@@ -1,8 +1,9 @@
-//! Vernam (VRNM) v2.0 — Zero-admin, 100% decentralized, information-theoretically secure OTP coin core.
+//! Vernam (VRNM) v2.1 — Zero-admin, 100% decentralized, information-theoretically secure OTP coin & confidential IT-MPC circuit VM.
 //!
 //! Zero external crates. Zero computational cryptography (no SHA-256, RSA, ECDSA, AES,
 //! or zk-SNARKs). Security rests solely on Shannon information theory and quantum mechanics.
 
+pub mod adaptive_tuner;
 pub mod bft;
 pub mod distributed_mpc;
 pub mod dynamic_quorum;
@@ -14,6 +15,9 @@ pub mod field;
 pub mod geo_triangulation;
 pub mod hw_entropy;
 pub mod key_transport;
+pub mod mpc_bytecode;
+pub mod mpc_defi;
+pub mod mpc_vm;
 pub mod oblivious_shuffle;
 pub mod otp;
 pub mod p2p_node;

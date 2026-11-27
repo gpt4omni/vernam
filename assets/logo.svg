@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Vernam VRNM Logo 05 - Ultra-Minimalist Coin Mark">
+  <defs>
+    <linearGradient id="azure05" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Pure Ink Background Circle -->
+  <circle cx="256" cy="256" r="244" fill="#05070D"/>
+
+  <!-- Precision Dual-Arc Outer Ring (Mersenne 2^127-1 Geometric Nod) -->
+  <circle cx="256" cy="256" r="218" fill="none" stroke="#1E293B" stroke-width="6"/>
+  <path d="M 256 38 A 218 218 0 0 1 445 365" fill="none" stroke="url(#azure05)" stroke-width="8" stroke-linecap="round"/>
+  <path d="M 256 474 A 218 218 0 0 1 67 147" fill="none" stroke="#F8FAFC" stroke-width="8" stroke-linecap="round"/>
+
+  <!-- Swiss-Grid Minimalist V -->
+  <path d="M 142 152 L 200 152 L 256 306 L 312 152 L 370 152 L 278 386 L 234 386 Z" fill="#F8FAFC"/>
+
+  <!-- Minimalist XOR Circle Anchoring the Center -->
+  <circle cx="256" cy="184" r="30" fill="none" stroke="url(#azure05)" stroke-width="7"/>
+  <line x1="256" y1="154" x2="256" y2="214" stroke="#0EA5E9" stroke-width="6.5" stroke-linecap="round"/>
+  <line x1="226" y1="184" x2="286" y2="184" stroke="#06B6D4" stroke-width="6.5" stroke-linecap="round"/>
+</svg>

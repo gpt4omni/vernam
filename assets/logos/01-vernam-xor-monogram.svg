@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Vernam VRNM Logo 01 - Quantum V-XOR Monogram">
+  <defs>
+    <linearGradient id="bg01" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0A1020"/>
+      <stop offset="100%" stop-color="#050811"/>
+    </linearGradient>
+    <linearGradient id="cyanViolet01" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00F5FF"/>
+      <stop offset="55%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="vRight01" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#4F46E5"/>
+    </linearGradient>
+    <radialGradient id="glow01" cx="50%" cy="42%" r="48%">
+      <stop offset="0%" stop-color="#00F5FF" stop-opacity="0.22"/>
+      <stop offset="65%" stop-color="#6366F1" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#050811" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="softGlow01" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Chamfered Hexagonal Obsidian Badge -->
+  <polygon points="256,22 458,139 458,373 256,490 54,373 54,139" fill="url(#bg01)" stroke="url(#cyanViolet01)" stroke-width="5" stroke-linejoin="round"/>
+  <polygon points="256,42 440,148 440,364 256,470 72,364 72,148" fill="url(#glow01)" stroke="#1E293B" stroke-width="1.5"/>
+
+  <!-- Subtle Quantum Grid Lines -->
+  <g stroke="#1E293B" stroke-width="1" opacity="0.55">
+    <line x1="256" y1="42" x2="256" y2="130"/>
+    <line x1="256" y1="395" x2="256" y2="470"/>
+    <line x1="72" y1="256" x2="128" y2="256"/>
+    <line x1="384" y1="256" x2="440" y2="256"/>
+  </g>
+
+  <!-- Architectural Split V Monogram -->
+  <polygon points="122,158 186,158 256,344 256,406 232,406" fill="url(#cyanViolet01)"/>
+  <polygon points="390,158 326,158 256,344 256,406 280,406" fill="url(#vRight01)"/>
+
+  <!-- Negative-Space Inner Bevel Highlight -->
+  <polygon points="154,158 176,158 248,348 238,372" fill="#E0F2FE" opacity="0.28"/>
+
+  <!-- Central XOR Reticle (Information-Theoretic OTP Symbol) -->
+  <g filter="url(#softGlow01)">
+    <circle cx="256" cy="186" r="38" fill="#070C18" stroke="#00F5FF" stroke-width="4.5"/>
+    <line x1="256" y1="148" x2="256" y2="224" stroke="#00F5FF" stroke-width="4" stroke-linecap="round"/>
+    <line x1="218" y1="186" x2="294" y2="186" stroke="#00F5FF" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="256" cy="186" r="7" fill="#E0F2FE"/>
+  </g>
+
+  <!-- Minimal Micro-Wordmark -->
+  <text x="256" y="446" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" font-weight="700" letter-spacing="10" fill="#94A3B8">VRNM</text>
+</svg>

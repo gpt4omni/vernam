@@ -3,7 +3,7 @@ members = [".", "vernam-kernel"]
 
 [package]
 name = "vernam-rs"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 description = "Vernam (VRNM) v2.0: Zero-admin, zero-dependency, information-theoretically secure OTP cryptocurrency core"
 

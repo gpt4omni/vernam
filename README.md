@@ -1,4 +1,8 @@
-# Vernam (`VRNM`) v1.2
+<p align="center">
+  <img src="assets/logo.svg" alt="Vernam (VRNM) Logo" width="140" />
+</p>
+
+# Vernam (`VRNM`) v2.1
 
 **Vernam (`VRNM`)** is a zero-admin, 100% decentralized, **information-theoretically secure** cryptocurrency core, split-share networked IT-MPC engine, crash-safe CLI wallet, **Beacon-Paired Proof-of-Pad (`PoP`)** entropy mining engine, self-contained dark-mode explorer, and multi-VPS P2P testnet written in **zero-dependency Rust** (`std` only — `0` external crates in `Cargo.toml`, plus a Python research lab in `python-lab/`).
 

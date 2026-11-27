@@ -93,19 +93,15 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   }
 
   .logo {
-    width: 46px;
-    height: 46px;
-    border-radius: 12px;
-    background: linear-gradient(135deg, var(--emerald), var(--cyan));
+    width: 50px;
+    height: 50px;
+    border-radius: 50%;
     display: grid;
     place-items: center;
-    font-weight: 900;
-    font-size: 22px;
-    color: #03111c;
-    letter-spacing: -0.04em;
-    box-shadow: 0 0 26px rgba(16, 185, 129, 0.32);
+    box-shadow: 0 0 24px rgba(6, 182, 212, 0.35);
     flex-shrink: 0;
   }
+  .logo svg { width: 50px; height: 50px; display: block; }
 
   .brand-title {
     display: flex;
@@ -796,10 +792,10 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   <!-- Top Status Banner -->
   <header class="banner">
     <div class="brand">
-      <div class="logo">V</div>
+      <div class="logo" aria-label="Vernam VRNM"><svg viewBox="0 0 512 512" width="50" height="50"><defs><linearGradient id="vrnmAz" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#06B6D4"/><stop offset="100%" stop-color="#2563EB"/></linearGradient></defs><circle cx="256" cy="256" r="244" fill="#05070D"/><circle cx="256" cy="256" r="218" fill="none" stroke="#1E293B" stroke-width="6"/><path d="M 256 38 A 218 218 0 0 1 445 365" fill="none" stroke="url(#vrnmAz)" stroke-width="10" stroke-linecap="round"/><path d="M 256 474 A 218 218 0 0 1 67 147" fill="none" stroke="#F8FAFC" stroke-width="10" stroke-linecap="round"/><path d="M 142 152 L 200 152 L 256 306 L 312 152 L 370 152 L 278 386 L 234 386 Z" fill="#F8FAFC"/><circle cx="256" cy="184" r="30" fill="none" stroke="url(#vrnmAz)" stroke-width="8"/><line x1="256" y1="154" x2="256" y2="214" stroke="#0EA5E9" stroke-width="7" stroke-linecap="round"/><line x1="226" y1="184" x2="286" y2="184" stroke="#06B6D4" stroke-width="7" stroke-linecap="round"/></svg></div>
       <div>
         <div class="brand-title">
-          <h1>Vernam (VRNM) Testnet v1.2</h1>
+          <h1>Vernam (VRNM) Testnet v2.1</h1>
           <span class="version-tag">v1.2 ASI-HARDENED &bull; OTP + IT-MPC + QKD</span>
         </div>
         <p class="brand-sub">Information-Theoretically Secure Ledger &bull; Carter-Wegman BFT &bull; Sharded Shamir Privacy &bull; Beacon-Paired PoP Mesh</p>

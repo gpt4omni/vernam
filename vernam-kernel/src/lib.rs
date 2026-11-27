@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bft_sm;
+pub mod circuit;
 pub mod cw_mac;
 pub mod field;
 pub mod mpc_checks;

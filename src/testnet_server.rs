@@ -2123,7 +2123,7 @@ impl TestnetServer {
             ("GET", "/") => HttpResponse::html(VERNAM_EXPLORER_HTML.to_string()),
 
             ("GET", "/health") => HttpResponse::ok_json(
-                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"2.0.0\"}"
+                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"2.1.0\"}"
                     .to_string(),
             ),
 
@@ -2659,7 +2659,7 @@ mod tests {
         assert!(headers.contains("Access-Control-Allow-Origin: *"));
         assert_eq!(
             body,
-            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"2.0.0"}"#
+            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"2.1.0"}"#
         );
 
         // 2. GET / (Dark-mode interactive explorer HTML)

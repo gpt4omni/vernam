@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
+use vernam_rs::adaptive_tuner::{AdaptiveProtocolController, EpochTelemetryInput};
 use vernam_rs::bft::{BftCluster, BftConfig, BinaryTx};
 use vernam_rs::distributed_mpc::run_distributed_mpc_bench;
 use vernam_rs::dynamic_quorum::{
@@ -23,6 +24,18 @@ use vernam_rs::geo_triangulation::{
     DistanceProbeKey, respond_probe, verify_probe_response,
 };
 use vernam_rs::hw_entropy::{ContinuousHealthMonitor, discover_best_entropy_source};
+use vernam_rs::mpc_bytecode::{
+    BytecodeMacKey, compile_vca, decode_authenticated, encode_authenticated, estimate_cost,
+};
+use vernam_rs::mpc_defi::{
+    AuctionMode, ConfidentialBallot, ConfidentialBallotBox, ConfidentialBid,
+    ConfidentialDarkPoolAmm, ConfidentialSealedBidAuction, ConfidentialSwapRequest,
+    DEFAULT_AMM_BIT_WIDTH, DEFAULT_AMM_FEE_BPS, DEFAULT_AUCTION_BIT_WIDTH,
+};
+use vernam_rs::mpc_vm::{
+    ESCROW_KEY_AMOUNT, ESCROW_KEY_BUYER_BAL, ESCROW_KEY_SELLER_BAL, ESCROW_KEY_SETTLED,
+    MpcVmEngine, build_private_escrow_circuit,
+};
 use vernam_rs::oblivious_shuffle::{
     AuthenticatedLedgerState, DealerShuffleSecret, ObliviousEpochMixer, ShuffleMaskCorrelation,
 };
@@ -33,7 +46,10 @@ use vernam_rs::pop_mining::{
     PopAuditPolicy, PopAuditor, PopEpochCoordinator, PopMiner, PopReplayRegistry,
     audit_pad_entropy_extended,
 };
-use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
+use vernam_rs::privacy_mpc::{
+    BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger,
+    split_secret as split_mpc_secret,
+};
 use vernam_rs::qkd::{
     AttackProfile, Bb84Channel, BufferedQkdPool, EntropySource, PoolConfig, QkdKeyProvider,
 };
@@ -61,7 +77,7 @@ fn fmt_vrnm(verns: u64) -> String {
 
 fn print_help() {
     println!(
-        r#"Vernam (VRNM) v2.0 — Zero-Admin, Information-Theoretically Secure OTP Coin
+        r#"Vernam (VRNM) v2.1 — Zero-Admin, Information-Theoretically Secure OTP Coin & Circuits VM
 
 USAGE:
   vrnm [COMMAND] [OPTIONS]
@@ -70,6 +86,7 @@ COMMANDS:
   demo                                  Run full 5-pillar showcase + speed benchmarks (default)
   v1-demo                               Run v1.0 zero-admin beacon, 4-daemon TCP MPC & 4->7 resharing demo
   v2-demo                               Run v2.0 multi-source entropy, global oblivious shuffle, Herzberg recovery & geo-triangulation demo
+  circuits-demo                         Run v2.1 Confidential IT-MPC Circuits VM, Dark-Pool AMM, Vickrey Auction, Ballot Box & Adaptive Tuner demo
   bench                                 Run high-throughput Express, Shielded & real-TCP TPS benchmarks
   testnet [--bind 0.0.0.0:8080] [--data-dir <path>]
                                         Start all-in-one 4-validator HTTP testnet + web explorer
@@ -876,6 +893,161 @@ fn cmd_bench() {
     println!("{report}");
 }
 
+fn cmd_circuits_demo() -> Result<(), String> {
+    println!("========================================================================");
+    println!("  VERNAM (VRNM) v2.1 — CONFIDENTIAL IT-MPC ARITHMETIC CIRCUITS SUITE");
+    println!("  Zero Reentrancy | MEV-Proof Dark Pool | Vickrey Auction | Auto-Tuner");
+    println!("========================================================================\n");
+
+    // 1. Vernam Circuit Assembly (.vca) Compiler + CW-MAC Binary Codec
+    println!("[1/5] Vernam Circuit Assembly (.vca) Compiler & CW-MAC Bytecode Codec");
+    let vca_src = "\
+        # Confidential escrow bonus multiplier circuit\n\
+        LOAD_IN r0, 0\n\
+        LOAD_IN r1, 1\n\
+        LOAD_STATE r2, 0\n\
+        MUL r3, r0, r1\n\
+        ADD r4, r2, r3\n\
+        ASSERT_BOOL r0\n\
+        STORE_STATE 0, r4\n\
+        REVEAL r4\n";
+    let compiled = compile_vca(vca_src).map_err(|e| format!("compile_vca: {e}"))?;
+    let cost = estimate_cost(&compiled);
+    let mac_key = BytecodeMacKey::generate();
+    let wire = encode_authenticated(&compiled, &mac_key).map_err(|e| format!("encode: {e}"))?;
+    let decoded = decode_authenticated(&wire, &mac_key).map_err(|e| format!("decode: {e}"))?;
+    assert_eq!(compiled, decoded);
+    println!(
+        "  Compiled & CW-MAC'd    : {} ops -> {} B wire frame | upfront cost: {} triples, {} squares, fee={}\n",
+        compiled.ops.len(),
+        wire.len(),
+        cost.beaver_triples,
+        cost.beaver_squares,
+        fmt_vrnm(cost.fee_vern)
+    );
+
+    // 2. General-Purpose Confidential IT-MPC Circuit VM (Private Escrow + PSS)
+    println!("[2/5] Confidential IT-MPC Circuit VM (Oblivious Mux Private Escrow)");
+    let mut vm = MpcVmEngine::new_3_of_4();
+    let escrow_prog = build_private_escrow_circuit();
+    let mut init_state = BTreeMap::new();
+    init_state.insert(ESCROW_KEY_AMOUNT, split_mpc_secret(2_500, 3, 4).unwrap());
+    init_state.insert(ESCROW_KEY_BUYER_BAL, split_mpc_secret(1_000, 3, 4).unwrap());
+    init_state.insert(ESCROW_KEY_SELLER_BAL, split_mpc_secret(500, 3, 4).unwrap());
+    init_state.insert(ESCROW_KEY_SETTLED, split_mpc_secret(0, 3, 4).unwrap());
+    let cid = vm
+        .deploy_contract(escrow_prog, init_state)
+        .map_err(|e| format!("deploy escrow: {e}"))?;
+    let mut pool = BeaverPool::new_3_of_4(4_096);
+    let release_flag = vec![split_mpc_secret(1, 3, 4).unwrap()];
+    let rcpt = vm
+        .execute_contract(cid, &release_flag, &mut pool)
+        .map_err(|e| format!("exec escrow: {e}"))?;
+    let new_pss = vm
+        .proactive_refresh_all_contracts()
+        .map_err(|e| format!("vm PSS refresh: {e}"))?;
+    let seller_bal = vm
+        .reconstruct_contract_state(cid, ESCROW_KEY_SELLER_BAL)
+        .map_err(|e| format!("{e}"))?;
+    assert_eq!(seller_bal, 3_000);
+    println!(
+        "  Private Escrow settled : seller_bal={seller_bal} VRNM (branch & amount hidden) | {} triples | PSS epoch={new_pss}\n",
+        rcpt.triples_consumed
+    );
+
+    // 3. MEV-Proof Dark-Pool Constant-Product AMM
+    println!("[3/5] MEV-Proof Dark-Pool Constant-Product AMM (Hidden Reserves & Direction)");
+    let mut amm = ConfidentialDarkPoolAmm::new_default(100_000, 100_000)
+        .map_err(|e| format!("amm init: {e}"))?;
+    let (swap_req, quoted_out) = ConfidentialSwapRequest::build_honest(
+        100_000,
+        100_000,
+        0, // secret A -> B
+        1_000,
+        900,
+        DEFAULT_AMM_FEE_BPS,
+        DEFAULT_AMM_BIT_WIDTH,
+        3,
+        4,
+    )
+    .map_err(|e| format!("build swap: {e}"))?;
+    amm.execute_swap(&swap_req, &mut pool)
+        .map_err(|e| format!("amm swap: {e}"))?;
+    amm.proactive_refresh_epoch()
+        .map_err(|e| format!("amm pss: {e}"))?;
+    let (res_a, res_b) = amm.reconstruct_reserves().map_err(|e| format!("{e}"))?;
+    println!(
+        "  Dark-Pool swap settled : 1000 A -> {quoted_out} B (0.30% fee) | reserves=({res_a}, {res_b}) | PSS epoch={}\n",
+        amm.pss_epoch()
+    );
+
+    // 4. Unconditionally Private Vickrey Second-Price Sealed-Bid Auction + Secret Ballot Box
+    println!("[4/5] Vickrey Second-Price Sealed-Bid Auction & Secret-Ballot Governance");
+    let mut auction =
+        ConfidentialSealedBidAuction::new_default(AuctionMode::VickreySecondPrice)
+            .map_err(|e| format!("auction init: {e}"))?;
+    for &(bidder, bid_amt) in &[(10u64, 420u128), (11, 950), (12, 780), (13, 610)] {
+        let bid = ConfidentialBid::build_honest(bidder, bid_amt, DEFAULT_AUCTION_BIT_WIDTH, 3, 4)
+            .map_err(|e| format!("build bid: {e}"))?;
+        auction
+            .submit_bid(bid, &mut pool)
+            .map_err(|e| format!("submit bid: {e}"))?;
+    }
+    let settled = auction
+        .settle(&mut pool)
+        .map_err(|e| format!("settle auction: {e}"))?;
+    assert_eq!(settled.winner_id, 11);
+    assert_eq!(settled.clearing_price, 780); // Second-highest price!
+
+    let mut ballot_box =
+        ConfidentialBallotBox::new_default(3, 3).map_err(|e| format!("ballot init: {e}"))?;
+    for &(voter, choice) in &[(1u64, 1usize), (2, 1), (3, 0), (4, 1)] {
+        let b = ConfidentialBallot::build_honest(voter, choice, 3, 3, 4)
+            .map_err(|e| format!("build ballot: {e}"))?;
+        ballot_box
+            .cast_ballot(&b, &mut pool)
+            .map_err(|e| format!("cast ballot: {e}"))?;
+    }
+    let tally = ballot_box
+        .tally_and_reveal()
+        .map_err(|e| format!("tally: {e}"))?;
+    println!(
+        "  Vickrey Auction        : winner=Bidder #{} clearing_price={} (all losing bids unconditionally secret!)",
+        settled.winner_id, settled.clearing_price
+    );
+    println!(
+        "  Secret Ballot Tally    : counts={:?} winner=Option #{} quorum_met={} (0 triples to tally!)\n",
+        tally.option_totals,
+        tally.winning_option.unwrap_or(0),
+        tally.quorum_met
+    );
+
+    // 5. Deterministic Pure-Integer Adaptive Protocol Controller
+    println!("[5/5] Deterministic Bounded Self-Tuning Protocol Controller (Zero Float / Zero AI Oracle)");
+    let mut tuner = AdaptiveProtocolController::default();
+    let r = tuner.step_epoch(&EpochTelemetryInput {
+        epoch: 1,
+        express_utilization_bps: 9_000,
+        shielded_utilization_bps: 8_500,
+        beaver_pool_fill_bps: 1_500,
+        observed_qber_bps: 750, // 7.5% QBER spike -> immediate PSS tightening!
+        verified_candidate_pool: 12,
+        slashing_events_in_epoch: 1,
+    });
+    println!(
+        "  Under congestion+threat: express_fee={} -> {} vern | PSS interval={}s -> {}s | beaver_target={}",
+        r.previous.express_fee_vern,
+        r.updated.express_fee_vern,
+        r.previous.pss_refresh_interval_secs,
+        r.updated.pss_refresh_interval_secs,
+        r.updated.beaver_pool_target_depth
+    );
+    println!("\n========================================================================");
+    println!("  VERNAM (VRNM) v2.1 CONFIDENTIAL CIRCUITS SUITE VERIFIED.");
+    println!("========================================================================");
+    Ok(())
+}
+
 fn cmd_v2_demo() -> Result<(), String> {
     println!("========================================================================");
     println!("  VERNAM (VRNM) v2.0 — FULL ANTI-ASI INFORMATION-THEORETIC SUITE");
@@ -1295,6 +1467,7 @@ fn main() {
         }
         "v1-demo" => cmd_v1_demo(),
         "v2-demo" => cmd_v2_demo(),
+        "circuits-demo" => cmd_circuits_demo(),
         "bench" => {
             cmd_bench();
             Ok(())

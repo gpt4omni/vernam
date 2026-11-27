@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Vernam VRNM Logo 03 - Shamir 3-of-4 Threshold Shield">
+  <defs>
+    <linearGradient id="bg03" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0E121D"/>
+      <stop offset="100%" stop-color="#06080E"/>
+    </linearGradient>
+    <linearGradient id="platA03" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#F8FAFC"/>
+      <stop offset="50%" stop-color="#CBD5E1"/>
+      <stop offset="100%" stop-color="#64748B"/>
+    </linearGradient>
+    <linearGradient id="platB03" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#E2E8F0"/>
+      <stop offset="100%" stop-color="#475569"/>
+    </linearGradient>
+    <linearGradient id="pulse03" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#22D3EE"/>
+    </linearGradient>
+    <radialGradient id="coreGlow03" cx="50%" cy="48%" r="36%">
+      <stop offset="0%" stop-color="#6366F1" stop-opacity="0.38"/>
+      <stop offset="100%" stop-color="#06080E" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Circular Sovereign Coin Medallion -->
+  <circle cx="256" cy="256" r="236" fill="url(#bg03)" stroke="#1E293B" stroke-width="5"/>
+  <circle cx="256" cy="256" r="218" fill="url(#coreGlow03)" stroke="url(#pulse03)" stroke-width="2" opacity="0.65"/>
+
+  <!-- 4 Interlocking Shamir Shards (t=3 of N=4) forming a Shield & V Crest -->
+  <!-- Shard 1: Upper-Left Wing -->
+  <polygon points="116,144 242,144 214,228 156,266" fill="url(#platA03)"/>
+  <!-- Shard 2: Upper-Right Wing -->
+  <polygon points="396,144 270,144 298,228 356,266" fill="url(#platB03)"/>
+  <!-- Shard 3: Lower-Left Blade -->
+  <polygon points="164,284 224,244 248,396 232,396" fill="url(#pulse03)"/>
+  <!-- Shard 4: Lower-Right Blade -->
+  <polygon points="348,284 288,244 264,396 280,396" fill="url(#platA03)"/>
+
+  <!-- Central Zero-Information Void Diamond (Secret never exists on any single shard) -->
+  <polygon points="256,196 286,238 256,280 226,238" fill="#080B14" stroke="url(#pulse03)" stroke-width="3.5" stroke-linejoin="round"/>
+  <circle cx="256" cy="238" r="7" fill="#22D3EE"/>
+
+  <!-- 4 Orbital Validator Nodes at Cardinal Points -->
+  <g fill="#E2E8F0" stroke="#6366F1" stroke-width="2.5">
+    <circle cx="256" cy="76" r="7"/>
+    <circle cx="436" cy="256" r="7"/>
+    <circle cx="256" cy="436" r="7"/>
+    <circle cx="76" cy="256" r="7"/>
+  </g>
+</svg>
