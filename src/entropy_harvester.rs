@@ -683,14 +683,17 @@ impl CpuJitterHarvester {
 
     fn harvest_raw_unbiased(&mut self, dst: &mut [u8]) -> Result<(), HwEntropyError> {
         let needed_bits = dst.len() * 8;
-        let mut unbiased_bits = Vec::with_capacity(needed_bits + 256);
+        // Collect 2x unbiased bits and XOR halves separated by `needed_bits` in time so any
+        // short-range microarchitectural/thermal lag-1 autocorrelation collapses quadratically.
+        let target_bits = needed_bits * 2;
+        let mut unbiased_bits = Vec::with_capacity(target_bits + 256);
         let mut raw_batch = Vec::with_capacity(512);
 
         // Cap retries so a frozen/virtualized constant counter fails closed rather than spinning.
-        let max_rounds = (dst.len().max(1) * 16).max(64);
+        let max_rounds = (dst.len().max(1) * 32).max(128);
         let mut rounds = 0usize;
 
-        while unbiased_bits.len() < needed_bits {
+        while unbiased_bits.len() < target_bits {
             rounds += 1;
             if rounds > max_rounds {
                 zeroize_slice(&mut raw_batch);
@@ -707,7 +710,7 @@ impl CpuJitterHarvester {
                 return Err(err);
             }
 
-            let remaining = needed_bits - unbiased_bits.len();
+            let remaining = target_bits - unbiased_bits.len();
             let batch_len = (remaining * 2).clamp(128, 1024);
             raw_batch.clear();
             for _ in 0..batch_len {
@@ -721,7 +724,9 @@ impl CpuJitterHarvester {
             let base = byte_idx * 8;
             let mut b = 0u8;
             for bit_pos in 0..8 {
-                b |= (unbiased_bits[base + bit_pos] & 1) << bit_pos;
+                let idx = base + bit_pos;
+                let decorrelated = (unbiased_bits[idx] ^ unbiased_bits[idx + needed_bits]) & 1;
+                b |= decorrelated << bit_pos;
             }
             *slot = b;
         }
@@ -891,14 +896,15 @@ impl IoIrqJitterHarvester {
 
     fn fill_raw_folded(&mut self, dst: &mut [u8]) {
         let needed_bits = dst.len() * 8;
-        let mut unbiased_bits = Vec::with_capacity(needed_bits + 128);
+        let target_bits = needed_bits * 2;
+        let mut unbiased_bits = Vec::with_capacity(target_bits + 128);
         let mut raw_batch = Vec::with_capacity(512);
-        let max_rounds = (dst.len().max(1) * 16).max(64);
+        let max_rounds = (dst.len().max(1) * 32).max(128);
         let mut rounds = 0usize;
 
-        while unbiased_bits.len() < needed_bits && rounds < max_rounds {
+        while unbiased_bits.len() < target_bits && rounds < max_rounds {
             rounds += 1;
-            let remaining = needed_bits - unbiased_bits.len();
+            let remaining = target_bits - unbiased_bits.len();
             let batch_len = (remaining * 2).clamp(128, 1024);
             raw_batch.clear();
             for _ in 0..batch_len {
@@ -914,7 +920,7 @@ impl IoIrqJitterHarvester {
             zeroize_slice(&mut raw_batch);
         }
 
-        if unbiased_bits.len() < needed_bits {
+        if unbiased_bits.len() < target_bits {
             zeroize_slice(&mut unbiased_bits);
             zeroize_slice(dst);
             return;
@@ -923,7 +929,9 @@ impl IoIrqJitterHarvester {
             let base = byte_idx * 8;
             let mut b = 0u8;
             for bit_pos in 0..8 {
-                b |= (unbiased_bits[base + bit_pos] & 1) << bit_pos;
+                let idx = base + bit_pos;
+                let decorrelated = (unbiased_bits[idx] ^ unbiased_bits[idx + needed_bits]) & 1;
+                b |= decorrelated << bit_pos;
             }
             *slot = b;
         }
