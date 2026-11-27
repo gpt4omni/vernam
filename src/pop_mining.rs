@@ -30,7 +30,7 @@
 //!      pads / tampered commitments; `ExtendedDowntime` 10% bond burn for compromised QKD
 //!      replenishment), and settles the halving `VRNM` epoch subsidy + 80% fee pool.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -72,6 +72,10 @@ pub const MAX_DECOY_YIELD_RATIO: f64 = 1.08;
 /// Number of random pad slot indices sampled per interactive PoP challenge.
 pub const DEFAULT_CHALLENGE_SLOT_COUNT: usize = 4;
 
+/// Default sliding-window depth (in epochs) retained by [`PopReplayRegistry`] to detect
+/// cross-epoch pad recycling and cross-validator pad theft with bounded memory.
+pub const DEFAULT_REPLAY_WINDOW_EPOCHS: u64 = 64;
+
 // ============================================================================
 // Errors & Audit Policy
 // ============================================================================
@@ -111,6 +115,23 @@ pub enum PopError {
         max_ratio: f64,
         single_photon_yield_lower_bound: f64,
     },
+    /// Provider submitted a solo batch without a co-signed counterparty peer delivery receipt.
+    MissingPeerReceipt(&'static str),
+    /// Provider attempted to self-co-sign its own pad batch (`counterparty_id == provider_id`).
+    SelfCoSignForbidden(ValidatorId),
+    /// Counterparty peer's Carter-Wegman delivery receipt MAC failed verification or did not match
+    /// the provider's committed pad batch.
+    InvalidPeerReceiptMac {
+        provider_id: ValidatorId,
+        counterparty_id: ValidatorId,
+    },
+    /// Pad sample, batch commitment, or peer receipt was replayed from an earlier epoch or another validator.
+    CrossEpochPadReplay {
+        validator_id: ValidatorId,
+        prior_validator_id: ValidatorId,
+        prior_epoch: u64,
+        current_epoch: u64,
+    },
     /// Tokenomics engine rejected recording a contribution or slashing.
     TokenomicsFailure(String),
     /// Non-slashable coordinator rejection (e.g., stale epoch challenge or duplicate submission).
@@ -123,8 +144,9 @@ impl PopError {
     /// Map an audit rejection to its corresponding `TokenomicsEngine` slashing offense.
     ///
     /// - Corrupted Beaver triples (`a * b != c`), forged/low-entropy fake pads, duplicate pad
-    ///   cloning, tampered Carter-Wegman tags, and challenge spoofing trigger a **50% bond burn**
-    ///   (`SlashingOffense::InconsistentMpcShare`).
+    ///   cloning, tampered Carter-Wegman tags, challenge spoofing, solo-mined missing peer
+    ///   receipts, self-co-signing, forged peer receipt MACs, and cross-epoch/cross-validator
+    ///   pad replay trigger a **50% bond burn** (`SlashingOffense::InconsistentMpcShare`).
     /// - High-QBER / decoy-anomaly QKD links or empty batches trigger a **10% bond burn**
     ///   (`SlashingOffense::ExtendedDowntime`) for failing clean pad replenishment.
     /// - Stale epoch challenges, duplicate coordinator entries, channel I/O failures, and
@@ -135,7 +157,11 @@ impl PopError {
             | Self::EntropyAuditFailed { .. }
             | Self::InvalidCommitmentTag(_)
             | Self::DuplicatePadPages { .. }
-            | Self::ChallengeMismatch(_) => Some(SlashingOffense::InconsistentMpcShare),
+            | Self::ChallengeMismatch(_)
+            | Self::MissingPeerReceipt(_)
+            | Self::SelfCoSignForbidden(_)
+            | Self::InvalidPeerReceiptMac { .. }
+            | Self::CrossEpochPadReplay { .. } => Some(SlashingOffense::InconsistentMpcShare),
             Self::QkdQberExceeded { .. }
             | Self::QkdDecoyAnomaly { .. }
             | Self::EmptyBatch(_) => Some(SlashingOffense::ExtendedDowntime),
@@ -190,6 +216,31 @@ impl fmt::Display for PopError {
                 f,
                 "QKD decoy-state anomaly: ratio={:.4} outside [{:.4}, {:.4}], Y1_L={:.4}",
                 decoy_yield_ratio, min_ratio, max_ratio, single_photon_yield_lower_bound
+            ),
+            Self::MissingPeerReceipt(msg) => {
+                write!(f, "missing bilateral counterparty delivery receipt: {msg}")
+            }
+            Self::SelfCoSignForbidden(vid) => {
+                write!(
+                    f,
+                    "validator {vid} attempted to self-co-sign its own pad delivery receipt"
+                )
+            }
+            Self::InvalidPeerReceiptMac {
+                provider_id,
+                counterparty_id,
+            } => write!(
+                f,
+                "invalid counterparty Carter-Wegman receipt MAC for provider {provider_id} / counterparty {counterparty_id}"
+            ),
+            Self::CrossEpochPadReplay {
+                validator_id,
+                prior_validator_id,
+                prior_epoch,
+                current_epoch,
+            } => write!(
+                f,
+                "cross-epoch/cross-validator pad replay detected for validator {validator_id} in epoch {current_epoch} (already used by validator {prior_validator_id} in epoch {prior_epoch})"
             ),
             Self::TokenomicsFailure(msg) => write!(f, "tokenomics integration error: {msg}"),
             Self::CoordinatorRejected(msg) => write!(f, "PoP coordinator rejected submission: {msg}"),
@@ -673,6 +724,353 @@ pub fn compute_challenged_slots_tag(
     add_mod(acc, reduce(slots_mask_s)).to_le_bytes()
 }
 
+/// Constant-time byte-slice equality check (prevents timing leaks when verifying bilateral QKD keys).
+fn ct_eq_slice(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Compute a length-prefixed, prefix-collision-free Carter-Wegman digest over a list of
+/// per-page digests evaluated at `commit_r` in `F_(2^127 - 1)`.
+///
+/// Used to bind a counterparty peer's independently received `bob_key` pad pages directly to
+/// the provider's pre-challenge `PopCommitment.page_digests`.
+pub fn compute_pages_commitment_digest(page_digests: &[u128], commit_r: u128) -> u128 {
+    let r = reduce(commit_r);
+    let mut acc = mul_mod(reduce(page_digests.len() as u128), r);
+    for &digest in page_digests {
+        acc = mul_mod(add_mod(acc, reduce(digest)), r);
+    }
+    acc
+}
+
+// ============================================================================
+// Step 2b: Bilateral Peer Delivery Receipts & Cross-Epoch Anti-Replay Registry
+// ============================================================================
+
+/// Pairwise information-theoretic Carter-Wegman authentication key `(r, s)` over `F_(2^127 - 1)`
+/// shared between a counterparty peer and the auditor committee to co-sign a
+/// [`BilateralDeliveryReceipt`].
+///
+/// Key scalars are redacted in `Debug` output and volatile-zeroized on `Drop`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerReceiptKey {
+    r: u128,
+    s: u128,
+}
+
+impl PeerReceiptKey {
+    /// Generate a fresh uniform one-time Carter-Wegman peer receipt key over `F_(2^127 - 1)`.
+    pub fn generate() -> Self {
+        Self {
+            r: random_nonzero_field_elem(),
+            s: random_field_elem(),
+        }
+    }
+
+    /// Construct a `PeerReceiptKey` from explicit canonical field elements (`0 < r < PRIME_P`,
+    /// `s < PRIME_P`).
+    pub fn from_parts(r: u128, s: u128) -> Result<Self, PopError> {
+        if r == 0 || r >= PRIME_P {
+            return Err(PopError::InvalidParameter(
+                "PeerReceiptKey r must satisfy 0 < r < PRIME_P",
+            ));
+        }
+        if s >= PRIME_P {
+            return Err(PopError::InvalidParameter(
+                "PeerReceiptKey s must satisfy s < PRIME_P",
+            ));
+        }
+        Ok(Self { r, s })
+    }
+
+    #[inline]
+    pub const fn r(&self) -> u128 {
+        self.r
+    }
+
+    #[inline]
+    pub const fn s(&self) -> u128 {
+        self.s
+    }
+}
+
+impl fmt::Debug for PeerReceiptKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerReceiptKey")
+            .field("r", &"[REDACTED]")
+            .field("s", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for PeerReceiptKey {
+    fn drop(&mut self) {
+        zeroize_u128(&mut self.r);
+        zeroize_u128(&mut self.s);
+    }
+}
+
+/// Co-signed information-theoretic receipt issued by a distinct counterparty peer
+/// (`counterparty_id != provider_id`) proving it actually received matching purified QKD OTP
+/// pad pages and observed the claimed QKD telemetry during `epoch`.
+///
+/// Closes the solo `/dev/urandom` farming attack: a miner cannot earn `VRNM` PoP rewards by
+/// generating local noise alone — a distinct counterparty peer must co-authenticate the exact
+/// committed pad pages it received.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BilateralDeliveryReceipt {
+    pub provider_id: ValidatorId,
+    pub counterparty_id: ValidatorId,
+    pub epoch: u64,
+    pub pad_pages_delivered: usize,
+    pub beaver_triples_delivered: usize,
+    /// Pre-commitment scalar `commit_r` at which the counterparty independently digested its
+    /// own received `bob_key` pad pages.
+    pub commit_r: u128,
+    /// Prefix-collision-free Carter-Wegman digest of the counterparty's received pad pages
+    /// evaluated at `commit_r`.
+    pub pages_commitment_digest: u128,
+    /// BB84 + Decoy-State QKD link telemetry independently observed by the counterparty peer.
+    pub observed_qkd: QkdTelemetry,
+    /// 128-bit Carter-Wegman MAC authenticated by the counterparty using its [`PeerReceiptKey`].
+    pub counterparty_mac: AuditTag,
+}
+
+impl BilateralDeliveryReceipt {
+    /// Compute the canonical, prefix-collision-free 128-bit Carter-Wegman MAC binding all
+    /// receipt fields under `peer_key`.
+    pub fn compute_mac(&self, peer_key: &PeerReceiptKey) -> AuditTag {
+        let r = peer_key.r;
+        let mut acc = mul_mod(reduce(self.provider_id as u128), r);
+        acc = mul_mod(add_mod(acc, reduce(self.counterparty_id as u128)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.epoch as u128)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.pad_pages_delivered as u128)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.beaver_triples_delivered as u128)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.commit_r)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.pages_commitment_digest)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.observed_qkd.qber.to_bits() as u128)), r);
+        acc = mul_mod(add_mod(acc, reduce(self.observed_qkd.sifted_bits as u128)), r);
+        acc = mul_mod(
+            add_mod(
+                acc,
+                reduce(self.observed_qkd.decoy_yield_ratio.to_bits() as u128),
+            ),
+            r,
+        );
+        acc = mul_mod(
+            add_mod(
+                acc,
+                reduce(self.observed_qkd.single_photon_yield_lower_bound.to_bits() as u128),
+            ),
+            r,
+        );
+        add_mod(acc, peer_key.s).to_le_bytes()
+    }
+
+    /// Issue a signed `BilateralDeliveryReceipt` computed directly from the counterparty peer's
+    /// OWN received `peer_pad_pages` (`bob_key`), without trusting the provider's digests.
+    pub fn issue_from_peer_pages(
+        provider_id: ValidatorId,
+        counterparty_id: ValidatorId,
+        epoch: u64,
+        peer_pad_pages: &[Vec<u8>],
+        beaver_triples_delivered: usize,
+        commit_r: u128,
+        observed_qkd: QkdTelemetry,
+        peer_key: &PeerReceiptKey,
+    ) -> Self {
+        let r = reduce(commit_r);
+        let mut peer_page_digests = Vec::with_capacity(peer_pad_pages.len());
+        for page in peer_pad_pages {
+            peer_page_digests.push(cw_poly_digest(page, r));
+        }
+        let pages_commitment_digest = compute_pages_commitment_digest(&peer_page_digests, r);
+        let mut receipt = Self {
+            provider_id,
+            counterparty_id,
+            epoch,
+            pad_pages_delivered: peer_pad_pages.len(),
+            beaver_triples_delivered,
+            commit_r: r,
+            pages_commitment_digest,
+            observed_qkd,
+            counterparty_mac: [0u8; 16],
+        };
+        receipt.counterparty_mac = receipt.compute_mac(peer_key);
+        receipt
+    }
+
+    /// Verify `counterparty_mac` in constant time (`ct_eq_16`) against `peer_key`.
+    pub fn verify_mac(&self, peer_key: &PeerReceiptKey) -> bool {
+        let expected = self.compute_mac(peer_key);
+        ct_eq_16(&expected, &self.counterparty_mac)
+    }
+}
+
+/// Bounded sliding-window anti-replay registry tracking 254-bit Carter-Wegman pad sample
+/// fingerprints, batch commitments, and bilateral receipt MACs across epochs.
+///
+/// Uses two independent private uniform non-zero scalars `(r1, r2)` in `F_(2^127 - 1)` so
+/// pad recycling across epochs or pad theft across validators is caught with false-negative
+/// probability `< 2^-244` without storing raw pad bytes or any computational hash function.
+pub struct PopReplayRegistry {
+    max_history_epochs: u64,
+    fingerprint_r1: u128,
+    fingerprint_r2: u128,
+    seen_pad_fingerprints: BTreeMap<(u128, u128), (ValidatorId, u64)>,
+    seen_batch_commitments: BTreeMap<AuditTag, (ValidatorId, u64)>,
+    seen_receipt_macs: BTreeMap<AuditTag, (ValidatorId, u64)>,
+}
+
+impl Default for PopReplayRegistry {
+    fn default() -> Self {
+        Self::new(DEFAULT_REPLAY_WINDOW_EPOCHS)
+    }
+}
+
+impl PopReplayRegistry {
+    /// Create a fresh anti-replay registry retaining the last `max_history_epochs` epochs.
+    pub fn new(max_history_epochs: u64) -> Self {
+        Self {
+            max_history_epochs: max_history_epochs.max(1),
+            fingerprint_r1: random_nonzero_field_elem(),
+            fingerprint_r2: random_nonzero_field_elem(),
+            seen_pad_fingerprints: BTreeMap::new(),
+            seen_batch_commitments: BTreeMap::new(),
+            seen_receipt_macs: BTreeMap::new(),
+        }
+    }
+
+    /// Configured epoch sliding-window depth.
+    #[inline]
+    pub const fn max_history_epochs(&self) -> u64 {
+        self.max_history_epochs
+    }
+
+    /// Number of pad sample fingerprints currently retained in the sliding window.
+    #[inline]
+    pub fn tracked_pad_fingerprints(&self) -> usize {
+        self.seen_pad_fingerprints.len()
+    }
+
+    #[inline]
+    fn sample_fingerprint(&self, sample: &[u8]) -> (u128, u128) {
+        (
+            cw_poly_digest(sample, self.fingerprint_r1),
+            cw_poly_digest(sample, self.fingerprint_r2),
+        )
+    }
+
+    /// Prune entries strictly older than `current_epoch - max_history_epochs`.
+    pub fn prune_expired(&mut self, current_epoch: u64) {
+        let cutoff = current_epoch.saturating_sub(self.max_history_epochs);
+        self.seen_pad_fingerprints
+            .retain(|_, &mut (_, ep)| ep >= cutoff);
+        self.seen_batch_commitments
+            .retain(|_, &mut (_, ep)| ep >= cutoff);
+        self.seen_receipt_macs
+            .retain(|_, &mut (_, ep)| ep >= cutoff);
+    }
+
+    /// Atomically verify that neither the batch commitment, the bilateral receipt MAC, nor any
+    /// opened pad sample has been seen in the sliding window (by this validator or any other),
+    /// then record them on success.
+    pub fn check_and_record(
+        &mut self,
+        current_epoch: u64,
+        commitment: &PopCommitment,
+        proof: &PopProof,
+        receipt: &BilateralDeliveryReceipt,
+    ) -> Result<(), PopError> {
+        self.prune_expired(current_epoch);
+
+        if let Some(&(prior_validator_id, prior_epoch)) =
+            self.seen_batch_commitments.get(&commitment.batch_commitment)
+        {
+            return Err(PopError::CrossEpochPadReplay {
+                validator_id: proof.validator_id,
+                prior_validator_id,
+                prior_epoch,
+                current_epoch,
+            });
+        }
+
+        if let Some(&(prior_validator_id, prior_epoch)) =
+            self.seen_receipt_macs.get(&receipt.counterparty_mac)
+        {
+            return Err(PopError::CrossEpochPadReplay {
+                validator_id: proof.validator_id,
+                prior_validator_id,
+                prior_epoch,
+                current_epoch,
+            });
+        }
+
+        let mut new_fps = Vec::with_capacity(proof.audited_pad_samples.len());
+        let mut intra_proof = BTreeSet::new();
+        for (_, sample) in &proof.audited_pad_samples {
+            let fp = self.sample_fingerprint(sample);
+            if let Some(&(prior_validator_id, prior_epoch)) = self.seen_pad_fingerprints.get(&fp) {
+                return Err(PopError::CrossEpochPadReplay {
+                    validator_id: proof.validator_id,
+                    prior_validator_id,
+                    prior_epoch,
+                    current_epoch,
+                });
+            }
+            if !intra_proof.insert(fp) {
+                return Err(PopError::DuplicatePadPages {
+                    unique_pages: intra_proof.len(),
+                    claimed_pages: proof.audited_pad_samples.len(),
+                });
+            }
+            new_fps.push(fp);
+        }
+
+        // All checks passed — commit fingerprints & tags into the sliding window.
+        self.seen_batch_commitments
+            .insert(commitment.batch_commitment, (proof.validator_id, current_epoch));
+        self.seen_receipt_macs
+            .insert(receipt.counterparty_mac, (proof.validator_id, current_epoch));
+        for fp in new_fps {
+            self.seen_pad_fingerprints
+                .insert(fp, (proof.validator_id, current_epoch));
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Debug for PopReplayRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PopReplayRegistry")
+            .field("max_history_epochs", &self.max_history_epochs)
+            .field("fingerprint_r1", &"[REDACTED]")
+            .field("fingerprint_r2", &"[REDACTED]")
+            .field("tracked_pad_fingerprints", &self.seen_pad_fingerprints.len())
+            .field(
+                "tracked_batch_commitments",
+                &self.seen_batch_commitments.len(),
+            )
+            .field("tracked_receipt_macs", &self.seen_receipt_macs.len())
+            .finish()
+    }
+}
+
+impl Drop for PopReplayRegistry {
+    fn drop(&mut self) {
+        zeroize_u128(&mut self.fingerprint_r1);
+        zeroize_u128(&mut self.fingerprint_r2);
+    }
+}
+
 // ============================================================================
 // Mined Pad Batch, Challenge, Proof & Verification Receipt
 // ============================================================================
@@ -779,16 +1177,25 @@ impl PopChallenge {
     }
 
     /// Resolve ALL deduplicated challenged pad slot indices (preserving first-seen order).
+    ///
+    /// When two random draws collide modulo `pad_pages`, linearly probes forward modulo
+    /// `pad_pages` so a challenge of `k` slots always audits `min(k, pad_pages)` distinct
+    /// pages (never collapsing to a weaker audit due to birthday collisions).
     pub fn resolve_pad_indices(&self, pad_pages: usize) -> Vec<usize> {
         if pad_pages == 0 {
             return Vec::new();
         }
-        let mut resolved = Vec::with_capacity(self.pad_slot_indices.len().max(1));
+        let target = self.pad_slot_indices.len().max(1).min(pad_pages);
+        let mut resolved = Vec::with_capacity(target);
         for &raw in &self.pad_slot_indices {
-            let idx = raw % pad_pages;
-            if !resolved.contains(&idx) {
-                resolved.push(idx);
+            if resolved.len() >= target {
+                break;
             }
+            let mut idx = raw % pad_pages;
+            while resolved.contains(&idx) {
+                idx = (idx + 1) % pad_pages;
+            }
+            resolved.push(idx);
         }
         if resolved.is_empty() {
             resolved.push(0);
@@ -873,10 +1280,14 @@ impl Drop for PopProof {
     }
 }
 
-/// Receipt emitted by `PopAuditor::verify_proof` when a validator passes every PoP check.
+/// Receipt emitted by `PopAuditor::verify_proof` or `PopAuditor::verify_bilateral_proof`
+/// when a validator passes every PoP check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PopVerificationReceipt {
     pub validator_id: ValidatorId,
+    /// Distinct counterparty peer that co-signed delivery of this pad batch (always `Some`
+    /// when verified via [`PopAuditor::verify_bilateral_proof`]).
+    pub counterparty_id: Option<ValidatorId>,
     pub epoch: u64,
     pub mined_pad_pages: usize,
     pub usable_pad_pages: usize,
@@ -962,6 +1373,126 @@ impl PopMiner {
             qkd_telemetry,
             page_size_bytes: PAD_PAGE_BYTES,
         })
+    }
+
+    /// Mine a fresh pad + Beaver triple batch via a **bilateral** BB84 QKD exchange with a
+    /// distinct `counterparty_id != provider_id`.
+    ///
+    /// Verifies in constant time that Alice's and Bob's reconciled purified keys match, commits
+    /// the provider's pad pages into a pre-challenge [`PopCommitment`], has the counterparty peer
+    /// independently digest its own received `bob_key` pages and co-sign a
+    /// [`BilateralDeliveryReceipt`] with `peer_key`, and immediately volatile-zeroizes all
+    /// temporary buffers before returning.
+    pub fn mine_bilateral_pad_batch(
+        provider_id: ValidatorId,
+        counterparty_id: ValidatorId,
+        epoch: u64,
+        pad_pages: usize,
+        beaver_triples: usize,
+        peer_key: &PeerReceiptKey,
+    ) -> Result<(MinedPadBatch, PopCommitment, BilateralDeliveryReceipt), PopError> {
+        let mut channel = Bb84Channel::default_channel();
+        Self::mine_bilateral_pad_batch_with_channel(
+            provider_id,
+            counterparty_id,
+            epoch,
+            pad_pages,
+            beaver_triples,
+            peer_key,
+            &mut channel,
+        )
+    }
+
+    /// Mine a bilateral pad + Beaver triple batch using a caller-supplied `Bb84Channel`.
+    pub fn mine_bilateral_pad_batch_with_channel<E: EntropySource>(
+        provider_id: ValidatorId,
+        counterparty_id: ValidatorId,
+        epoch: u64,
+        pad_pages: usize,
+        beaver_triples: usize,
+        peer_key: &PeerReceiptKey,
+        channel: &mut Bb84Channel<E>,
+    ) -> Result<(MinedPadBatch, PopCommitment, BilateralDeliveryReceipt), PopError> {
+        if provider_id == counterparty_id {
+            return Err(PopError::SelfCoSignForbidden(provider_id));
+        }
+        if pad_pages == 0 {
+            return Err(PopError::EmptyBatch("pad_pages must be > 0"));
+        }
+        if beaver_triples == 0 {
+            return Err(PopError::EmptyBatch("beaver_triples must be > 0"));
+        }
+
+        let pad_total_bytes = pad_pages
+            .checked_mul(PAD_PAGE_BYTES)
+            .ok_or(PopError::InvalidParameter("pad_pages byte count overflow"))?;
+        let triple_total_bytes = beaver_triples
+            .checked_mul(32)
+            .ok_or(PopError::InvalidParameter("beaver_triples byte count overflow"))?;
+        let total_qkd_bytes = pad_total_bytes
+            .checked_add(triple_total_bytes)
+            .ok_or(PopError::InvalidParameter("total QKD byte count overflow"))?;
+
+        let mut exchange = channel.exchange_key(total_qkd_bytes)?;
+        if !ct_eq_slice(&exchange.alice_key, &exchange.bob_key) {
+            zeroize_slice(&mut exchange.alice_key);
+            zeroize_slice(&mut exchange.bob_key);
+            return Err(PopError::QkdChannelError(
+                "bilateral QKD key reconciliation mismatch between provider and counterparty"
+                    .into(),
+            ));
+        }
+
+        let qkd_telemetry = QkdTelemetry::from_exchange(&exchange);
+
+        let mut alice_pages = Vec::with_capacity(pad_pages);
+        for chunk in exchange.alice_key[..pad_total_bytes].chunks_exact(PAD_PAGE_BYTES) {
+            alice_pages.push(chunk.to_vec());
+        }
+
+        let mut bob_pages = Vec::with_capacity(pad_pages);
+        for chunk in exchange.bob_key[..pad_total_bytes].chunks_exact(PAD_PAGE_BYTES) {
+            bob_pages.push(chunk.to_vec());
+        }
+
+        let mut triples = Vec::with_capacity(beaver_triples);
+        let mut triple_buf = [0u8; 32];
+        for chunk in exchange.alice_key[pad_total_bytes..].chunks_exact(32) {
+            triple_buf.copy_from_slice(chunk);
+            triples.push(BeaverTriple::from_purified_bytes(&triple_buf));
+        }
+        zeroize_slice(&mut triple_buf);
+        zeroize_slice(&mut exchange.alice_key);
+        zeroize_slice(&mut exchange.bob_key);
+
+        let batch = MinedPadBatch {
+            validator_id: provider_id,
+            pad_pages: alice_pages,
+            beaver_triples: triples,
+            qkd_telemetry,
+            page_size_bytes: PAD_PAGE_BYTES,
+        };
+
+        let commit_r = random_nonzero_field_elem();
+        let commit_s = random_field_elem();
+        let commitment = Self::commit_batch(&batch, commit_r, commit_s);
+
+        let receipt = BilateralDeliveryReceipt::issue_from_peer_pages(
+            provider_id,
+            counterparty_id,
+            epoch,
+            &bob_pages,
+            beaver_triples,
+            commit_r,
+            qkd_telemetry,
+            peer_key,
+        );
+
+        for page in &mut bob_pages {
+            zeroize_slice(page);
+        }
+
+        Ok((batch, commitment, receipt))
     }
 
     /// Commit to a mined pad batch BEFORE receiving [`PopAuditor::issue_challenge`].
@@ -1350,6 +1881,7 @@ impl PopAuditor {
 
         Ok(PopVerificationReceipt {
             validator_id: proof.validator_id,
+            counterparty_id: None,
             epoch: proof.epoch,
             mined_pad_pages: proof.pad_pages_mined,
             usable_pad_pages,
@@ -1360,6 +1892,140 @@ impl PopAuditor {
             contribution,
             verified_commitment_tag: proof.sample_commitment_tag,
         })
+    }
+
+    /// Full production Proof-of-Pad verification enforcing:
+    /// 1. Mandatory distinct counterparty [`BilateralDeliveryReceipt`] (blocks solo `/dev/urandom` farming).
+    /// 2. Anti-self-co-signing (`counterparty_id != provider_id`).
+    /// 3. Constant-time Carter-Wegman MAC verification & exact binding to `commitment.page_digests`
+    ///    and independently observed `QkdTelemetry`.
+    /// 4. All interactive commit-then-challenge, statistical entropy, Beaver triple, duplicate-page,
+    ///    and QKD checks.
+    /// 5. Sliding-window cross-epoch & cross-validator anti-replay enforcement via [`PopReplayRegistry`].
+    pub fn verify_bilateral_proof(
+        commitment: &PopCommitment,
+        challenge: &PopChallenge,
+        proof: &PopProof,
+        peer_receipt: Option<&BilateralDeliveryReceipt>,
+        peer_key: Option<&PeerReceiptKey>,
+        replay_registry: &mut PopReplayRegistry,
+    ) -> Result<PopVerificationReceipt, PopError> {
+        Self::verify_bilateral_proof_with_policy(
+            commitment,
+            challenge,
+            proof,
+            peer_receipt,
+            peer_key,
+            replay_registry,
+            &PopAuditPolicy::default(),
+        )
+    }
+
+    /// Full bilateral + anti-replay Proof-of-Pad verification against an explicit [`PopAuditPolicy`].
+    pub fn verify_bilateral_proof_with_policy(
+        commitment: &PopCommitment,
+        challenge: &PopChallenge,
+        proof: &PopProof,
+        peer_receipt: Option<&BilateralDeliveryReceipt>,
+        peer_key: Option<&PeerReceiptKey>,
+        replay_registry: &mut PopReplayRegistry,
+        policy: &PopAuditPolicy,
+    ) -> Result<PopVerificationReceipt, PopError> {
+        // 1. Require a counterparty bilateral delivery receipt and verification key.
+        let receipt = peer_receipt.ok_or(PopError::MissingPeerReceipt(
+            "counterparty bilateral delivery receipt is required (solo mining rejected)",
+        ))?;
+        let key = peer_key.ok_or(PopError::MissingPeerReceipt(
+            "counterparty verification key is required",
+        ))?;
+
+        // 2. Reject self-co-signing (provider cannot vouch for its own pad batch).
+        if receipt.counterparty_id == receipt.provider_id
+            || receipt.counterparty_id == challenge.validator_id
+            || receipt.counterparty_id == proof.validator_id
+        {
+            return Err(PopError::SelfCoSignForbidden(challenge.validator_id));
+        }
+
+        // 3. Bind receipt identity, epoch, batch dimensions, and canonical field elements.
+        if receipt.provider_id != challenge.validator_id {
+            return Err(PopError::ChallengeMismatch(format!(
+                "peer receipt provider_id mismatch: challenge={}, receipt={}",
+                challenge.validator_id, receipt.provider_id
+            )));
+        }
+        if receipt.epoch != challenge.epoch {
+            return Err(PopError::ChallengeMismatch(format!(
+                "peer receipt epoch mismatch: challenge={}, receipt={}",
+                challenge.epoch, receipt.epoch
+            )));
+        }
+        if receipt.pad_pages_delivered != commitment.pad_pages_mined
+            || receipt.beaver_triples_delivered != commitment.beaver_triples_mined
+        {
+            return Err(PopError::ChallengeMismatch(
+                "peer receipt delivered counts do not match pre-challenge commitment".into(),
+            ));
+        }
+        if receipt.commit_r == 0
+            || receipt.commit_r >= PRIME_P
+            || receipt.commit_r != commitment.commit_r
+        {
+            return Err(PopError::InvalidCommitmentTag("receipt_commit_r"));
+        }
+        if receipt.pages_commitment_digest >= PRIME_P {
+            return Err(PopError::InvalidCommitmentTag(
+                "non-canonical receipt pages_commitment_digest >= PRIME_P",
+            ));
+        }
+
+        // 4. Verify counterparty Carter-Wegman MAC in constant time.
+        if !receipt.verify_mac(key) {
+            return Err(PopError::InvalidPeerReceiptMac {
+                provider_id: receipt.provider_id,
+                counterparty_id: receipt.counterparty_id,
+            });
+        }
+
+        // 5. Verify counterparty's received page digest matches provider's committed `page_digests`.
+        if commitment.page_digests.iter().any(|&d| d >= PRIME_P) {
+            return Err(PopError::InvalidCommitmentTag(
+                "non-canonical commitment page_digest >= PRIME_P",
+            ));
+        }
+        let expected_pages_digest =
+            compute_pages_commitment_digest(&commitment.page_digests, commitment.commit_r);
+        if !ct_eq_16(
+            &expected_pages_digest.to_le_bytes(),
+            &receipt.pages_commitment_digest.to_le_bytes(),
+        ) {
+            return Err(PopError::InvalidPeerReceiptMac {
+                provider_id: receipt.provider_id,
+                counterparty_id: receipt.counterparty_id,
+            });
+        }
+
+        // 6. Verify provider's claimed QKD telemetry matches what the counterparty observed.
+        if receipt.observed_qkd.qber.to_bits() != proof.qkd_telemetry.qber.to_bits()
+            || receipt.observed_qkd.sifted_bits != proof.qkd_telemetry.sifted_bits
+            || receipt.observed_qkd.decoy_yield_ratio.to_bits()
+                != proof.qkd_telemetry.decoy_yield_ratio.to_bits()
+            || receipt.observed_qkd.single_photon_yield_lower_bound.to_bits()
+                != proof.qkd_telemetry.single_photon_yield_lower_bound.to_bits()
+        {
+            return Err(PopError::ChallengeMismatch(
+                "provider QKD telemetry disagrees with counterparty delivery receipt".into(),
+            ));
+        }
+
+        // 7. Run full commit-then-challenge, entropy, Beaver triple, duplicate-page, and QKD checks.
+        let mut verified = Self::verify_proof_with_policy(commitment, challenge, proof, policy)?;
+
+        // 8. Enforce cross-epoch & cross-validator anti-replay sliding window.
+        replay_registry.check_and_record(proof.epoch, commitment, proof, receipt)?;
+
+        verified.counterparty_id = Some(receipt.counterparty_id);
+        Ok(verified)
     }
 }
 
@@ -1386,12 +2052,118 @@ pub struct PopEpochReport {
     pub settlement: EpochSettlement,
 }
 
+/// Complete bilateral Proof-of-Pad epoch submission pairing a miner's commitment, challenge,
+/// and proof with its counterparty peer's co-signed [`BilateralDeliveryReceipt`].
+#[derive(Debug, Clone)]
+pub struct BilateralPopSubmission {
+    pub commitment: PopCommitment,
+    pub challenge: PopChallenge,
+    pub proof: PopProof,
+    pub peer_receipt: Option<BilateralDeliveryReceipt>,
+    pub peer_key: Option<PeerReceiptKey>,
+}
+
 /// Coordinates end-to-end interactive Proof-of-Pad audits, automatic slashing of cheaters,
 /// and `TokenomicsEngine` epoch reward settlement.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PopEpochCoordinator;
 
 impl PopEpochCoordinator {
+    /// Audit all participating validators' [`BilateralPopSubmission`]s for the current epoch with
+    /// mandatory bilateral counterparty receipts and cross-epoch/cross-validator anti-replay
+    /// enforcement, credit honest validators, slash cheaters, and settle the epoch reward pool.
+    pub fn run_bilateral_audited_epoch(
+        tokenomics: &mut TokenomicsEngine,
+        replay_registry: &mut PopReplayRegistry,
+        submissions: &[BilateralPopSubmission],
+    ) -> PopEpochReport {
+        Self::run_bilateral_audited_epoch_with_policy(
+            tokenomics,
+            replay_registry,
+            submissions,
+            &PopAuditPolicy::default(),
+        )
+    }
+
+    /// Bilateral + anti-replay epoch audit and settlement using an explicit [`PopAuditPolicy`].
+    pub fn run_bilateral_audited_epoch_with_policy(
+        tokenomics: &mut TokenomicsEngine,
+        replay_registry: &mut PopReplayRegistry,
+        submissions: &[BilateralPopSubmission],
+        policy: &PopAuditPolicy,
+    ) -> PopEpochReport {
+        let current_epoch = tokenomics.current_epoch();
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        let mut outcomes = Vec::with_capacity(submissions.len());
+        let mut seen_validators = BTreeSet::new();
+
+        for sub in submissions {
+            let validator_id = sub.challenge.validator_id;
+
+            let audit_result = if sub.challenge.epoch != current_epoch {
+                Err(PopError::CoordinatorRejected(format!(
+                    "stale or future challenge epoch {} != current epoch {current_epoch}",
+                    sub.challenge.epoch
+                )))
+            } else if !seen_validators.insert(validator_id) {
+                Err(PopError::CoordinatorRejected(format!(
+                    "duplicate PoP submission for validator {validator_id} in epoch {current_epoch}"
+                )))
+            } else {
+                PopAuditor::verify_bilateral_proof_with_policy(
+                    &sub.commitment,
+                    &sub.challenge,
+                    &sub.proof,
+                    sub.peer_receipt.as_ref(),
+                    sub.peer_key.as_ref(),
+                    replay_registry,
+                    policy,
+                )
+            };
+
+            match audit_result {
+                Ok(receipt) => match tokenomics
+                    .record_contribution(receipt.validator_id, receipt.contribution)
+                {
+                    Ok(()) => {
+                        outcomes.push(PopAuditOutcome::Accepted(receipt.clone()));
+                        accepted.push(receipt);
+                    }
+                    Err(tok_err) => {
+                        let err = PopError::TokenomicsFailure(tok_err.to_string());
+                        outcomes.push(PopAuditOutcome::Rejected {
+                            validator_id: receipt.validator_id,
+                            error: err.clone(),
+                            slashing: None,
+                        });
+                        rejected.push((receipt.validator_id, err, None));
+                    }
+                },
+                Err(err) => {
+                    let slashing = err.slashing_offense().and_then(|offense| {
+                        tokenomics.slash_validator(validator_id, offense).ok()
+                    });
+                    outcomes.push(PopAuditOutcome::Rejected {
+                        validator_id,
+                        error: err.clone(),
+                        slashing: slashing.clone(),
+                    });
+                    rejected.push((validator_id, err, slashing));
+                }
+            }
+        }
+
+        let settlement = tokenomics.settle_epoch();
+
+        PopEpochReport {
+            epoch: current_epoch,
+            accepted,
+            rejected,
+            outcomes,
+            settlement,
+        }
+    }
     /// Audit all participating validators' `(PopCommitment, PopChallenge, PopProof)` submissions
     /// for the current epoch, credit honest validators in `tokenomics`, slash cheating validators,
     /// and settle the halving `VRNM` epoch subsidy + 80% Pad-Burn fee pool.
@@ -1822,5 +2594,352 @@ mod tests {
         assert!(report.rejected[0].2.is_none(), "stale epoch must not slash");
         assert_eq!(engine.vault(1).unwrap().bond, DEFAULT_REQUIRED_BOND);
         assert_eq!(engine.vault(1).unwrap().status, ValidatorStatus::Active);
+    }
+
+    #[test]
+    fn test_honest_bilateral_pop_passes_audit_and_records_counterparty() {
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.mint_genesis_supply(50 * VERN_PER_VRNM).unwrap();
+        for vid in 0..4u64 {
+            engine.register_genesis_validator(vid).unwrap();
+        }
+        let mut replay = PopReplayRegistry::default();
+        let epoch = engine.current_epoch();
+
+        let mut submissions = Vec::with_capacity(4);
+        for vid in 0..4u64 {
+            let counterparty = (vid + 1) % 4;
+            let key = PeerReceiptKey::generate();
+            // Redacted Debug check: secret scalars must never print.
+            let dbg = format!("{key:?}");
+            assert!(dbg.contains("[REDACTED]"));
+
+            let (mut batch, commit, peer_receipt) =
+                PopMiner::mine_bilateral_pad_batch(vid, counterparty, epoch, 8, 12, &key).unwrap();
+            let challenge = PopAuditor::issue_challenge(vid, epoch);
+            let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
+
+            submissions.push(BilateralPopSubmission {
+                commitment: commit,
+                challenge,
+                proof,
+                peer_receipt: Some(peer_receipt),
+                peer_key: Some(key),
+            });
+        }
+
+        let report =
+            PopEpochCoordinator::run_bilateral_audited_epoch(&mut engine, &mut replay, &submissions);
+        assert_eq!(report.accepted.len(), 4);
+        assert!(report.rejected.is_empty());
+        for (i, rcpt) in report.accepted.iter().enumerate() {
+            assert_eq!(rcpt.validator_id, i as u64);
+            assert_eq!(rcpt.counterparty_id, Some(((i + 1) % 4) as u64));
+        }
+        assert!(replay.tracked_pad_fingerprints() >= 4);
+        assert_eq!(report.settlement.subsidy_minted, INITIAL_EPOCH_REWARD);
+        engine.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn test_solo_urandom_farming_without_peer_receipt_is_rejected_and_slashed() {
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.register_genesis_validator(1).unwrap();
+        engine.register_genesis_validator(2).unwrap();
+        let mut replay = PopReplayRegistry::default();
+
+        // Validator 1 mines honestly with counterparty 2.
+        let key1 = PeerReceiptKey::generate();
+        let (mut b1, c1, r1) = PopMiner::mine_bilateral_pad_batch(1, 2, 0, 8, 8, &key1).unwrap();
+        let ch1 = PopAuditor::issue_challenge(1, 0);
+        let p1 = PopMiner::answer_challenge(&mut b1, &ch1);
+
+        // Validator 2 farms solo local pads without any counterparty peer receipt!
+        let mut b2 = PopMiner::mine_pad_batch(2, 8, 8).unwrap();
+        let c2 = commit_helper(&b2);
+        let ch2 = PopAuditor::issue_challenge(2, 0);
+        let p2 = PopMiner::answer_challenge(&mut b2, &ch2);
+
+        let subs = vec![
+            BilateralPopSubmission {
+                commitment: c1,
+                challenge: ch1,
+                proof: p1,
+                peer_receipt: Some(r1),
+                peer_key: Some(key1),
+            },
+            BilateralPopSubmission {
+                commitment: c2,
+                challenge: ch2,
+                proof: p2,
+                peer_receipt: None,
+                peer_key: None,
+            },
+        ];
+
+        let report =
+            PopEpochCoordinator::run_bilateral_audited_epoch(&mut engine, &mut replay, &subs);
+        assert_eq!(report.accepted.len(), 1);
+        assert_eq!(report.accepted[0].validator_id, 1);
+        assert_eq!(report.rejected.len(), 1);
+        assert_eq!(report.rejected[0].0, 2);
+        assert!(matches!(report.rejected[0].1, PopError::MissingPeerReceipt(_)));
+        let slash = report.rejected[0].2.as_ref().expect("solo farmer must be slashed 50%");
+        assert_eq!(slash.offense, SlashingOffense::InconsistentMpcShare);
+        assert_eq!(slash.slashed_amount, DEFAULT_REQUIRED_BOND / 2);
+        assert_eq!(engine.vault(2).unwrap().status, ValidatorStatus::Jailed);
+        assert_eq!(engine.vault(2).unwrap().reward_balance, 0);
+    }
+
+    #[test]
+    fn test_self_cosign_forged_mac_batch_swap_and_qkd_lie_rejected_and_slashed() {
+        let mut replay = PopReplayRegistry::default();
+
+        // 1. Self-co-sign rejected directly at mining and at auditor.
+        let key_self = PeerReceiptKey::generate();
+        assert_eq!(
+            PopMiner::mine_bilateral_pad_batch(3, 3, 0, 6, 6, &key_self).unwrap_err(),
+            PopError::SelfCoSignForbidden(3)
+        );
+        let mut b_self = PopMiner::mine_pad_batch(3, 6, 6).unwrap();
+        let c_self = commit_helper(&b_self);
+        let self_receipt = BilateralDeliveryReceipt::issue_from_peer_pages(
+            3,
+            3, // provider_id == counterparty_id!
+            0,
+            &b_self.pad_pages,
+            6,
+            c_self.commit_r,
+            b_self.qkd_telemetry,
+            &key_self,
+        );
+        let ch_self = PopAuditor::issue_challenge(3, 0);
+        let p_self = PopMiner::answer_challenge(&mut b_self, &ch_self);
+        let err = PopAuditor::verify_bilateral_proof(
+            &c_self,
+            &ch_self,
+            &p_self,
+            Some(&self_receipt),
+            Some(&key_self),
+            &mut replay,
+        )
+        .unwrap_err();
+        assert_eq!(err, PopError::SelfCoSignForbidden(3));
+        assert_eq!(err.slashing_offense(), Some(SlashingOffense::InconsistentMpcShare));
+
+        // 2. Forged counterparty MAC (wrong PeerReceiptKey or flipped bit).
+        let real_key = PeerReceiptKey::generate();
+        let fake_key = PeerReceiptKey::generate();
+        let (mut b_forg, c_forg, mut r_forg) =
+            PopMiner::mine_bilateral_pad_batch(4, 5, 0, 6, 6, &real_key).unwrap();
+        let ch_forg = PopAuditor::issue_challenge(4, 0);
+        let p_forg = PopMiner::answer_challenge(&mut b_forg, &ch_forg);
+        // Verify fails under wrong key:
+        let err_wrong_key = PopAuditor::verify_bilateral_proof(
+            &c_forg,
+            &ch_forg,
+            &p_forg,
+            Some(&r_forg),
+            Some(&fake_key),
+            &mut replay,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err_wrong_key,
+            PopError::InvalidPeerReceiptMac {
+                provider_id: 4,
+                counterparty_id: 5,
+            }
+        );
+        // Flip 1 bit in counterparty_mac:
+        r_forg.counterparty_mac[3] ^= 0x40;
+        let err_bitflip = PopAuditor::verify_bilateral_proof(
+            &c_forg,
+            &ch_forg,
+            &p_forg,
+            Some(&r_forg),
+            Some(&real_key),
+            &mut replay,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err_bitflip,
+            PopError::InvalidPeerReceiptMac {
+                provider_id: 4,
+                counterparty_id: 5,
+            }
+        );
+
+        // 3. Batch-swap attack: provider gets a genuine receipt for batch A, then commits random noise batch B!
+        let key_swap = PeerReceiptKey::generate();
+        let (_batch_a, commit_a, receipt_a) =
+            PopMiner::mine_bilateral_pad_batch(6, 7, 0, 6, 6, &key_swap).unwrap();
+        let mut batch_b = PopMiner::mine_pad_batch(6, 6, 6).unwrap();
+        // Force same commit_r so only the pad contents differ:
+        let commit_b = PopMiner::commit_batch(&batch_b, commit_a.commit_r, random_field_elem());
+        let ch_swap = PopAuditor::issue_challenge(6, 0);
+        let proof_b = PopMiner::answer_challenge(&mut batch_b, &ch_swap);
+        let err_swap = PopAuditor::verify_bilateral_proof(
+            &commit_b,
+            &ch_swap,
+            &proof_b,
+            Some(&receipt_a),
+            Some(&key_swap),
+            &mut replay,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err_swap,
+            PopError::InvalidPeerReceiptMac {
+                provider_id: 6,
+                counterparty_id: 7,
+            }
+        );
+
+        // 4. QKD telemetry lie: provider tampers with proof.qkd_telemetry vs peer's observed_qkd.
+        let key_lie = PeerReceiptKey::generate();
+        let (mut b_lie, c_lie, r_lie) =
+            PopMiner::mine_bilateral_pad_batch(8, 9, 0, 6, 6, &key_lie).unwrap();
+        let ch_lie = PopAuditor::issue_challenge(8, 0);
+        let mut p_lie = PopMiner::answer_challenge(&mut b_lie, &ch_lie);
+        p_lie.qkd_telemetry.qber = 0.0001; // Provider fakes lower QBER than peer observed!
+        let err_lie = PopAuditor::verify_bilateral_proof(
+            &c_lie,
+            &ch_lie,
+            &p_lie,
+            Some(&r_lie),
+            Some(&key_lie),
+            &mut replay,
+        )
+        .unwrap_err();
+        assert!(matches!(err_lie, PopError::ChallengeMismatch(_)));
+        assert_eq!(
+            err_lie.slashing_offense(),
+            Some(SlashingOffense::InconsistentMpcShare)
+        );
+    }
+
+    #[test]
+    fn test_cross_epoch_pad_replay_and_cross_validator_pad_theft_slashed() {
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.register_genesis_validator(1).unwrap();
+        engine.register_genesis_validator(2).unwrap();
+        let mut replay = PopReplayRegistry::new(8);
+
+        // Epoch 0: Validator 1 mines an honest bilateral batch (save a clone of its raw pages
+        // before sacrificing so we can simulate replaying the exact same pads in Epoch 1!).
+        let key_e0 = PeerReceiptKey::generate();
+        let (mut batch_e0, commit_e0, receipt_e0) =
+            PopMiner::mine_bilateral_pad_batch(1, 2, 0, 6, 6, &key_e0).unwrap();
+        let saved_pages = batch_e0.pad_pages.clone();
+        let saved_qkd = batch_e0.qkd_telemetry;
+
+        let ch_e0 = PopAuditor::issue_challenge(1, 0);
+        let proof_e0 = PopMiner::answer_challenge(&mut batch_e0, &ch_e0);
+
+        let r0 = PopEpochCoordinator::run_bilateral_audited_epoch(
+            &mut engine,
+            &mut replay,
+            &[BilateralPopSubmission {
+                commitment: commit_e0,
+                challenge: ch_e0,
+                proof: proof_e0,
+                peer_receipt: Some(receipt_e0),
+                peer_key: Some(key_e0),
+            }],
+        );
+        assert_eq!(r0.accepted.len(), 1);
+
+        // Epoch 1: Validator 1 tries to RECYCLE the exact same Epoch 0 pad pages (even with a
+        // fresh commitment, fresh Epoch 1 receipt, and fresh challenge!).
+        let key_e1 = PeerReceiptKey::generate();
+        let mut recycled_batch = MinedPadBatch::from_raw_parts(
+            1,
+            saved_pages.clone(),
+            vec![BeaverTriple::generate(); 6],
+            saved_qkd,
+        );
+        let commit_e1 = commit_helper(&recycled_batch);
+        let receipt_e1 = BilateralDeliveryReceipt::issue_from_peer_pages(
+            1,
+            2,
+            1,
+            &saved_pages,
+            6,
+            commit_e1.commit_r,
+            saved_qkd,
+            &key_e1,
+        );
+        // Use all 6 slots so at least one of Epoch 0's opened pages is deterministically sampled.
+        let ch_e1 = PopAuditor::issue_challenge_with_slots(1, 1, 6);
+        let proof_e1 = PopMiner::answer_challenge(&mut recycled_batch, &ch_e1);
+
+        // Also simulate Validator 2 STEALING Validator 1's pads in Epoch 1!
+        let key_theft = PeerReceiptKey::generate();
+        let mut stolen_batch = MinedPadBatch::from_raw_parts(
+            2,
+            saved_pages.clone(),
+            vec![BeaverTriple::generate(); 6],
+            saved_qkd,
+        );
+        let commit_theft = commit_helper(&stolen_batch);
+        let receipt_theft = BilateralDeliveryReceipt::issue_from_peer_pages(
+            2,
+            1,
+            1,
+            &saved_pages,
+            6,
+            commit_theft.commit_r,
+            saved_qkd,
+            &key_theft,
+        );
+        let ch_theft = PopAuditor::issue_challenge_with_slots(2, 1, 6);
+        let proof_theft = PopMiner::answer_challenge(&mut stolen_batch, &ch_theft);
+
+        let r1 = PopEpochCoordinator::run_bilateral_audited_epoch(
+            &mut engine,
+            &mut replay,
+            &[
+                BilateralPopSubmission {
+                    commitment: commit_e1,
+                    challenge: ch_e1,
+                    proof: proof_e1,
+                    peer_receipt: Some(receipt_e1),
+                    peer_key: Some(key_e1),
+                },
+                BilateralPopSubmission {
+                    commitment: commit_theft,
+                    challenge: ch_theft,
+                    proof: proof_theft,
+                    peer_receipt: Some(receipt_theft),
+                    peer_key: Some(key_theft),
+                },
+            ],
+        );
+        assert!(r1.accepted.is_empty());
+        assert_eq!(r1.rejected.len(), 2);
+        for (vid, err, maybe_slash) in &r1.rejected {
+            assert!(
+                matches!(
+                    err,
+                    PopError::CrossEpochPadReplay {
+                        validator_id,
+                        prior_validator_id: 1,
+                        prior_epoch: 0,
+                        current_epoch: 1,
+                    } if validator_id == vid
+                ),
+                "expected CrossEpochPadReplay for validator {vid}, got {err:?}"
+            );
+            let slash = maybe_slash.as_ref().expect("replayer/thief must be slashed 50%");
+            assert_eq!(slash.offense, SlashingOffense::InconsistentMpcShare);
+            assert_eq!(slash.slashed_amount, DEFAULT_REQUIRED_BOND / 2);
+        }
+        assert_eq!(engine.vault(1).unwrap().status, ValidatorStatus::Jailed);
+        assert_eq!(engine.vault(2).unwrap().status, ValidatorStatus::Jailed);
+
+        // Sliding window pruning check: advancing beyond max_history_epochs (8) prunes epoch 0!
+        replay.prune_expired(20);
+        assert_eq!(replay.tracked_pad_fingerprints(), 0);
     }
 }

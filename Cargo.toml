@@ -1,6 +1,6 @@
 [package]
 name = "vernam-rs"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Vernam (VRNM) v1.0: Zero-admin, 100% decentralized, information-theoretically secure OTP cryptocurrency core"
 

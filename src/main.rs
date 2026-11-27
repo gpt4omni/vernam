@@ -15,10 +15,13 @@ use vernam_rs::dynamic_quorum::{
 };
 use vernam_rs::entropy_beacon::{AutonomousEpochClock, BeaconConfig, OtpChannelKey, VernamBeacon};
 use vernam_rs::fast_engine::run_speed_benchmarks;
-use vernam_rs::field::{random_field_elem, random_nonzero_field_elem};
+use vernam_rs::field::random_field_elem;
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
 use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
-use vernam_rs::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
+use vernam_rs::pop_mining::{
+    BilateralPopSubmission, PeerReceiptKey, PopAuditor, PopEpochCoordinator, PopMiner,
+    PopReplayRegistry,
+};
 use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
 use vernam_rs::qkd::{
     AttackProfile, Bb84Channel, BufferedQkdPool, PoolConfig, QkdKeyProvider,
@@ -221,7 +224,7 @@ fn cmd_node(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_pop_mine() -> Result<(), String> {
-    println!("=== Vernam (VRNM) Verified Proof-of-Pad (PoP) Entropy Mining Audit ===");
+    println!("=== Vernam (VRNM) Bilateral Proof-of-Pad (PoP) Entropy Mining Audit ===");
     let mut tok = TokenomicsEngine::with_defaults();
     tok.mint_genesis_supply(10_000 * VERN_PER_VRNM)
         .map_err(|e| format!("{e}"))?;
@@ -229,30 +232,42 @@ fn cmd_pop_mine() -> Result<(), String> {
         tok.register_genesis_validator(vid)
             .map_err(|e| format!("{e}"))?;
     }
+    let mut replay = PopReplayRegistry::default();
     let epoch = tok.current_epoch();
-    let mut proofs = Vec::new();
+    let mut submissions = Vec::with_capacity(4);
     for vid in 0..4u64 {
-        let mut batch = PopMiner::mine_pad_batch(vid, 8, 8).map_err(|e| format!("{e}"))?;
-        let commit =
-            PopMiner::commit_batch(&batch, random_nonzero_field_elem(), random_field_elem());
+        let counterparty = (vid + 1) % 4;
+        let peer_key = PeerReceiptKey::generate();
+        let (mut batch, commit, peer_receipt) =
+            PopMiner::mine_bilateral_pad_batch(vid, counterparty, epoch, 8, 8, &peer_key)
+                .map_err(|e| format!("{e}"))?;
         let challenge = PopAuditor::issue_challenge(vid, epoch);
         let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
-        let rcpt =
-            PopAuditor::verify_proof(&commit, &challenge, &proof).map_err(|e| format!("{e}"))?;
+        submissions.push(BilateralPopSubmission {
+            commitment: commit,
+            challenge,
+            proof,
+            peer_receipt: Some(peer_receipt),
+            peer_key: Some(peer_key),
+        });
+    }
+    let report = PopEpochCoordinator::run_bilateral_audited_epoch(&mut tok, &mut replay, &submissions);
+    for rcpt in &report.accepted {
         println!(
-            "  Validator V{vid}: PASS | monobit_z={:.3} runs_z={:.3} QBER={:.2}% beaver_triple=OK",
+            "  Validator V{} <-> Peer V{}: PASS | monobit_z={:.3} runs_z={:.3} QBER={:.2}% beaver_triple=OK peer_receipt=OK anti_replay=OK",
+            rcpt.validator_id,
+            rcpt.counterparty_id.unwrap_or(0),
             rcpt.entropy_stats.monobit_z_score,
             rcpt.entropy_stats.runs_z_score,
             rcpt.qkd_telemetry.qber * 100.0
         );
-        proofs.push((commit, challenge, proof));
     }
-    let report = PopEpochCoordinator::run_audited_epoch(&mut tok, &proofs);
     println!(
-        "Epoch #{} settled: {}/{} passed, minted {} across {} validators!",
+        "Epoch #{} settled: {}/{} passed (anti-replay tracked={} pads), minted {} across {} validators!",
         report.settlement.epoch,
         report.accepted.len(),
-        proofs.len(),
+        submissions.len(),
+        replay.tracked_pad_fingerprints(),
         fmt_vrnm(report.settlement.subsidy_minted),
         report.settlement.payouts.len()
     );
@@ -297,20 +312,35 @@ fn cmd_miner(args: &[String]) -> Result<(), String> {
     println!("  Batch Size   : {pages} OTP pages ({} B) + {triples} Beaver triples / round", pages * FRAME_BYTES);
     println!("========================================================================");
 
+    let counterparty_id = validator_id.wrapping_add(1);
+    let mut replay = PopReplayRegistry::default();
     let mut round: usize = 0;
     loop {
         round += 1;
         let t0 = Instant::now();
         // Strictly single-threaded 1-core execution when cores == 1 (or parallel workers if > 1).
         let (rcpt, total_pages, total_triples) = if cores == 1 {
-            let mut batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
-                .map_err(|e| format!("PoP mine failed: {e}"))?;
-            let commit =
-                PopMiner::commit_batch(&batch, random_nonzero_field_elem(), random_field_elem());
+            let peer_key = PeerReceiptKey::generate();
+            let (mut batch, commit, peer_receipt) = PopMiner::mine_bilateral_pad_batch(
+                validator_id,
+                counterparty_id,
+                round as u64,
+                pages,
+                triples,
+                &peer_key,
+            )
+            .map_err(|e| format!("PoP bilateral mine failed: {e}"))?;
             let challenge = PopAuditor::issue_challenge(validator_id, round as u64);
             let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
-            let rcpt = PopAuditor::verify_proof(&commit, &challenge, &proof)
-                .map_err(|e| format!("self-audit failed: {e}"))?;
+            let rcpt = PopAuditor::verify_bilateral_proof(
+                &commit,
+                &challenge,
+                &proof,
+                Some(&peer_receipt),
+                Some(&peer_key),
+                &mut replay,
+            )
+            .map_err(|e| format!("bilateral self-audit failed: {e}"))?;
             (rcpt, pages, triples)
         } else {
             let mut results = Vec::with_capacity(cores);
@@ -318,17 +348,28 @@ fn cmd_miner(args: &[String]) -> Result<(), String> {
                 let mut handles = Vec::with_capacity(cores);
                 for c in 0..cores {
                     handles.push(s.spawn(move || -> Result<_, String> {
-                        let mut batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
-                            .map_err(|e| format!("worker {c}: {e}"))?;
-                        let cm = PopMiner::commit_batch(
-                            &batch,
-                            random_nonzero_field_elem(),
-                            random_field_elem(),
-                        );
+                        let peer_key = PeerReceiptKey::generate();
+                        let mut worker_replay = PopReplayRegistry::default();
+                        let (mut batch, cm, peer_receipt) = PopMiner::mine_bilateral_pad_batch(
+                            validator_id,
+                            counterparty_id,
+                            round as u64,
+                            pages,
+                            triples,
+                            &peer_key,
+                        )
+                        .map_err(|e| format!("worker {c}: {e}"))?;
                         let ch = PopAuditor::issue_challenge(validator_id, round as u64);
                         let pr = PopMiner::answer_challenge(&mut batch, &ch).with_liveness(1, 1);
-                        PopAuditor::verify_proof(&cm, &ch, &pr)
-                            .map_err(|e| format!("worker {c}: {e}"))
+                        PopAuditor::verify_bilateral_proof(
+                            &cm,
+                            &ch,
+                            &pr,
+                            Some(&peer_receipt),
+                            Some(&peer_key),
+                            &mut worker_replay,
+                        )
+                        .map_err(|e| format!("worker {c}: {e}"))
                     }));
                 }
                 for h in handles {

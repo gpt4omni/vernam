@@ -19,8 +19,11 @@ use std::time::{Duration, Instant};
 
 use crate::bft::{BftCluster, BftConfig, BinaryTx, WebOfTrustRegistry};
 use crate::explorer_ui::VERNAM_EXPLORER_HTML;
-use crate::field::{random_field_elem, random_nonzero_field_elem, zeroize_slice};
-use crate::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
+use crate::field::zeroize_slice;
+use crate::pop_mining::{
+    BilateralPopSubmission, PeerReceiptKey, PopAuditor, PopEpochCoordinator, PopMiner,
+    PopReplayRegistry,
+};
 use crate::privacy_mpc::{
     BeaverPool, ConfidentialTransferRequest, DEFAULT_BUCKET_SIZE, DEFAULT_NUM_VALIDATORS,
     DEFAULT_THRESHOLD, ShardedPrivateLedger,
@@ -192,6 +195,8 @@ pub struct TestnetState {
     pub qkd_channel: Bb84Channel<OsEntropySource>,
     /// Live 21M-cap Proof-of-Pad tokenomics & 80/20 pad-burn fee engine.
     pub tokenomics: TokenomicsEngine,
+    /// Persistent cross-epoch & cross-validator PoP anti-replay registry.
+    pub pop_replay_registry: PopReplayRegistry,
     /// Live Proof-of-Personhood Web-of-Trust registry (1-human = 1-vote).
     pub wot_registry: WebOfTrustRegistry,
     /// Monotonic counter of settled Express transactions.
@@ -277,6 +282,7 @@ impl TestnetState {
             beaver_pool,
             qkd_channel,
             tokenomics,
+            pop_replay_registry: PopReplayRegistry::default(),
             wot_registry,
             express_txs: 0,
             shielded_txs: 0,
@@ -1335,7 +1341,7 @@ impl TestnetServer {
             ("GET", "/") => HttpResponse::html(VERNAM_EXPLORER_HTML.to_string()),
 
             ("GET", "/health") => HttpResponse::ok_json(
-                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"0.4.0\"}"
+                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"1.0.1\"}"
                     .to_string(),
             ),
 
@@ -1391,62 +1397,88 @@ impl TestnetServer {
                     return resp;
                 }
                 // Read current epoch briefly, then drop mutex so /health and /status never stall
-                // while PoP QKD/entropy mining & commit-then-challenge verification execute.
+                // while bilateral PoP QKD/entropy mining & commit-then-challenge proofs run.
                 let (epoch, mut last_qber) = {
                     let guard = state.lock().expect("testnet state mutex poisoned");
                     (guard.tokenomics.current_epoch(), guard.last_qber)
                 };
 
-                let mut proofs = Vec::with_capacity(4);
-                let mut last_monobit_z = 0.0f64;
-                let mut last_runs_z = 0.0f64;
-                let mut all_valid = true;
+                let mut submissions = Vec::with_capacity(4);
+                let mut all_mined = true;
 
                 for vid in 0..4u64 {
-                    match PopMiner::mine_pad_batch(vid, 8, 8) {
-                        Ok(mut batch) => {
-                            let commit = PopMiner::commit_batch(
-                                &batch,
-                                random_nonzero_field_elem(),
-                                random_field_elem(),
-                            );
+                    let counterparty = (vid + 1) % 4;
+                    let peer_key = PeerReceiptKey::generate();
+                    match PopMiner::mine_bilateral_pad_batch(
+                        vid,
+                        counterparty,
+                        epoch,
+                        8,
+                        8,
+                        &peer_key,
+                    ) {
+                        Ok((mut batch, commit, peer_receipt)) => {
                             let challenge = PopAuditor::issue_challenge(vid, epoch);
                             let proof = PopMiner::answer_challenge(&mut batch, &challenge)
                                 .with_liveness(1, 1);
-                            if let Ok(rcpt) = PopAuditor::verify_proof(&commit, &challenge, &proof) {
-                                last_monobit_z = rcpt.entropy_stats.monobit_z_score;
-                                last_runs_z = rcpt.entropy_stats.runs_z_score;
-                                last_qber = rcpt.qkd_telemetry.qber;
-                            } else {
-                                all_valid = false;
-                            }
-                            proofs.push((commit, challenge, proof));
+                            submissions.push(BilateralPopSubmission {
+                                commitment: commit,
+                                challenge,
+                                proof,
+                                peer_receipt: Some(peer_receipt),
+                                peer_key: Some(peer_key),
+                            });
                         }
                         Err(_) => {
-                            all_valid = false;
+                            all_mined = false;
                         }
                     }
                 }
 
                 let mut guard = state.lock().expect("testnet state mutex poisoned");
-                let report = PopEpochCoordinator::run_audited_epoch(&mut guard.tokenomics, &proofs);
+                let TestnetState {
+                    ref mut tokenomics,
+                    ref mut pop_replay_registry,
+                    ..
+                } = *guard;
+                let report = PopEpochCoordinator::run_bilateral_audited_epoch(
+                    tokenomics,
+                    pop_replay_registry,
+                    &submissions,
+                );
+                let tracked_pads = guard.pop_replay_registry.tracked_pad_fingerprints();
+                let mut last_monobit_z = 0.0f64;
+                let mut last_runs_z = 0.0f64;
+                let mut all_bilateral_ok =
+                    all_mined && report.accepted.len() == submissions.len() && !submissions.is_empty();
+                for rcpt in &report.accepted {
+                    last_monobit_z = rcpt.entropy_stats.monobit_z_score;
+                    last_runs_z = rcpt.entropy_stats.runs_z_score;
+                    last_qber = rcpt.qkd_telemetry.qber;
+                    if rcpt.counterparty_id.is_none() {
+                        all_bilateral_ok = false;
+                    }
+                }
                 let _ = guard.shielded_ledger.proactive_refresh_epoch();
                 guard.last_qber = last_qber;
                 guard.push_event(format!(
-                    "POP MINE: epoch #{} audited {}/{} validators, subsidy={} vern, QBER={:.4}%",
+                    "POP MINE: epoch #{} bilateral-audited {}/{} validators (anti-replay={} pads), subsidy={} vern, QBER={:.4}%",
                     report.settlement.epoch,
                     report.accepted.len(),
-                    proofs.len(),
+                    submissions.len(),
+                    tracked_pads,
                     report.settlement.subsidy_minted,
                     last_qber * 100.0
                 ));
                 HttpResponse::ok_json(format!(
-                    "{{\"status\":\"mined\",\"epoch\":{},\"pss_epoch\":{},\"audited_validators\":{},\"passed_validators\":{},\"beaver_verified\":{},\"monobit_z\":{:.4},\"runs_z\":{:.4},\"qber\":{:.6},\"subsidy_minted_vern\":{},\"total_burned_vern\":{},\"circulating_supply_vern\":{}}}",
+                    "{{\"status\":\"mined\",\"epoch\":{},\"pss_epoch\":{},\"audited_validators\":{},\"passed_validators\":{},\"beaver_verified\":{},\"bilateral_receipts_verified\":{},\"anti_replay_tracked_pads\":{},\"monobit_z\":{:.4},\"runs_z\":{:.4},\"qber\":{:.6},\"subsidy_minted_vern\":{},\"total_burned_vern\":{},\"circulating_supply_vern\":{}}}",
                     report.settlement.epoch,
                     guard.shielded_ledger.epoch(),
-                    proofs.len(),
+                    submissions.len(),
                     report.accepted.len(),
-                    all_valid && report.accepted.len() == proofs.len() && !proofs.is_empty(),
+                    all_bilateral_ok,
+                    all_bilateral_ok,
+                    tracked_pads,
                     last_monobit_z,
                     last_runs_z,
                     last_qber,
@@ -1769,7 +1801,7 @@ mod tests {
         assert!(headers.contains("Access-Control-Allow-Origin: *"));
         assert_eq!(
             body,
-            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"0.4.0"}"#
+            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"1.0.1"}"#
         );
 
         // 2. GET / (Dark-mode interactive explorer HTML)
@@ -2007,6 +2039,8 @@ mod tests {
         );
         assert_eq!(resp_pop.status_code, 200, "pop mine failed: {}", resp_pop.body);
         assert!(resp_pop.body.contains("\"beaver_verified\":true"));
+        assert!(resp_pop.body.contains("\"bilateral_receipts_verified\":true"));
+        assert!(parse_json_u64(&resp_pop.body, "anti_replay_tracked_pads").unwrap_or(0) >= 4);
         assert_eq!(parse_json_u64(&resp_pop.body, "passed_validators"), Some(4));
         assert_eq!(parse_json_u64(&resp_pop.body, "audited_validators"), Some(4));
     }
