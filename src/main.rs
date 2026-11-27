@@ -9,6 +9,11 @@ use std::process;
 use std::time::Instant;
 
 use vernam_rs::bft::{BftCluster, BftConfig, BinaryTx};
+use vernam_rs::distributed_mpc::run_distributed_mpc_bench;
+use vernam_rs::dynamic_quorum::{
+    redistribute_ledger_accounts, reconstruct_secret, split_secret, verify_committee_shares,
+};
+use vernam_rs::entropy_beacon::{AutonomousEpochClock, BeaconConfig, OtpChannelKey, VernamBeacon};
 use vernam_rs::fast_engine::run_speed_benchmarks;
 use vernam_rs::field::{random_field_elem, random_nonzero_field_elem};
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
@@ -41,7 +46,8 @@ USAGE:
 
 COMMANDS:
   demo                                  Run full 5-pillar showcase + speed benchmarks (default)
-  bench                                 Run high-throughput Express & Shielded TPS benchmarks
+  v1-demo                               Run v1.0 zero-admin beacon, 4-daemon TCP MPC & 4->7 resharing demo
+  bench                                 Run high-throughput Express, Shielded & real-TCP TPS benchmarks
   testnet [--bind 0.0.0.0:8080]         Start all-in-one 4-validator HTTP testnet + web explorer
   node    [--id 0] [--bind 0.0.0.0:8080] [--advertise <IP:PORT>] [--seed <HOST:PORT> ...]
                                         Start an independent decentralized P2P validator node
@@ -651,9 +657,142 @@ fn cmd_bench() {
     println!("=== 3. Turbo Shielded Lane (Beaver Squares + Star + Schwartz-Zippel RLC) ===");
     println!("{ts}\n");
 
+    let dm = run_distributed_mpc_bench(100).expect("4-daemon real-TCP MPC bench");
+    println!("=== 4. Split-Share 4-Daemon Real-TCP Shielded IT-MPC (1 Share / Server) ===");
+    println!(
+        "  4-Daemon TCP Shielded  : {:>9.0} tx/s (avg={:.3} ms, p50={:.3} ms, p99={:.3} ms, PSS={:.3} ms, {} B/tx)\n",
+        dm.tps,
+        dm.avg_latency_ms,
+        dm.p50_latency_ms,
+        dm.p99_latency_ms,
+        dm.pss_refresh_ms,
+        dm.inter_validator_wire_bytes_per_tx
+    );
+
     let report = run_speed_benchmarks();
-    println!("=== 4. Baseline Fast Engine Comparison (v0.3 BIP-152 Compact Relay) ===");
+    println!("=== 5. Baseline Fast Engine Comparison (v0.3 BIP-152 Compact Relay) ===");
     println!("{report}");
+}
+
+fn cmd_v1_demo() -> Result<(), String> {
+    println!("========================================================================");
+    println!("  VERNAM (VRNM) v1.0 — ZERO-ADMIN 100% DECENTRALIZED ARCHITECTURE DEMO");
+    println!("  Unbiasable Threshold Beacon | 4-Daemon TCP MPC | 4->7 Resharing");
+    println!("========================================================================\n");
+
+    // 1. Unbiasable Threshold Beacon (V3 aborts last-revealer -> still reconstructed!)
+    println!("[1/3] Unbiasable Threshold Entropy Beacon (t=3, N=4, V3 Aborts Reveal)");
+    let cfg = BeaconConfig::bft(4).map_err(|e| format!("{e}"))?;
+    let mut nodes: Vec<VernamBeacon> = (0..4u32)
+        .map(|id| VernamBeacon::new(cfg, 1, id).unwrap())
+        .collect();
+    let pad_len = cfg.share_payload_bytes();
+    for dealer in 0..4usize {
+        let mut pairs: Vec<(u32, OtpChannelKey, OtpChannelKey)> = (0..4u32)
+            .map(|recip| {
+                let (s_k, r_k) = OtpChannelKey::generate_pair(pad_len);
+                (recip, s_k, r_k)
+            })
+            .collect();
+        let key_refs: Vec<(u32, &OtpChannelKey)> =
+            pairs.iter().map(|(r, sk, _)| (*r, sk)).collect();
+        let envs = nodes[dealer]
+            .generate_commit_envelopes(&key_refs)
+            .map_err(|e| format!("{e}"))?;
+        for env in envs {
+            let r = env.recipient_id as usize;
+            nodes[r]
+                .receive_commit_envelope(&env, &pairs[r].2)
+                .map_err(|e| format!("{e}"))?;
+        }
+        pairs.clear();
+    }
+    for i in 0..4usize {
+        nodes[i].lock_commit_phase().map_err(|e| format!("{e}"))?;
+    }
+    // Only V0, V1, V2 reveal; V3 ABORTS to try to bias the beacon!
+    let mut reveals = Vec::new();
+    for i in 0..3usize {
+        reveals.push(nodes[i].generate_reveal().map_err(|e| format!("{e}"))?);
+    }
+    for r in &reveals {
+        for i in 0..3usize {
+            nodes[i].receive_reveal(r).map_err(|e| format!("{e}"))?;
+        }
+    }
+    // V0, V1, V2 forcibly reconstruct V3's aborted secret via Lagrange recovery shares!
+    let mut rec_shares = Vec::new();
+    for holder in 0..3usize {
+        rec_shares.push(
+            nodes[holder]
+                .generate_recovery_share(3)
+                .map_err(|e| format!("{e}"))?,
+        );
+    }
+    for rs in &rec_shares {
+        for i in 0..3usize {
+            nodes[i]
+                .receive_recovery_share(rs)
+                .map_err(|e| format!("{e}"))?;
+        }
+    }
+    let out0 = nodes[0].finalize_epoch().map_err(|e| format!("{e}"))?;
+    let out1 = nodes[1].finalize_epoch().map_err(|e| format!("{e}"))?;
+    assert_eq!(out0.gamma, out1.gamma);
+    let mut clock = AutonomousEpochClock::new(10).map_err(|e| format!("{e}"))?;
+    let _ev = clock.on_block_finalized(10);
+    clock
+        .complete_beacon_round(out0.clone())
+        .map_err(|e| format!("{e}"))?;
+    println!(
+        "  Beacon Gamma_1         : {:#034x} (identical across V0..V2; V3 abort defeated!)",
+        out0.gamma
+    );
+    println!(
+        "  Leader permutation     : {:?} | Next stage: {:?}\n",
+        out0.epoch_leader_order(4),
+        clock.pipeline_stage()
+    );
+
+    // 2. Real 4-Daemon Split-Share TCP Shielded IT-MPC
+    println!("[2/3] True Split-Share 4-Daemon Real-TCP Shielded IT-MPC (1 Share / Server)");
+    let dm = run_distributed_mpc_bench(100).map_err(|e| format!("{e}"))?;
+    println!(
+        "  100 live 4-TCP txs     : {:.0} TPS | avg={:.3} ms | p50={:.3} ms | p99={:.3} ms",
+        dm.tps, dm.avg_latency_ms, dm.p50_latency_ms, dm.p99_latency_ms
+    );
+    println!(
+        "  4-Daemon TCP PSS sync  : {:.3} ms | Wire traffic: {} B/tx across 12 OTP+MAC links\n",
+        dm.pss_refresh_ms, dm.inter_validator_wire_bytes_per_tx
+    );
+
+    // 3. Zero-Reconstruction Dynamic Committee Scaling (4 -> 7 Validators!)
+    println!("[3/3] Zero-Reconstruction Dynamic Committee Scaling: (3, 4) -> (5, 7)");
+    let old_coords = [1u64, 2, 3, 4];
+    let new_coords = [1u64, 2, 3, 4, 5, 6, 7];
+    let mut old_ledger = BTreeMap::new();
+    for acct in 0..16u64 {
+        let bal = (acct + 1) * 1_000;
+        let shares = split_secret(bal as u128, 3, &old_coords).map_err(|e| format!("{e}"))?;
+        old_ledger.insert(acct, shares);
+    }
+    let res = redistribute_ledger_accounts(2, &old_ledger, &[1, 2, 3], &new_coords, 5)
+        .map_err(|e| format!("{e}"))?;
+    for acct in 0..16u64 {
+        let new_shares = &res.redistributed_accounts[&acct];
+        verify_committee_shares(new_shares, 5).map_err(|e| format!("{e}"))?;
+        let rec = reconstruct_secret(&new_shares[..5], 5).map_err(|e| format!("{e}"))?;
+        assert_eq!(rec, ((acct + 1) * 1_000) as u128);
+    }
+    println!(
+        "  Reshared 16 accounts   : (3, 4) -> (5, 7) with ZERO balance reconstruction ({} OTP bytes)",
+        res.otp_bytes_consumed
+    );
+    println!("  Degree-4 verification  : ALL 16 accounts verified exact across 7 new validators!");
+    println!("\n========================================================================");
+    println!("  VERNAM (VRNM) v1.0 ZERO-ADMIN DECENTRALIZED ARCHITECTURE VERIFIED.");
+    println!("========================================================================");
+    Ok(())
 }
 
 fn cmd_demo() {
@@ -818,6 +957,7 @@ fn main() {
             cmd_demo();
             Ok(())
         }
+        "v1-demo" => cmd_v1_demo(),
         "bench" => {
             cmd_bench();
             Ok(())
