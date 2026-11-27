@@ -722,9 +722,11 @@ impl FastMempool {
             // Merge prefilled transactions at their exact target indices with short_ids.
             let mut slots: Vec<Option<CompactTx>> = vec![None; total];
             for &(idx, tx) in &proposal.prefilled_txs {
-                if (idx as usize) < total {
-                    slots[idx as usize] = Some(tx);
+                let i = idx as usize;
+                if i >= total || slots[i].is_some() {
+                    return Err(vec![i]);
                 }
+                slots[i] = Some(tx);
             }
             let mut sid_iter = proposal.short_ids.iter();
             let mut missing = Vec::new();
@@ -853,6 +855,11 @@ impl IndexedLedger {
         prev_tag: &[u8; 16],
         txs: &[CompactTx],
     ) -> Result<(), FastEngineError> {
+        if !self.undo_log.is_empty() {
+            return Err(FastEngineError::InvalidParameters(
+                "cannot stage_batch while a previous staged batch is still uncommitted",
+            ));
+        }
         if height != self.height + 1 || !ct_eq_16(prev_tag, &self.tip_tag) {
             return Err(FastEngineError::ChainLinkMismatch {
                 expected_height: self.height + 1,
@@ -1545,18 +1552,18 @@ impl FastExpressCluster {
                             continue;
                         }
                         if let Some(frame) = prep_ref[sender][me] {
-                            let deck = v.inbound[sender]
-                                .as_mut()
-                                .ok_or(FastEngineError::OtpDeckExhausted)?;
-                            let pt = deck.open_vote(&frame, sender as u32, v.id)?;
-                            if decode_and_check_vote(
-                                &pt,
-                                FastVoteKind::Prepare,
-                                sender as u32,
-                                height,
-                                view,
-                                &block_tag,
-                            ) {
+                            // Tolerate up to f = 1 Byzantine bad Prepare vote frame.
+                            if let Some(deck) = v.inbound[sender].as_mut()
+                                && let Ok(pt) = deck.open_vote(&frame, sender as u32, v.id)
+                                && decode_and_check_vote(
+                                    &pt,
+                                    FastVoteKind::Prepare,
+                                    sender as u32,
+                                    height,
+                                    view,
+                                    &block_tag,
+                                )
+                            {
                                 prepare_votes += 1;
                             }
                         }
@@ -1624,18 +1631,18 @@ impl FastExpressCluster {
                             continue;
                         }
                         if let Some(frame) = commit_ref[sender][me] {
-                            let deck = v.inbound[sender]
-                                .as_mut()
-                                .ok_or(FastEngineError::OtpDeckExhausted)?;
-                            let pt = deck.open_vote(&frame, sender as u32, v.id)?;
-                            if decode_and_check_vote(
-                                &pt,
-                                FastVoteKind::Commit,
-                                sender as u32,
-                                height,
-                                view,
-                                &block_tag,
-                            ) {
+                            // Tolerate up to f = 1 Byzantine bad Commit vote frame.
+                            if let Some(deck) = v.inbound[sender].as_mut()
+                                && let Ok(pt) = deck.open_vote(&frame, sender as u32, v.id)
+                                && decode_and_check_vote(
+                                    &pt,
+                                    FastVoteKind::Commit,
+                                    sender as u32,
+                                    height,
+                                    view,
+                                    &block_tag,
+                                )
+                            {
                                 voters[sender] = true;
                                 count += 1;
                             }
@@ -2318,6 +2325,7 @@ fn execute_transfer_on_bucket_state(
 #[derive(Debug)]
 pub struct FastShieldedCluster {
     buckets: Vec<FastAnonymityBucket>,
+    bucket_minted: Vec<u128>,
 }
 
 impl FastShieldedCluster {
@@ -2343,7 +2351,10 @@ impl FastShieldedCluster {
         }
 
         zeroize_u128_slice(&mut rands);
-        Ok(Self { buckets })
+        Ok(Self {
+            buckets,
+            bucket_minted: vec![0u128; num_buckets],
+        })
     }
 
     /// Number of anonymity buckets.
@@ -2359,6 +2370,8 @@ impl FastShieldedCluster {
     }
 
     /// Mint an initial confidential balance into `(bucket_id, slot)` using fresh `(3, 4)` shares.
+    ///
+    /// Enforces `existing_balance + amount <= 2^16 - 1` and safe bucket supply cap `<= 2^16 - 1`.
     pub fn mint_balance(
         &mut self,
         bucket_id: usize,
@@ -2378,8 +2391,23 @@ impl FastShieldedCluster {
             .buckets
             .get_mut(bucket_id)
             .ok_or(FastEngineError::InvalidBucket { bucket_id })?;
+        let existing = Lagrange3Of4::reconstruct_and_verify(&bucket.balances[slot])?;
+        if existing.checked_add(amount).is_none_or(|sum| sum > max_val) {
+            return Err(FastEngineError::InvalidParameters(
+                "existing balance + mint amount exceeds 2^16 - 1",
+            ));
+        }
+        if self.bucket_minted[bucket_id]
+            .checked_add(amount)
+            .is_none_or(|sum| sum > max_val)
+        {
+            return Err(FastEngineError::InvalidParameters(
+                "bucket supply would exceed safe 2^16 - 1 cap",
+            ));
+        }
         let mut delta = Lagrange3Of4::split_secret(amount)?;
         bucket.balances[slot] = share4_add(&bucket.balances[slot], &delta);
+        self.bucket_minted[bucket_id] += amount;
         zeroize_share4(&mut delta);
         Ok(())
     }
@@ -2683,7 +2711,7 @@ pub fn run_speed_benchmarks() -> SpeedBenchmarkReport {
 
     let mut shielded =
         FastShieldedCluster::new(num_buckets).expect("shielded cluster creation must succeed");
-    let initial_bal = 10_000u128;
+    let initial_bal = 3_000u128;
     for b in 0..num_buckets {
         for slot in 0..FAST_BUCKET_SIZE {
             shielded

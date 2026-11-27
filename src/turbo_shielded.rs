@@ -15,12 +15,15 @@
 //!      `[x^2] = [a^2] + 2*d*[a] + d^2 (mod P)` and `[x*(x - 1)] = [a^2] + (2*d - 1)*[a] + d*(d - 1)`.
 //!    - Cuts bit-proof openings, multiplications, and correlated-randomness RAM traffic in HALF.
 //!
-//! 2. **Schwartz–Zippel Random Linear Combination (RLC) Batch Zero-Check**:
+//! 2. **Blinded Schwartz–Zippel Random Linear Combination (RLC) Batch Zero-Check**:
 //!    - Combines ALL 50 per-transfer invariant checks (`16 v_bits + 16 r_bits + 16 s_bits +
 //!      1 balance_conservation + 1 selector_sum`) into a single secret-shared polynomial evaluated
 //!      via Horner's rule at a fresh non-zero OS-random challenge `gamma in F_(2^127 - 1)`:
 //!      `[Z] = sum_{i=0}^{49} gamma^i * [check_i] (mod P)`.
-//!    - Opens & degree-2 verifies ONLY `[Z]` -> **MUST equal `0`**.
+//!    - Multiplies `[Z]` by a fresh uniform non-zero secret-shared blinding scalar `[rho]` via
+//!      one single-use [`BeaverTriple4`] (`[Z_blind] = [rho * Z]`) and opens ONLY `[Z_blind]` ->
+//!      **MUST equal `0`**. If any check fails (`Z != 0`), `rho * Z` is uniformly distributed in
+//!      `F_p^*`, leaking ZERO bits about `B_sender` or concurrent incoming credits!
 //!    - Information-theoretic soundness: by Schwartz–Zippel, if ANY single check is non-zero,
 //!      `Pr[Z == 0] <= 49 / (2^127 - 2) < 50 / (2^127 - 1) < 2^-121`, unconditionally secure
 //!      even against unbounded computational power (`P = NP`).
@@ -30,8 +33,9 @@
 //!    - Using a single-use Shared-Factor Beaver Star `([b_v], [a_0..a_15], [c_0..c_15])` where
 //!      `c_k = a_k * b_v (mod P)`, `beta = v - b_v` is opened **ONCE** (saving 15 openings),
 //!      followed by the 16 openings `alpha_k = s_k - a_k`.
-//!    - Total openings per full 16-bit + 16-slot confidential transfer drops from **178 -> 66**
-//!      (`48` bit squares + `1` RLC zero-check + `1` shared `beta` + `16` `alpha_k` = `66`).
+//!    - Total openings per full 16-bit + 16-slot confidential transfer drops from **178 -> 68**
+//!      (`48` bit squares + `2` blinding-triple openings + `1` blinded RLC zero-check +
+//!      `1` shared `beta` + `16` `alpha_k` = `68`).
 //!
 //! 4. **Persistent Multi-Core Sharded Bucket Pool ([`TurboShieldedCluster`])**:
 //!    - Spawns persistent OS worker threads ONCE (sized to `available_parallelism()`), statically
@@ -80,10 +84,14 @@ pub const CHECKS_PER_TURBO_TX: usize = SQUARES_PER_TURBO_TX + 2;
 /// Exact number of Beaver Stars consumed per confidential transfer (`1` per 16-slot credit).
 pub const STARS_PER_TURBO_TX: usize = 1;
 
+/// Exact number of Beaver Triples consumed per confidential transfer (`1` for blinding `[rho * Z]`).
+pub const TRIPLES_PER_TURBO_TX: usize = 1;
+
 /// Exact number of `(3, 4)` openings per full 16-bit + 16-slot confidential transfer:
-/// `48` square openings + `1` RLC zero-check + `1` shared `beta` + `16` `alpha_k` = `66`
-/// (down from `178` in standard Beaver-triple IT-MPC).
-pub const OPENINGS_PER_TURBO_TX: usize = SQUARES_PER_TURBO_TX + 1 + 1 + TURBO_BUCKET_SIZE;
+/// `48` square openings + `2` blinding-triple openings + `1` blinded RLC zero-check +
+/// `1` shared `beta` + `16` `alpha_k` = `68` (down from `178` in standard Beaver-triple IT-MPC).
+pub const OPENINGS_PER_TURBO_TX: usize =
+    SQUARES_PER_TURBO_TX + 2 * TRIPLES_PER_TURBO_TX + 1 + 1 + TURBO_BUCKET_SIZE;
 
 /// Baseline openings per transfer in standard Beaver-triple IT-MPC (`64*2 + 48 + 1 + 1 = 178`).
 pub const BASELINE_OPENINGS_PER_TX: usize = 178;
@@ -131,21 +139,107 @@ impl std::error::Error for TurboShieldedError {}
 // Internal Zeroization & Pure OS Entropy Helpers
 // ============================================================================
 
+struct BufferedUrandom {
+    file: File,
+    buf: [u8; 4096],
+    pos: usize,
+}
+
+impl BufferedUrandom {
+    fn new() -> Self {
+        Self {
+            file: File::open("/dev/urandom").expect("failed to open /dev/urandom"),
+            buf: [0u8; 4096],
+            pos: 4096,
+        }
+    }
+
+    #[inline]
+    fn fill_bytes(&mut self, out: &mut [u8]) {
+        if out.len() >= self.buf.len() {
+            self.file
+                .read_exact(out)
+                .expect("failed to read from /dev/urandom");
+            return;
+        }
+        let avail = self.buf.len() - self.pos;
+        if out.len() <= avail {
+            out.copy_from_slice(&self.buf[self.pos..self.pos + out.len()]);
+            zeroize_slice(&mut self.buf[self.pos..self.pos + out.len()]);
+            self.pos += out.len();
+        } else {
+            self.file
+                .read_exact(&mut self.buf)
+                .expect("failed to read from /dev/urandom");
+            self.pos = 0;
+            out.copy_from_slice(&self.buf[..out.len()]);
+            zeroize_slice(&mut self.buf[..out.len()]);
+            self.pos = out.len();
+        }
+    }
+}
+
+impl Drop for BufferedUrandom {
+    fn drop(&mut self) {
+        zeroize_slice(&mut self.buf);
+    }
+}
+
 thread_local! {
-    static URANDOM_FILE: RefCell<File> = RefCell::new(
-        File::open("/dev/urandom").expect("failed to open /dev/urandom")
-    );
+    static URANDOM_BUF: RefCell<BufferedUrandom> = RefCell::new(BufferedUrandom::new());
 }
 
 /// Fill `buf` directly from OS cryptographic randomness (`/dev/urandom`) using a
-/// thread-local file descriptor (zero PRNG, zero syscall open/close churn).
+/// thread-local zeroized buffer (zero PRNG, minimal syscall overhead).
 #[inline]
 fn fill_os_random_fast(buf: &mut [u8]) {
-    URANDOM_FILE.with(|cell| {
-        cell.borrow_mut()
-            .read_exact(buf)
-            .expect("failed to read from /dev/urandom");
+    URANDOM_BUF.with(|cell| {
+        cell.borrow_mut().fill_bytes(buf);
     });
+}
+
+/// Sample a fresh uniform non-zero secret-shared blinding scalar `[rho]` (`rho in [1, PRIME_P)`)
+/// using pure OS entropy.
+#[inline]
+fn random_nonzero_share4_fast() -> Share4 {
+    let mut raw = [0u8; 48];
+    fill_os_random_fast(&mut raw);
+    let mut b0 = [0u8; 16];
+    let mut b1 = [0u8; 16];
+    let mut b2 = [0u8; 16];
+    b0.copy_from_slice(&raw[0..16]);
+    b1.copy_from_slice(&raw[16..32]);
+    b2.copy_from_slice(&raw[32..48]);
+    zeroize_slice(&mut raw);
+
+    let c0_cand = u128::from_le_bytes(b0) & PRIME_P;
+    let c1_cand = u128::from_le_bytes(b1) & PRIME_P;
+    let c2_cand = u128::from_le_bytes(b2) & PRIME_P;
+    zeroize_slice(&mut b0);
+    zeroize_slice(&mut b1);
+    zeroize_slice(&mut b2);
+
+    let mut c0 = if c0_cand > 0 && c0_cand < PRIME_P {
+        c0_cand
+    } else {
+        random_nonzero_challenge()
+    };
+    let mut c1 = if c1_cand < PRIME_P {
+        c1_cand
+    } else {
+        random_field_elem_fast()
+    };
+    let mut c2 = if c2_cand < PRIME_P {
+        c2_cand
+    } else {
+        random_field_elem_fast()
+    };
+
+    let shares = TurboLagrange3Of4::eval_poly(c0, c1, c2);
+    zeroize_u128(&mut c0);
+    zeroize_u128(&mut c1);
+    zeroize_u128(&mut c2);
+    shares
 }
 
 /// Sample one uniform canonical element in `[0, PRIME_P)` via unbiased rejection sampling.
@@ -443,10 +537,17 @@ fn compose_bits_16(bits: &[Share4; TURBO_RANGE_BITS]) -> Share4 {
 /// instead of 2 openings, cutting bit-proof openings, multiplications, and RAM traffic in HALF.
 /// Move-only (no `Copy`/`Clone`) and volatile-zeroized on `Drop`.
 #[repr(C, align(64))]
-#[derive(Debug)]
 pub struct BeaverSquare {
     a: Share4,
     a_sq: Share4,
+}
+
+impl fmt::Debug for BeaverSquare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaverSquare")
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BeaverSquare {
@@ -481,11 +582,18 @@ impl Drop for BeaverSquare {
 ///
 /// Move-only (no `Copy`/`Clone`) and volatile-zeroized on `Drop`.
 #[repr(C, align(64))]
-#[derive(Debug)]
 pub struct BeaverTriple4 {
     a: Share4,
     b: Share4,
     c: Share4,
+}
+
+impl fmt::Debug for BeaverTriple4 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaverTriple4")
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BeaverTriple4 {
@@ -530,11 +638,19 @@ impl Drop for BeaverTriple4 {
 /// exact information-theoretic secrecy (`< 3` validators learn 0 bits).
 /// Move-only (no `Copy`/`Clone`) and volatile-zeroized on `Drop`.
 #[repr(C, align(64))]
-#[derive(Debug)]
 pub struct BeaverStar16 {
     b_v: Share4,
     a: [Share4; TURBO_BUCKET_SIZE],
     c: [Share4; TURBO_BUCKET_SIZE],
+}
+
+impl fmt::Debug for BeaverStar16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaverStar16")
+            .field("slots", &TURBO_BUCKET_SIZE)
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BeaverStar16 {
@@ -662,11 +778,9 @@ pub fn mpc_mul_triple_3_of_4(
 /// Offline correlated-randomness factory storing contiguous, stack-allocated, single-use
 /// [`BeaverSquare`] pairs, [`BeaverStar16`] stars, and [`BeaverTriple4`] triples.
 ///
-/// Uses forward consumption cursors (`sq_pos`, `star_pos`, `triple_pos`) so parallel workers
-/// consume and volatile-zeroize disjoint slices in place in L1 cache with zero main-thread
-/// drop churn and strict single-use guarantees; all remaining unconsumed items are also
-/// volatile-zeroized on `Drop`.
-#[derive(Debug)]
+/// Uses forward consumption cursors (`sq_pos`, `star_pos`, `triple_pos`) with automatic prefix
+/// compaction so parallel workers consume and volatile-zeroize disjoint slices in place in L1
+/// cache while sustained throughput maintains O(1) bounded memory.
 pub struct TurboBeaverBank {
     squares: Vec<BeaverSquare>,
     sq_pos: usize,
@@ -674,6 +788,17 @@ pub struct TurboBeaverBank {
     star_pos: usize,
     triples: Vec<BeaverTriple4>,
     triple_pos: usize,
+}
+
+impl fmt::Debug for TurboBeaverBank {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurboBeaverBank")
+            .field("available_squares", &self.available_squares())
+            .field("available_stars", &self.available_stars())
+            .field("available_triples", &self.available_triples())
+            .field("material", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TurboBeaverBank {
@@ -690,8 +815,9 @@ impl TurboBeaverBank {
     }
 
     /// Pre-generate offline correlated randomness for `tx_count` full 16-bit + 16-slot
-    /// confidential transfers (`tx_count * 48` Beaver squares and `tx_count` Beaver stars),
-    /// parallelized across available hardware threads using pure OS `/dev/urandom` entropy.
+    /// confidential transfers (`tx_count * 48` Beaver squares, `tx_count` Beaver stars, and
+    /// `tx_count` blinding Beaver triples), parallelized across available hardware threads using
+    /// pure OS `/dev/urandom` entropy.
     pub fn new_for_txs(tx_count: usize) -> Self {
         let mut bank = Self::empty();
         bank.refill_for_txs(tx_count);
@@ -707,14 +833,57 @@ impl TurboBeaverBank {
         bank
     }
 
+    /// Compact consumed prefix `0..sq_pos` to keep memory bounded O(1) under sustained load.
+    #[inline]
+    fn compact_squares(&mut self) {
+        if self.sq_pos > 0 {
+            self.squares.drain(..self.sq_pos);
+            self.sq_pos = 0;
+        }
+    }
+
+    /// Compact consumed prefix `0..star_pos`.
+    #[inline]
+    fn compact_stars(&mut self) {
+        if self.star_pos > 0 {
+            self.stars.drain(..self.star_pos);
+            self.star_pos = 0;
+        }
+    }
+
+    /// Compact consumed prefix `0..triple_pos`.
+    #[inline]
+    fn compact_triples(&mut self) {
+        if self.triple_pos > 0 {
+            self.triples.drain(..self.triple_pos);
+            self.triple_pos = 0;
+        }
+    }
+
+    /// Compact any vector whose consumed prefix has reached at least half its capacity.
+    #[inline]
+    fn compact_if_half_consumed(&mut self) {
+        if self.sq_pos > 0 && self.sq_pos * 2 >= self.squares.capacity() {
+            self.compact_squares();
+        }
+        if self.star_pos > 0 && self.star_pos * 2 >= self.stars.capacity() {
+            self.compact_stars();
+        }
+        if self.triple_pos > 0 && self.triple_pos * 2 >= self.triples.capacity() {
+            self.compact_triples();
+        }
+    }
+
     /// Refill correlated randomness for `tx_count` additional confidential transfers.
     pub fn refill_for_txs(&mut self, tx_count: usize) {
         self.refill_squares(tx_count * SQUARES_PER_TURBO_TX);
         self.refill_stars(tx_count * STARS_PER_TURBO_TX);
+        self.refill_triples(tx_count * TRIPLES_PER_TURBO_TX);
     }
 
     /// Pre-generate `count` fresh single-use [`BeaverSquare`] pairs in parallel.
     pub fn refill_squares(&mut self, count: usize) {
+        self.compact_squares();
         if count == 0 {
             return;
         }
@@ -755,6 +924,7 @@ impl TurboBeaverBank {
 
     /// Pre-generate `count` fresh single-use [`BeaverStar16`] stars in parallel.
     pub fn refill_stars(&mut self, count: usize) {
+        self.compact_stars();
         if count == 0 {
             return;
         }
@@ -793,34 +963,45 @@ impl TurboBeaverBank {
         }
     }
 
-    /// Pre-generate `count` fresh single-use general [`BeaverTriple4`] triples.
+    /// Pre-generate `count` fresh single-use general [`BeaverTriple4`] triples in parallel.
     pub fn refill_triples(&mut self, count: usize) {
+        self.compact_triples();
         if count == 0 {
             return;
         }
-        self.triples.reserve(count);
-        const BATCH: usize = 512;
-        let mut entropy = [0u128; BATCH * 8];
-        let mut remaining = count;
-        while remaining > 0 {
-            let take = remaining.min(BATCH);
-            let slice = &mut entropy[..take * 8];
-            fill_random_field_elems(slice);
-            for chunk in slice.chunks_exact(8) {
-                let mut a0 = chunk[0];
-                let mut b0 = chunk[1];
-                let mut c0 = mul_mod_fast(a0, b0);
-                let a = TurboLagrange3Of4::eval_poly(a0, chunk[2], chunk[3]);
-                let b = TurboLagrange3Of4::eval_poly(b0, chunk[4], chunk[5]);
-                let c = TurboLagrange3Of4::eval_poly(c0, chunk[6], chunk[7]);
-                self.triples.push(BeaverTriple4 { a, b, c });
-                zeroize_u128(&mut a0);
-                zeroize_u128(&mut b0);
-                zeroize_u128(&mut c0);
-            }
-            remaining -= take;
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if count < 2048 || cores <= 1 {
+            self.triples.reserve(count);
+            generate_triples_into(&mut self.triples, count);
+            return;
         }
-        zeroize_u128_slice(&mut entropy);
+
+        let threads = cores.min(count / 1024).max(1);
+        let base = count / threads;
+        let rem = count % threads;
+
+        let chunks: Vec<Vec<BeaverTriple4>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for t in 0..threads {
+                let n = base + usize::from(t < rem);
+                handles.push(scope.spawn(move || {
+                    let mut v = Vec::with_capacity(n);
+                    generate_triples_into(&mut v, n);
+                    v
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("beaver triple generator thread panicked"))
+                .collect()
+        });
+
+        self.triples.reserve(count);
+        for mut c in chunks {
+            self.triples.append(&mut c);
+        }
     }
 
     /// Number of unused [`BeaverSquare`] pairs remaining.
@@ -844,11 +1025,14 @@ impl TurboBeaverBank {
     /// Maximum number of full confidential transfers currently supported by this bank.
     #[inline]
     pub fn available_txs(&self) -> usize {
-        (self.available_squares() / SQUARES_PER_TURBO_TX).min(self.available_stars())
+        (self.available_squares() / SQUARES_PER_TURBO_TX)
+            .min(self.available_stars() / STARS_PER_TURBO_TX)
+            .min(self.available_triples() / TRIPLES_PER_TURBO_TX)
     }
 
     /// Pop one single-use [`BeaverSquare`] from the back of the bank.
     pub fn pop_square(&mut self) -> Result<BeaverSquare, TurboShieldedError> {
+        self.compact_if_half_consumed();
         if self.available_squares() == 0 {
             return Err(TurboShieldedError::BeaverSquaresExhausted {
                 needed: 1,
@@ -860,6 +1044,7 @@ impl TurboBeaverBank {
 
     /// Pop one single-use [`BeaverStar16`] from the back of the bank.
     pub fn pop_star(&mut self) -> Result<BeaverStar16, TurboShieldedError> {
+        self.compact_if_half_consumed();
         if self.available_stars() == 0 {
             return Err(TurboShieldedError::BeaverStarsExhausted {
                 needed: 1,
@@ -871,6 +1056,7 @@ impl TurboBeaverBank {
 
     /// Pop one single-use [`BeaverTriple4`] from the back of the bank.
     pub fn pop_triple(&mut self) -> Result<BeaverTriple4, TurboShieldedError> {
+        self.compact_if_half_consumed();
         if self.available_triples() == 0 {
             return Err(TurboShieldedError::BeaverTriplesExhausted {
                 needed: 1,
@@ -885,7 +1071,9 @@ impl TurboBeaverBank {
     fn reserve_for_txs(
         &mut self,
         tx_count: usize,
-    ) -> Result<(&mut [BeaverSquare], &mut [BeaverStar16]), TurboShieldedError> {
+    ) -> Result<(&mut [BeaverSquare], &mut [BeaverStar16], &mut [BeaverTriple4]), TurboShieldedError>
+    {
+        self.compact_if_half_consumed();
         let need_sq = tx_count * SQUARES_PER_TURBO_TX;
         let avail_sq = self.available_squares();
         if avail_sq < need_sq {
@@ -902,15 +1090,52 @@ impl TurboBeaverBank {
                 available: avail_stars,
             });
         }
+        let need_triples = tx_count * TRIPLES_PER_TURBO_TX;
+        let avail_triples = self.available_triples();
+        if avail_triples < need_triples {
+            return Err(TurboShieldedError::BeaverTriplesExhausted {
+                needed: need_triples,
+                available: avail_triples,
+            });
+        }
         let sq_start = self.sq_pos;
         self.sq_pos += need_sq;
         let star_start = self.star_pos;
         self.star_pos += need_stars;
+        let triple_start = self.triple_pos;
+        self.triple_pos += need_triples;
         Ok((
             &mut self.squares[sq_start..sq_start + need_sq],
             &mut self.stars[star_start..star_start + need_stars],
+            &mut self.triples[triple_start..triple_start + need_triples],
         ))
     }
+}
+
+/// Generate `count` fresh [`BeaverTriple4`] triples into `out` using batched OS entropy.
+fn generate_triples_into(out: &mut Vec<BeaverTriple4>, count: usize) {
+    const BATCH: usize = 512;
+    let mut entropy = [0u128; BATCH * 8];
+    let mut remaining = count;
+    while remaining > 0 {
+        let take = remaining.min(BATCH);
+        let slice = &mut entropy[..take * 8];
+        fill_random_field_elems(slice);
+        for chunk in slice.chunks_exact(8) {
+            let mut a0 = chunk[0];
+            let mut b0 = chunk[1];
+            let mut c0 = mul_mod_fast(a0, b0);
+            let a = TurboLagrange3Of4::eval_poly(a0, chunk[2], chunk[3]);
+            let b = TurboLagrange3Of4::eval_poly(b0, chunk[4], chunk[5]);
+            let c = TurboLagrange3Of4::eval_poly(c0, chunk[6], chunk[7]);
+            out.push(BeaverTriple4 { a, b, c });
+            zeroize_u128(&mut a0);
+            zeroize_u128(&mut b0);
+            zeroize_u128(&mut c0);
+        }
+        remaining -= take;
+    }
+    zeroize_u128_slice(&mut entropy);
 }
 
 impl Drop for TurboBeaverBank {
@@ -998,13 +1223,22 @@ fn generate_stars_into(out: &mut Vec<BeaverStar16>, count: usize) {
 /// - `16` amount bits `v_j in {0, 1}`,
 /// - `16` remainder bits `r_j in {0, 1}` (`r = B_sender - v`),
 /// - `16` blinded one-hot recipient selector bits `s_k in {0, 1}` with `sum(s_k) == 1`.
-#[derive(Debug)]
 pub struct TurboTransferRequest {
     pub bucket_id: usize,
     pub sender_slot: usize,
     pub v_bits: [Share4; TURBO_RANGE_BITS],
     pub r_bits: [Share4; TURBO_RANGE_BITS],
     pub selector_shares: [Share4; TURBO_BUCKET_SIZE],
+}
+
+impl fmt::Debug for TurboTransferRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurboTransferRequest")
+            .field("bucket_id", &self.bucket_id)
+            .field("sender_slot", &self.sender_slot)
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TurboTransferRequest {
@@ -1142,16 +1376,18 @@ fn accumulate_bool_square_rlc(
 }
 
 /// Execute and verify a single full 16-bit + 16-slot confidential transfer against a mutable
-/// bucket state `[Share4; 16]` with **ZERO heap allocations** and **66 total openings**.
+/// bucket state `[Share4; 16]` with **ZERO heap allocations** and **68 total openings**.
 ///
-/// Consumes and volatile-zeroizes `squares[0..48]` and `star` unconditionally (even on error).
+/// Consumes and volatile-zeroizes `squares[0..48]`, `star`, and `blind_triple` unconditionally
+/// (even on early parameter errors).
 ///
 /// Algebraic proof & update pipeline:
 /// 1. `48` single-opening [`BeaverSquare`] Boolean checks (`16 v_bits + 16 r_bits + 16 s_bits`)
 ///    folded via Horner's rule into `[Z]` at fresh non-zero challenge `gamma in F_(2^127 - 1)`.
 /// 2. Check #49 (`B_sender - v - r == 0`) and check #50 (`sum(s_k) - 1 == 0`) folded into `[Z]`.
-/// 3. `1` degree-2 verified opening of `[Z]` -> MUST equal `0` (Schwartz–Zippel soundness
-///    `Pr[cheat] <= 49 / (2^127 - 2) < 2^-121`).
+/// 3. Multiplicative blinding `[Z_blind] = [rho] * [Z]` via `blind_triple` (`2` mask openings)
+///    followed by `1` degree-2 verified opening of `[Z_blind]` -> MUST equal `0` (Schwartz–Zippel
+///    soundness `Pr[cheat] <= 49 / (2^127 - 2) < 2^-121`, zero leakage on failure).
 /// 4. `1` shared opening `beta = v - b_v` + `16` openings `alpha_k = s_k - a_k` via
 ///    [`BeaverStar16`] to credit `+[s_k * v]` blindly across ALL 16 bucket slots and debit `-[v]`
 ///    from `sender_slot`.
@@ -1161,19 +1397,23 @@ pub fn execute_transfer_in_bucket(
     req: &TurboTransferRequest,
     squares: &mut [BeaverSquare],
     star: &mut BeaverStar16,
+    blind_triple: &mut BeaverTriple4,
     gamma: u128,
 ) -> Result<(), TurboShieldedError> {
     if req.sender_slot >= TURBO_BUCKET_SIZE {
+        wipe_remaining_tx_beaver(squares, 0, star, blind_triple);
         return Err(TurboShieldedError::InvalidSlot {
             slot: req.sender_slot,
         });
     }
     if gamma == 0 || gamma >= PRIME_P {
+        wipe_remaining_tx_beaver(squares, 0, star, blind_triple);
         return Err(TurboShieldedError::InvalidParameters(
             "RLC challenge gamma must be in [1, PRIME_P)",
         ));
     }
     if squares.len() < SQUARES_PER_TURBO_TX {
+        wipe_remaining_tx_beaver(squares, 0, star, blind_triple);
         return Err(TurboShieldedError::BeaverSquaresExhausted {
             needed: SQUARES_PER_TURBO_TX,
             available: squares.len(),
@@ -1193,7 +1433,7 @@ pub fn execute_transfer_in_bucket(
             &mut z,
             &mut z_const,
         ) {
-            wipe_remaining_tx_beaver(squares, sq_idx, star);
+            wipe_remaining_tx_beaver(squares, sq_idx, star, blind_triple);
             zeroize_share4(&mut z);
             return Err(e);
         }
@@ -1209,7 +1449,7 @@ pub fn execute_transfer_in_bucket(
             &mut z,
             &mut z_const,
         ) {
-            wipe_remaining_tx_beaver(squares, sq_idx, star);
+            wipe_remaining_tx_beaver(squares, sq_idx, star, blind_triple);
             zeroize_share4(&mut z);
             return Err(e);
         }
@@ -1223,7 +1463,7 @@ pub fn execute_transfer_in_bucket(
         if let Err(e) =
             accumulate_bool_square_rlc(s_k, &mut squares[sq_idx], gamma, &mut z, &mut z_const)
         {
-            wipe_remaining_tx_beaver(squares, sq_idx, star);
+            wipe_remaining_tx_beaver(squares, sq_idx, star, blind_triple);
             zeroize_share4(&mut z);
             zeroize_share4(&mut sum_s);
             return Err(e);
@@ -1246,6 +1486,7 @@ pub fn execute_transfer_in_bucket(
         || sender_bal[3] >= PRIME_P
     {
         star.wipe_in_place_nofence();
+        blind_triple.wipe_in_place_nofence();
         zeroize_share4_nofence(&mut v_shares);
         zeroize_share4_nofence(&mut r_shares);
         zeroize_share4_nofence(&mut sum_s);
@@ -1274,16 +1515,64 @@ pub fn execute_transfer_in_bucket(
     z_const = add_unreduced(mul_unreduced(z_const, gamma), PRIME_P - 1);
     zeroize_share4_nofence(&mut sum_s);
 
-    // Finalize canonical [Z] = z + z_const and perform ONE degree-2 verified opening (#49).
+    // Finalize canonical [Z] = z + z_const and blind with uniform non-zero [rho] via one
+    // Beaver triple ([Z_blind] = [rho] * [Z]) so a non-zero opening leaks ZERO bits!
     let mut z_final: Share4 = [
         canon_le_p(add_unreduced(z[0], z_const)),
         canon_le_p(add_unreduced(z[1], z_const)),
         canon_le_p(add_unreduced(z[2], z_const)),
         canon_le_p(add_unreduced(z[3], z_const)),
     ];
-    let opened_z = TurboLagrange3Of4::reconstruct_and_verify(&z_final);
     zeroize_share4_nofence(&mut z);
+
+    let mut rho = random_nonzero_share4_fast();
+    let d_r = match TurboLagrange3Of4::open_diff(&rho, &blind_triple.a) {
+        Ok(v) => v,
+        Err(e) => {
+            star.wipe_in_place_nofence();
+            blind_triple.wipe_in_place_nofence();
+            zeroize_share4_nofence(&mut rho);
+            zeroize_share4_nofence(&mut z_final);
+            zeroize_share4(&mut v_shares);
+            return Err(e);
+        }
+    };
+    let e_z = match TurboLagrange3Of4::open_diff(&z_final, &blind_triple.b) {
+        Ok(v) => v,
+        Err(e) => {
+            star.wipe_in_place_nofence();
+            blind_triple.wipe_in_place_nofence();
+            zeroize_share4_nofence(&mut rho);
+            zeroize_share4_nofence(&mut z_final);
+            zeroize_share4(&mut v_shares);
+            return Err(e);
+        }
+    };
+    let de = mul_mod_fast(d_r, e_z);
+    let mut z_blind: Share4 = [
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[0], mul_unreduced(d_r, blind_triple.b[0])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[0]), de),
+        )),
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[1], mul_unreduced(d_r, blind_triple.b[1])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[1]), de),
+        )),
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[2], mul_unreduced(d_r, blind_triple.b[2])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[2]), de),
+        )),
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[3], mul_unreduced(d_r, blind_triple.b[3])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[3]), de),
+        )),
+    ];
+    blind_triple.wipe_in_place_nofence();
+    zeroize_share4_nofence(&mut rho);
     zeroize_share4_nofence(&mut z_final);
+
+    let opened_z = TurboLagrange3Of4::reconstruct_and_verify(&z_blind);
+    zeroize_share4_nofence(&mut z_blind);
 
     match opened_z {
         Ok(0) => {}
@@ -1370,17 +1659,22 @@ pub fn execute_transfer_in_bucket(
     Ok(())
 }
 
-/// Wipe any unconsumed squares and the star on an early error exit.
+/// Wipe any unconsumed squares, the star, and the blinding triple on an early error exit.
 #[inline]
 fn wipe_remaining_tx_beaver(
     squares: &mut [BeaverSquare],
     from_idx: usize,
     star: &mut BeaverStar16,
+    blind_triple: &mut BeaverTriple4,
 ) {
-    for sq in &mut squares[from_idx..SQUARES_PER_TURBO_TX] {
-        sq.wipe_in_place_nofence();
+    let end = squares.len().min(SQUARES_PER_TURBO_TX);
+    if from_idx < end {
+        for sq in &mut squares[from_idx..end] {
+            sq.wipe_in_place_nofence();
+        }
     }
     star.wipe_in_place_nofence();
+    blind_triple.wipe_in_place_nofence();
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -1390,9 +1684,18 @@ fn wipe_remaining_tx_beaver(
 
 /// Cache-line-aligned anonymity bucket preventing false sharing across parallel CPU cores.
 #[repr(C, align(64))]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct TurboAnonymityBucket {
     balances: [Share4; TURBO_BUCKET_SIZE],
+}
+
+impl fmt::Debug for TurboAnonymityBucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TurboAnonymityBucket")
+            .field("slots", &TURBO_BUCKET_SIZE)
+            .field("balances", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Drop for TurboAnonymityBucket {
@@ -1413,12 +1716,13 @@ struct WorkerJob {
     requests_ptr: *const TurboTransferRequest,
     squares_ptr: *mut BeaverSquare,
     stars_ptr: *mut BeaverStar16,
+    triples_ptr: *mut BeaverTriple4,
     gamma: u128,
 }
 
 // SAFETY: Every worker receives strictly disjoint `[bucket_start..bucket_end)`, disjoint
-// `staged_ptr` subrange, disjoint `squares_ptr`/`stars_ptr` subranges, and immutable shared
-// views of `buckets_ptr`, `bucket_offsets_ptr`, `sorted_indices_ptr`, and `requests_ptr`.
+// `staged_ptr` subrange, disjoint `squares_ptr`/`stars_ptr`/`triples_ptr` subranges, and immutable
+// shared views of `buckets_ptr`, `bucket_offsets_ptr`, `sorted_indices_ptr`, and `requests_ptr`.
 // All pointers remain valid for the entire epoch while the coordinator waits on `done_count`.
 unsafe impl Send for WorkerJob {}
 
@@ -1434,6 +1738,7 @@ impl WorkerJob {
             requests_ptr: std::ptr::null(),
             squares_ptr: std::ptr::null_mut(),
             stars_ptr: std::ptr::null_mut(),
+            triples_ptr: std::ptr::null_mut(),
             gamma: 1,
         }
     }
@@ -1475,6 +1780,7 @@ unsafe fn run_worker_job(job: WorkerJob) -> Option<TurboShieldedError> {
 
     let mut sq_off = 0usize;
     let mut star_off = 0usize;
+    let mut triple_off = 0usize;
 
     for b in job.bucket_start..job.bucket_end {
         // SAFETY: `bucket_offsets_ptr` has length `num_buckets + 1` and `b < bucket_end <= num_buckets`.
@@ -1498,14 +1804,17 @@ unsafe fn run_worker_job(job: WorkerJob) -> Option<TurboShieldedError> {
                 std::slice::from_raw_parts_mut(job.squares_ptr.add(sq_off), SQUARES_PER_TURBO_TX)
             };
             let tx_star = unsafe { &mut *job.stars_ptr.add(star_off) };
+            let tx_triple = unsafe { &mut *job.triples_ptr.add(triple_off) };
             sq_off += SQUARES_PER_TURBO_TX;
             star_off += STARS_PER_TURBO_TX;
+            triple_off += TRIPLES_PER_TURBO_TX;
 
             if let Err(e) = execute_transfer_in_bucket(
                 &mut staged_bucket.balances,
                 req,
                 tx_squares,
                 tx_star,
+                tx_triple,
                 job.gamma,
             ) {
                 // Wipe any remaining unconsumed Beaver items assigned to this worker's shard
@@ -1516,6 +1825,7 @@ unsafe fn run_worker_job(job: WorkerJob) -> Option<TurboShieldedError> {
                 };
                 let total_sq = total_txs_in_shard * SQUARES_PER_TURBO_TX;
                 let total_st = total_txs_in_shard * STARS_PER_TURBO_TX;
+                let total_tr = total_txs_in_shard * TRIPLES_PER_TURBO_TX;
                 if sq_off < total_sq {
                     let rem_sq = unsafe {
                         std::slice::from_raw_parts_mut(
@@ -1538,6 +1848,17 @@ unsafe fn run_worker_job(job: WorkerJob) -> Option<TurboShieldedError> {
                         st.wipe_in_place_nofence();
                     }
                 }
+                if triple_off < total_tr {
+                    let rem_tr = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            job.triples_ptr.add(triple_off),
+                            total_tr - triple_off,
+                        )
+                    };
+                    for tr in rem_tr {
+                        tr.wipe_in_place_nofence();
+                    }
+                }
                 compiler_fence(Ordering::SeqCst);
                 return Some(e);
             }
@@ -1556,6 +1877,9 @@ unsafe fn run_worker_job(job: WorkerJob) -> Option<TurboShieldedError> {
 pub struct TurboShieldedCluster {
     buckets: Vec<TurboAnonymityBucket>,
     staged: Vec<TurboAnonymityBucket>,
+    /// Cumulative minted supply per bucket (capped at `2^16 - 1` so no intra-bucket transfer can
+    /// ever overflow any slot above `max_val`).
+    bucket_minted: Vec<u128>,
     /// Reusable O(N) counting-sort scratch buffers for zero-alloc batch partitioning.
     bucket_counts: Vec<usize>,
     bucket_offsets: Vec<usize>,
@@ -1702,6 +2026,7 @@ impl TurboShieldedCluster {
         Ok(Self {
             buckets,
             staged,
+            bucket_minted: vec![0u128; num_buckets],
             bucket_counts: vec![0usize; num_buckets],
             bucket_offsets: vec![0usize; num_buckets + 1],
             bucket_write_pos: vec![0usize; num_buckets],
@@ -1731,6 +2056,9 @@ impl TurboShieldedCluster {
     }
 
     /// Mint an initial confidential balance into `(bucket_id, slot)` using fresh `(3, 4)` shares.
+    ///
+    /// Enforces `existing_balance + amount <= 2^16 - 1` and `bucket_supply + amount <= 2^16 - 1`
+    /// so no intra-bucket transfer can ever overflow any slot above `2^16 - 1`.
     pub fn mint_balance(
         &mut self,
         bucket_id: usize,
@@ -1750,8 +2078,23 @@ impl TurboShieldedCluster {
             .buckets
             .get_mut(bucket_id)
             .ok_or(TurboShieldedError::InvalidBucket { bucket_id })?;
+        let existing = TurboLagrange3Of4::reconstruct_and_verify(&bucket.balances[slot])?;
+        if existing.checked_add(amount).is_none_or(|sum| sum > max_val) {
+            return Err(TurboShieldedError::InvalidParameters(
+                "existing balance + mint amount exceeds 2^16 - 1",
+            ));
+        }
+        if self.bucket_minted[bucket_id]
+            .checked_add(amount)
+            .is_none_or(|sum| sum > max_val)
+        {
+            return Err(TurboShieldedError::InvalidParameters(
+                "bucket supply would exceed safe 2^16 - 1 cap",
+            ));
+        }
         let mut delta = TurboLagrange3Of4::split_secret(amount)?;
         bucket.balances[slot] = share4_add(&bucket.balances[slot], &delta);
+        self.bucket_minted[bucket_id] += amount;
         zeroize_share4(&mut delta);
         Ok(())
     }
@@ -1799,11 +2142,18 @@ impl TurboShieldedCluster {
             });
         }
 
-        let (squares, stars) = bank.reserve_for_txs(1)?;
+        let (squares, stars, triples) = bank.reserve_for_txs(1)?;
         let gamma = random_nonzero_challenge();
         let mut staged = self.buckets[req.bucket_id].balances;
 
-        let res = execute_transfer_in_bucket(&mut staged, req, squares, &mut stars[0], gamma);
+        let res = execute_transfer_in_bucket(
+            &mut staged,
+            req,
+            squares,
+            &mut stars[0],
+            &mut triples[0],
+            gamma,
+        );
         match res {
             Ok(()) => {
                 self.buckets[req.bucket_id].balances = staged;
@@ -1868,8 +2218,8 @@ impl TurboShieldedCluster {
             self.bucket_write_pos[req.bucket_id] = pos + 1;
         }
 
-        // 3. Reserve all Beaver squares & stars upfront (advances single-use cursors atomically).
-        let (squares, stars) = bank.reserve_for_txs(requests.len())?;
+        // 3. Reserve all Beaver squares, stars & blinding triples upfront (advances single-use cursors atomically).
+        let (squares, stars, triples) = bank.reserve_for_txs(requests.len())?;
 
         // 4. Sample a fresh OS-random non-zero Schwartz–Zippel challenge AFTER the batch is fixed.
         let gamma = random_nonzero_challenge();
@@ -1887,6 +2237,7 @@ impl TurboShieldedCluster {
         let requests_ptr = requests.as_ptr();
         let squares_base = squares.as_mut_ptr();
         let stars_base = stars.as_mut_ptr();
+        let triples_base = triples.as_mut_ptr();
 
         let mut b_cursor = 0usize;
         let mut main_job = WorkerJob::empty();
@@ -1907,9 +2258,10 @@ impl TurboShieldedCluster {
                 sorted_indices_ptr,
                 requests_ptr,
                 // SAFETY: Disjoint worker ranges map to disjoint `tx_offset` slices within
-                // `squares` and `stars`.
+                // `squares`, `stars`, and `triples`.
                 squares_ptr: unsafe { squares_base.add(tx_offset * SQUARES_PER_TURBO_TX) },
                 stars_ptr: unsafe { stars_base.add(tx_offset * STARS_PER_TURBO_TX) },
+                triples_ptr: unsafe { triples_base.add(tx_offset * TRIPLES_PER_TURBO_TX) },
                 gamma,
             };
 
@@ -2009,7 +2361,7 @@ pub struct TurboShieldedBench {
     pub elapsed_secs: f64,
     /// Number of persistent parallel workers / hardware threads used.
     pub cores_used: usize,
-    /// Exact `(3, 4)` openings per confidential transfer (`66`, down from `178`).
+    /// Exact `(3, 4)` openings per confidential transfer (`68`, down from `178`).
     pub openings_per_tx: usize,
     /// Number of disjoint 16-account anonymity buckets used.
     pub buckets_used: usize,
@@ -2039,7 +2391,7 @@ impl fmt::Display for TurboShieldedBench {
 
 /// Run the live multi-core Shielded IT-MPC benchmark: `16,384` full 16-bit + 16-slot
 /// confidential transfers across `64` disjoint anonymity buckets on persistent worker threads
-/// (Beaver squares + Schwartz–Zippel RLC + Shared-Factor Beaver Stars = `66` openings/tx).
+/// (Beaver squares + blinded Schwartz–Zippel RLC + Shared-Factor Beaver Stars = `68` openings/tx).
 pub fn run_turbo_shielded_bench() -> TurboShieldedBench {
     let num_buckets = 64usize;
     let txs_per_bucket = 256usize;
@@ -2049,7 +2401,7 @@ pub fn run_turbo_shielded_bench() -> TurboShieldedBench {
         TurboShieldedCluster::new(num_buckets).expect("turbo shielded cluster init must succeed");
     let cores_used = cluster.num_workers();
 
-    let initial_bal = 30_000u128;
+    let initial_bal = 3_000u128;
     for b in 0..num_buckets {
         for slot in 0..TURBO_BUCKET_SIZE {
             cluster
@@ -2449,8 +2801,68 @@ mod tests {
         let report = run_turbo_shielded_bench();
         println!("\n{report}\n");
         assert_eq!(report.total_txs, 16_384);
-        assert_eq!(report.openings_per_tx, 66);
+        assert_eq!(report.openings_per_tx, 68);
         assert_eq!(report.buckets_used, 64);
         assert!(report.shielded_tps > 0.0);
+    }
+
+    #[test]
+    fn test_beaver_bank_compaction_overflow_cap_redacted_debug_and_early_wipe() {
+        // H-8: TurboBeaverBank compaction bounds memory across repeated reserve/refill cycles.
+        let mut bank = TurboBeaverBank::new_for_txs(8);
+        let mut cluster = TurboShieldedCluster::new(1).unwrap();
+        cluster.mint_balance(0, 0, 1_000).unwrap();
+        let mut bal0 = 1_000u128;
+        for _ in 0..16 {
+            let req = TurboTransferRequest::new(0, 0, bal0, 1, 1).unwrap();
+            bal0 -= 1;
+            cluster.execute_single_transfer(&req, &mut bank).unwrap();
+            if bank.available_txs() == 0 {
+                bank.refill_for_txs(8);
+            }
+        }
+        assert!(bank.squares.len() <= 8 * SQUARES_PER_TURBO_TX);
+        assert!(bank.stars.len() <= 8 * STARS_PER_TURBO_TX);
+        assert!(bank.triples.len() <= 8 * TRIPLES_PER_TURBO_TX);
+
+        // C-2: Cumulative balance and safe bucket supply cap enforcement.
+        assert!(cluster.mint_balance(0, 0, 65_000).is_err());
+        assert!(cluster.mint_balance(0, 2, 65_000).is_err());
+        cluster.mint_balance(0, 2, 64_535).unwrap();
+        assert!(cluster.mint_balance(0, 3, 1).is_err());
+
+        // L-1: Redacted Debug and early-error wipe of squares, star, and blinding triple.
+        let mut bank2 = TurboBeaverBank::new_for_txs(1);
+        assert!(format!("{bank2:?}").contains("<redacted>"));
+        let (squares, stars, triples) = bank2.reserve_for_txs(1).unwrap();
+        assert!(format!("{:?}", squares[0]).contains("<redacted>"));
+        assert!(format!("{:?}", stars[0]).contains("<redacted>"));
+        assert!(format!("{:?}", triples[0]).contains("<redacted>"));
+        let mut dummy_bucket = [[0u128; 4]; TURBO_BUCKET_SIZE];
+        let req = TurboTransferRequest::new(0, 0, 100, 1, 10).unwrap();
+        // Trigger early gamma == 0 error; all provided Beaver material must be zeroized!
+        let err = execute_transfer_in_bucket(
+            &mut dummy_bucket,
+            &req,
+            squares,
+            &mut stars[0],
+            &mut triples[0],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            TurboShieldedError::InvalidParameters(
+                "RLC challenge gamma must be in [1, PRIME_P)"
+            )
+        );
+        for sq in squares.iter() {
+            assert_eq!(*sq.a(), [0u128; 4]);
+            assert_eq!(*sq.a_sq(), [0u128; 4]);
+        }
+        assert_eq!(*stars[0].b_v(), [0u128; 4]);
+        assert_eq!(*triples[0].a(), [0u128; 4]);
+        assert_eq!(*triples[0].b(), [0u128; 4]);
+        assert_eq!(*triples[0].c(), [0u128; 4]);
     }
 }

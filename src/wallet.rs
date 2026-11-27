@@ -17,7 +17,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::field::{PRIME_P, zeroize_slice};
+use crate::field::{PRIME_P, random_field_elem, zeroize_slice};
 use crate::otp::{
     FRAME_BYTES, MAC_TAG_BYTES, OtpError, PadPage, WalPadBook, open_frame, seal_frame,
 };
@@ -32,6 +32,31 @@ pub const DEFAULT_NODE_URL: &str = "http://127.0.0.1:8080";
 
 /// Default TCP connect/read/write timeout for `WalletRpcClient`.
 pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum HTTP response size accepted by `WalletRpcClient` (4 MiB).
+pub const MAX_RPC_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum permitted wallet name length in ASCII characters.
+pub const MAX_WALLET_NAME_LEN: usize = 64;
+
+/// Strictly validate a wallet name: 1..=64 ASCII characters matching `[A-Za-z0-9_-]`.
+/// Rejects path separators (`/`, `\`), `.`, `..`, whitespace, control characters, and absolute paths.
+pub fn validate_wallet_name(name: &str) -> Result<&str, WalletError> {
+    if name.is_empty() || name.len() > MAX_WALLET_NAME_LEN {
+        return Err(WalletError::InvalidConfig(format!(
+            "wallet name must be 1..={MAX_WALLET_NAME_LEN} ASCII characters"
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(WalletError::InvalidConfig(format!(
+            "invalid wallet name '{name}': only ASCII [A-Za-z0-9_-] allowed (no path separators or dots)"
+        )));
+    }
+    Ok(name)
+}
 
 /// Compact binary express transfer payload length in bytes:
 /// `sender_id (4) + recipient_id (4) + amount (8) + page_id (8) + nonce (8) = 32`.
@@ -417,9 +442,8 @@ impl WalletMetadata {
         }
 
         let name = name.ok_or_else(|| WalletError::CorruptMetadata("missing key: name".into()))?;
-        if name.is_empty() {
-            return Err(WalletError::CorruptMetadata("empty wallet name".into()));
-        }
+        validate_wallet_name(&name)
+            .map_err(|e| WalletError::CorruptMetadata(format!("invalid wallet name: {e}")))?;
         let num_validators = num_validators
             .ok_or_else(|| WalletError::CorruptMetadata("missing key: num_validators".into()))?;
         if num_validators == 0 {
@@ -456,7 +480,7 @@ impl WalletMetadata {
         })
     }
 
-    /// Atomically write metadata with `0600` permissions (Unix) via temp file + `fsync` + `rename`.
+    /// Atomically write metadata with `0600` permissions (Unix) via unique temp file + `fsync` + `rename` + parent dir `fsync`.
     pub fn save_atomic(&self, path: &Path) -> Result<(), WalletError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -467,16 +491,23 @@ impl WalletMetadata {
         let tmp_path = temp_metadata_path(path);
         let serialized = self.to_kv_string();
 
-        let mut file = open_owner_only_write(&tmp_path)?;
-        file.write_all(serialized.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-
-        fs::rename(&tmp_path, path)?;
+        let write_res: io::Result<()> = (|| {
+            let mut file = open_owner_only_write(&tmp_path)?;
+            file.write_all(serialized.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WalletError::Io(err));
+        }
 
         #[cfg(unix)]
         {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            sync_parent_dir(path)?;
         }
 
         Ok(())
@@ -495,9 +526,26 @@ fn parse_field<T: std::str::FromStr>(key: &str, val: &str) -> Result<T, WalletEr
 }
 
 fn temp_metadata_path(path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let rnd = random_field_elem() as u64;
     let mut os = path.as_os_str().to_os_string();
-    os.push(".tmp");
+    os.push(format!(".{pid}.{rnd:016x}.tmp"));
     PathBuf::from(os)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(d) = File::open(dir) {
+            d.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 fn open_owner_only_write(path: &Path) -> io::Result<File> {
@@ -570,13 +618,7 @@ impl VernamWallet {
         node_url: &str,
         config: WalletConfig,
     ) -> Result<Self, WalletError> {
-        let trimmed_name = name.trim();
-        if trimmed_name.is_empty() {
-            return Err(WalletError::InvalidConfig(
-                "wallet name must not be empty".into(),
-            ));
-        }
-        validate_single_line("name", trimmed_name)?;
+        let trimmed_name = validate_wallet_name(name.trim())?;
 
         if num_validators == 0 {
             return Err(WalletError::InvalidConfig(
@@ -597,6 +639,10 @@ impl VernamWallet {
         validate_single_line("node_url", &resolved_url)?;
 
         fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
 
         let mut pad_books = Vec::with_capacity(num_validators);
         for v in 0..num_validators {
@@ -1090,7 +1136,10 @@ impl WalletRpcClient {
             let after = &slice[pos + needle.len()..];
             if let Some(end) = after.find('"') {
                 let addr = after[..end].trim();
-                if !addr.is_empty() && !addrs.iter().any(|a| a == addr) {
+                let valid_peer = !addr.is_empty()
+                    && !addr.chars().any(|c| c.is_whitespace() || c.is_control())
+                    && parse_http_endpoint(addr).is_ok();
+                if valid_peer && !addrs.iter().any(|a| a == addr) {
                     addrs.push(addr.to_string());
                 }
                 slice = &after[end + 1..];
@@ -1183,17 +1232,39 @@ impl WalletRpcClient {
         stream.write_all(req.as_bytes())?;
         stream.flush()?;
 
-        let mut raw_resp = Vec::new();
-        stream.read_to_end(&mut raw_resp)?;
+        let mut raw_resp = Vec::with_capacity(4096);
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if raw_resp.len().saturating_add(n) > MAX_RPC_RESPONSE_BYTES {
+                return Err(WalletError::RpcError(format!(
+                    "HTTP response exceeded maximum size ({MAX_RPC_RESPONSE_BYTES} bytes)"
+                )));
+            }
+            raw_resp.extend_from_slice(&buf[..n]);
+        }
 
         parse_http_response(&raw_resp)
     }
 }
 
 fn parse_http_endpoint(raw_url: &str) -> Result<(String, u16, String), WalletError> {
+    if raw_url.chars().any(|c| c.is_control()) {
+        return Err(WalletError::InvalidConfig(
+            "node URL must not contain CR/LF or control characters".into(),
+        ));
+    }
     let trimmed = raw_url.trim();
     if trimmed.is_empty() {
         return Err(WalletError::InvalidConfig("empty node URL".into()));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(WalletError::InvalidConfig(
+            "node URL must not contain whitespace or control characters".into(),
+        ));
     }
 
     let without_scheme = if let Some(rest) = trimmed.strip_prefix("http://") {
@@ -1334,13 +1405,21 @@ fn decode_chunked_body(mut data: &[u8]) -> Result<Vec<u8>, WalletError> {
         if chunk_len == 0 {
             break;
         }
-        if data.len() < chunk_len + 2 {
+        let needed = chunk_len.checked_add(2).ok_or_else(|| {
+            WalletError::RpcError("chunked HTTP body length overflow".into())
+        })?;
+        if data.len() < needed {
             return Err(WalletError::RpcError(
                 "chunked HTTP body shorter than declared chunk length".into(),
             ));
         }
+        if out.len().saturating_add(chunk_len) > MAX_RPC_RESPONSE_BYTES {
+            return Err(WalletError::RpcError(format!(
+                "decoded chunked HTTP body exceeded maximum size ({MAX_RPC_RESPONSE_BYTES} bytes)"
+            )));
+        }
         out.extend_from_slice(&data[..chunk_len]);
-        data = &data[chunk_len + 2..];
+        data = &data[needed..];
     }
     Ok(out)
 }
@@ -1798,5 +1877,38 @@ mod tests {
         assert!(report.contains("1800 VRNM"));
         assert!(report.contains("3 min"));
         assert!(report.contains("http://127.0.0.1:9090"));
+    }
+
+    #[test]
+    fn test_wallet_security_name_validation_endpoint_crlf_and_chunked_overflow() {
+        // Strict wallet name validation blocks path traversal and bad characters.
+        assert!(validate_wallet_name("alice_01-main").is_ok());
+        assert!(validate_wallet_name("").is_err());
+        assert!(validate_wallet_name(".").is_err());
+        assert!(validate_wallet_name("..").is_err());
+        assert!(validate_wallet_name("../evil").is_err());
+        assert!(validate_wallet_name("a/b").is_err());
+        assert!(validate_wallet_name("a\\b").is_err());
+        assert!(validate_wallet_name("/etc/passwd").is_err());
+        assert!(validate_wallet_name(&"a".repeat(65)).is_err());
+
+        // Endpoint parser rejects CR/LF header injection and whitespace.
+        assert!(parse_http_endpoint("http://127.0.0.1:8080/api\r\nX-Injected: 1").is_err());
+        assert!(parse_http_endpoint("http://127.0.0.1:8080/a b").is_err());
+        assert!(parse_http_endpoint("http://127.0.0.1:8080").is_ok());
+
+        // decode_chunked_body rejects usize::MAX overflow cleanly without panicking.
+        let overflow_chunk = format!("{:x}\r\nabcd\r\n0\r\n\r\n", usize::MAX);
+        assert!(decode_chunked_body(overflow_chunk.as_bytes()).is_err());
+
+        // Wallet directory is created with 0700 permissions on Unix.
+        let tmp = TempWalletDir::new("dir_perms");
+        let _w = VernamWallet::create(tmp.path(), "secure_01", 2, 2, 1, DEFAULT_NODE_URL)
+            .expect("create wallet");
+        #[cfg(unix)]
+        {
+            let dir_mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "wallet directory must be 0700 on Unix");
+        }
     }
 }

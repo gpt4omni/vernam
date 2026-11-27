@@ -34,6 +34,21 @@ log()  { printf '\033[1;32m[vernam]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[vernam]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[vernam]\033[0m %s\n' "$*" >&2; exit 1; }
 
+validate_config() {
+    if [[ ! "${VRNM_BIND}" =~ ^[0-9A-Za-z.\[\]:-]+:[0-9]{1,5}$ ]]; then
+        err "Invalid VRNM_BIND='${VRNM_BIND}': must match host:port (e.g., 0.0.0.0:8080 or [::]:8080)."
+    fi
+    if [[ ! "${VRNM_PORT}" =~ ^[0-9]{1,5}$ ]] || (( 10#${VRNM_PORT} < 1 || 10#${VRNM_PORT} > 65535 )); then
+        err "Invalid port '${VRNM_PORT}' in VRNM_BIND='${VRNM_BIND}': must be 1..65535."
+    fi
+    if [[ ! "${VRNM_USER}" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        err "Invalid VRNM_USER='${VRNM_USER}': must be a valid POSIX system username."
+    fi
+    if [[ ! "${VRNM_DATA_DIR}" =~ ^/[0-9A-Za-z._/-]+$ ]] || [[ "${VRNM_DATA_DIR}" == *".."* ]]; then
+        err "Invalid VRNM_DATA_DIR='${VRNM_DATA_DIR}': must be an absolute path without '..' or metacharacters."
+    fi
+}
+
 run_root() {
     if [[ "${EUID}" -eq 0 ]]; then
         "$@"
@@ -247,13 +262,15 @@ WantedBy=multi-user.target
 EOF
     fi
 
-    # Apply custom bind address if user overrode VRNM_BIND
-    if [[ "${VRNM_BIND}" != "0.0.0.0:8080" ]]; then
-        run_root sed -i \
-            -e "s|Environment=VRNM_BIND=.*|Environment=VRNM_BIND=${VRNM_BIND}|" \
-            -e "s|--bind [^ ]*|--bind ${VRNM_BIND}|" \
-            "${unit_dest}"
-    fi
+    # Apply validated VRNM_USER, VRNM_DATA_DIR, and VRNM_BIND consistently to the installed unit.
+    run_root sed -i \
+        -e "s|^User=.*|User=${VRNM_USER}|" \
+        -e "s|^Group=.*|Group=${VRNM_USER}|" \
+        -e "s|^WorkingDirectory=.*|WorkingDirectory=${VRNM_DATA_DIR}|" \
+        -e "s|^Environment=VRNM_DATA_DIR=.*|Environment=VRNM_DATA_DIR=${VRNM_DATA_DIR}|" \
+        -e "s|^Environment=VRNM_BIND=.*|Environment=VRNM_BIND=${VRNM_BIND}|" \
+        -e "s|--bind [^ ]*|--bind ${VRNM_BIND}|" \
+        "${unit_dest}"
 
     run_root systemctl daemon-reload
     run_root systemctl enable "${VRNM_SERVICE}"
@@ -335,6 +352,7 @@ EOF
 }
 
 main() {
+    validate_config
     require_privileges
     install_system_packages
     ensure_rust

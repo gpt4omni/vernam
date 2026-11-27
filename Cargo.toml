@@ -1,6 +1,6 @@
 [package]
 name = "vernam-rs"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "Vernam (VRNM): Ultra-fast SIMD & multi-core, 100% information-theoretically secure OTP cryptocurrency core & wallet"
 

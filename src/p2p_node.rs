@@ -13,11 +13,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::field::{PRIME_P, add_mod, mul_mod, reduce, zeroize_slice};
 use crate::qkd::{Bb84Channel, Bb84Config, OsEntropySource};
@@ -35,6 +35,24 @@ pub const MAX_RECENT_EVENTS: usize = 32;
 /// Default outbound peer HTTP timeout (2 seconds).
 pub const DEFAULT_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum concurrent inbound HTTP/P2P connections permitted before returning HTTP 503.
+const MAX_CONCURRENT_CONNS: usize = 64;
+
+/// Maximum number of remote peers retained in the P2P peer table.
+const MAX_PEERS: usize = 64;
+
+/// Maximum pending jobs buffered in the asynchronous gossip queue.
+const MAX_GOSSIP_QUEUE: usize = 256;
+
+/// Maximum finalized blocks returned per `GET /p2p/blocks` page.
+const MAX_BLOCKS_PER_PAGE: usize = 100;
+
+/// Overall wall-clock deadline for reading a single inbound HTTP request (Slowloris defense).
+const HTTP_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Socket write timeout for HTTP responses.
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Maximum accepted HTTP request/response header size (16 KiB).
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 
@@ -44,14 +62,47 @@ const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum JSON nesting depth permitted by the built-in parser.
 const MAX_JSON_DEPTH: usize = 32;
 
+/// Maximum total JSON elements/values permitted in a single parsed document (CPU/OOM defense).
+const MAX_JSON_ELEMENTS: usize = 16_384;
+
 /// Genesis block tag (16 zero bytes, 32 hex zeros).
 pub const GENESIS_TAG_HEX: &str = "00000000000000000000000000000000";
 
-/// Domain-separated Carter-Wegman evaluation point `r` in `F_(2^127 - 1)` for P2P block tags.
+/// Default domain-separated Carter-Wegman evaluation point `r` in `F_(2^127 - 1)` for P2P block tags.
 const CW_BLOCK_R: u128 = 0x5645_524e_414d_5032_505f_424c_4b5f_5201 & PRIME_P;
 
-/// Domain-separated Carter-Wegman shift `s` in `F_(2^127 - 1)` for P2P block tags.
+/// Default domain-separated Carter-Wegman shift `s` in `F_(2^127 - 1)` for P2P block tags.
 const CW_BLOCK_S: u128 = 0x3141_5926_5358_9793_2384_6264_3383_2795 & PRIME_P;
+
+/// Resolve the active Carter-Wegman `(r, s)` key pair in `F_(2^127 - 1)` for P2P block tags.
+///
+/// When `VRNM_P2P_SECRET` is set and non-empty, derives a per-network key pair purely via
+/// Carter-Wegman polynomial folding over `F_(2^127 - 1)` (zero computational crypto), preventing
+/// default-key forgery across private or staging networks. Falls back to the default public
+/// testnet key when unset so zero-config tests and devnets work out of the box.
+fn p2p_block_key() -> (u128, u128) {
+    match std::env::var("VRNM_P2P_SECRET") {
+        Ok(secret) if !secret.is_empty() => derive_p2p_cw_key(secret.as_bytes()),
+        _ => (CW_BLOCK_R, CW_BLOCK_S),
+    }
+}
+
+fn derive_p2p_cw_key(secret: &[u8]) -> (u128, u128) {
+    let mut r_acc = CW_BLOCK_R;
+    let mut s_acc = CW_BLOCK_S;
+    let len_elem = reduce(secret.len() as u128);
+    r_acc = add_mod(mul_mod(r_acc, CW_BLOCK_S), len_elem);
+    s_acc = add_mod(mul_mod(s_acc, CW_BLOCK_R), len_elem);
+    for (idx, &b) in secret.iter().enumerate() {
+        let term = ((idx as u128 + 1) << 8) | (b as u128);
+        r_acc = add_mod(mul_mod(r_acc, CW_BLOCK_R), reduce(term));
+        s_acc = add_mod(mul_mod(s_acc, CW_BLOCK_S), reduce(term ^ 0xA5));
+    }
+    if r_acc == 0 {
+        r_acc = 1;
+    }
+    (r_acc, s_acc)
+}
 
 // ============================================================================
 // 1. Core Data Structures: Peers, Config, Transactions & Blocks
@@ -317,7 +368,8 @@ pub fn compute_block_tag(
     timestamp_secs: u64,
     txs: &[P2pTx],
 ) -> [u8; 16] {
-    let mut acc = CW_BLOCK_S;
+    let (cw_r, cw_s) = p2p_block_key();
+    let mut acc = cw_s;
     let prev_elem = reduce(u128::from_le_bytes(*prev_tag));
 
     let header_words = [
@@ -328,14 +380,14 @@ pub fn compute_block_tag(
         txs.len() as u128,
     ];
     for w in header_words {
-        acc = add_mod(mul_mod(acc, CW_BLOCK_R), reduce(w));
+        acc = add_mod(mul_mod(acc, cw_r), reduce(w));
     }
 
     for tx in txs {
         let pair = ((tx.sender as u128) << 32) | (tx.recipient as u128);
         let tx_words = [pair, tx.amount as u128, tx.page_id as u128, tx.nonce as u128];
         for w in tx_words {
-            acc = add_mod(mul_mod(acc, CW_BLOCK_R), reduce(w));
+            acc = add_mod(mul_mod(acc, cw_r), reduce(w));
         }
     }
 
@@ -410,23 +462,76 @@ pub fn parse_host_port(authority: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), port))
 }
 
+/// Returns `true` if `ip` is a forbidden SSRF target (cloud metadata / link-local `169.254.0.0/16`,
+/// IPv6 link-local `fe80::/10`, multicast, broadcast, or unspecified `0.0.0.0`/`::`).
+/// Loopback (`127.0.0.1` / `::1`) remains permitted for local multi-node deployments and tests.
+pub fn is_ssrf_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_ssrf_blocked_v4(v4),
+        IpAddr::V6(v6) => {
+            if v6.is_multicast() || v6.is_unspecified() {
+                return true;
+            }
+            // Reject IPv6 link-local (fe80::/10)
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Reject IPv4-mapped IPv6 addresses targeting blocked IPv4 ranges
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_ssrf_blocked_v4(mapped);
+            }
+            false
+        }
+    }
+}
+
+fn is_ssrf_blocked_v4(v4: Ipv4Addr) -> bool {
+    v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.octets() == [169, 254, 169, 254]
+}
+
+fn reject_ssrf_literal_host(host: &str) -> Result<(), String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_ssrf_blocked_ip(ip) {
+            return Err(format!(
+                "SSRF protection: address '{host}' targets blocked metadata/link-local/multicast IP"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a Bitcoin Core-style DNS seed (e.g., `seed.vernam.network:8080`, `localhost:8080`)
 /// or plain `ip:port` seed into one or more deduplicated [`SocketAddr`] targets using
-/// `std::net::ToSocketAddrs`.
+/// `std::net::ToSocketAddrs`, filtering out SSRF-blocked metadata/link-local/multicast IPs.
 pub fn resolve_seed_addrs(seed: &str) -> Result<Vec<SocketAddr>, String> {
     let normalized = normalize_addr(seed)?;
     let (host, port) = parse_host_port(&normalized)?;
+    reject_ssrf_literal_host(&host)?;
     let iter = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|e| format!("DNS/socket resolution failed for '{normalized}': {e}"))?;
 
     let mut addrs = Vec::new();
+    let mut saw_blocked = false;
     for sa in iter {
+        if is_ssrf_blocked_ip(sa.ip()) {
+            saw_blocked = true;
+            continue;
+        }
         if !addrs.contains(&sa) {
             addrs.push(sa);
         }
     }
     if addrs.is_empty() {
+        if saw_blocked {
+            return Err(format!(
+                "SSRF protection: seed '{normalized}' resolved only to blocked metadata/link-local/multicast IPs"
+            ));
+        }
         return Err(format!("seed '{normalized}' resolved to zero addresses"));
     }
     Ok(addrs)
@@ -573,10 +678,13 @@ impl P2pNodeState {
         false
     }
 
-    /// Register or update a peer in the local peer table (ignoring self and malformed addresses).
+    /// Register or update a peer in the local peer table (ignoring self, SSRF targets, and malformed addresses).
+    /// Caps the peer table at `MAX_PEERS` (64), evicting an unhealthy peer if full.
     /// Returns `Ok(true)` if a brand-new peer was added, `Ok(false)` if updated or self-ignored.
     pub fn upsert_peer(&mut self, mut info: PeerInfo) -> Result<bool, String> {
         let norm_addr = normalize_addr(&info.addr)?;
+        let (host, _) = parse_host_port(&norm_addr)?;
+        reject_ssrf_literal_host(&host)?;
         if self.is_self(Some(info.node_id), &norm_addr) {
             return Ok(false);
         }
@@ -588,6 +696,20 @@ impl P2pNodeState {
             info.qber = 0.0;
         }
         let is_new = !self.peers.contains_key(&norm_addr);
+        if is_new && self.peers.len() >= MAX_PEERS {
+            // Try evicting the stalest unhealthy peer before rejecting new peers.
+            let stale_unhealthy = self
+                .peers
+                .iter()
+                .filter(|(_, p)| !p.healthy)
+                .min_by_key(|(_, p)| p.last_seen_secs)
+                .map(|(k, _)| k.clone());
+            if let Some(evict_key) = stale_unhealthy {
+                self.peers.remove(&evict_key);
+            } else {
+                return Err(format!("peer table full (max {MAX_PEERS} peers)"));
+            }
+        }
         self.peers.insert(norm_addr.clone(), info);
         if is_new {
             self.push_event(format!("PEER DISCOVERED: {norm_addr}"));
@@ -638,14 +760,22 @@ impl P2pNodeState {
         self.balances.get(&account_id).copied().unwrap_or(0)
     }
 
-    /// Return finalized blocks starting at height `from_height` (inclusive).
-    pub fn blocks_from(&self, from_height: u64) -> Vec<P2pBlock> {
+    /// Return finalized blocks starting at height `from_height` (inclusive), paginated up to `limit`
+    /// (clamped to `1..=MAX_BLOCKS_PER_PAGE`).
+    pub fn blocks_from_paginated(&self, from_height: u64, limit: usize) -> Vec<P2pBlock> {
         let start = from_height.max(1);
+        let cap = limit.clamp(1, MAX_BLOCKS_PER_PAGE);
         self.blocks
             .iter()
             .filter(|b| b.height >= start)
+            .take(cap)
             .cloned()
             .collect()
+    }
+
+    /// Return finalized blocks starting at height `from_height` (inclusive), capped at `MAX_BLOCKS_PER_PAGE`.
+    pub fn blocks_from(&self, from_height: u64) -> Vec<P2pBlock> {
+        self.blocks_from_paginated(from_height, MAX_BLOCKS_PER_PAGE)
     }
 
     /// Validate a batch of transactions atomically against current balances & replay protection,
@@ -764,6 +894,10 @@ impl P2pNodeState {
             ));
         }
 
+        // Always verify the block's Carter-Wegman tag BEFORE queueing CatchUpSync or touching state
+        // so unauthenticated/forged future blocks cannot trigger sync amplification.
+        let verified_tag = block.verify_tag()?;
+
         if block.height > self.height + 1 {
             return Ok(ApplyBlockOutcome::NeedSync {
                 local_height: self.height,
@@ -771,7 +905,7 @@ impl P2pNodeState {
             });
         }
 
-        // Verify chain linkage (`prev_tag == local tip_tag`) and Carter-Wegman tag.
+        // Verify chain linkage (`prev_tag == local tip_tag`).
         let expected_prev = hex_encode(&self.tip_tag);
         if block.prev_tag_hex != expected_prev {
             return Err(format!(
@@ -779,7 +913,6 @@ impl P2pNodeState {
                 block.height, expected_prev, block.prev_tag_hex
             ));
         }
-        let verified_tag = block.verify_tag()?;
 
         // Validate all transactions atomically before mutating state.
         let (next_balances, next_pages) = self.validate_txs_atomic(&block.txs)?;
@@ -888,6 +1021,14 @@ impl GossipQueue {
 
     fn push(&self, job: GossipJob) {
         let mut q = self.jobs.lock().expect("gossip queue mutex poisoned");
+        if matches!(job, GossipJob::CatchUpSync)
+            && q.iter().any(|existing| matches!(existing, GossipJob::CatchUpSync))
+        {
+            return;
+        }
+        if q.len() >= MAX_GOSSIP_QUEUE {
+            return;
+        }
         q.push_back(job);
         self.cv.notify_one();
     }
@@ -1157,21 +1298,68 @@ impl Drop for P2pNode {
     }
 }
 
-/// Non-blocking accept loop spawning short-lived connection handlers and exiting cleanly on `shutdown`.
+struct ConnSlotGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnSlotGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_conn_slot(active: &Arc<AtomicUsize>) -> Option<ConnSlotGuard> {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONCURRENT_CONNS {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(ConnSlotGuard {
+                    active: Arc::clone(active),
+                });
+            }
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Non-blocking accept loop with bounded concurrency (`MAX_CONCURRENT_CONNS`), returning HTTP 503
+/// immediately when saturated instead of spawning unbounded threads.
 fn serve_accept_loop(
     listener: TcpListener,
     state: Arc<Mutex<P2pNodeState>>,
     queue: Arc<GossipQueue>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let active_conns = Arc::new(AtomicUsize::new(0));
     let mut conn_handles: Vec<JoinHandle<()>> = Vec::new();
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((mut stream, _peer_addr)) => {
                 let _ = stream.set_nonblocking(false);
+                let Some(slot_guard) = try_acquire_conn_slot(&active_conns) else {
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let resp = HttpResponse::err_json(
+                        503,
+                        "Service Unavailable",
+                        "server saturated: too many concurrent connections",
+                    )
+                    .to_http_bytes();
+                    let _ = stream.write_all(&resp);
+                    let _ = stream.flush();
+                    continue;
+                };
                 let st = Arc::clone(&state);
                 let q = Arc::clone(&queue);
                 let h = thread::spawn(move || {
+                    let _guard = slot_guard;
                     handle_http_connection(&st, &q, &mut stream);
                 });
                 conn_handles.push(h);
@@ -1198,6 +1386,7 @@ fn handle_http_connection(
     queue: &Arc<GossipQueue>,
     stream: &mut TcpStream,
 ) {
+    let _ = stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT));
     let response = match read_http_request(stream) {
         Ok(req) => route_p2p_request(state, queue, &req),
         Err(err) => HttpResponse::err_json(400, "Bad Request", &err),
@@ -1270,8 +1459,13 @@ fn route_p2p_request(
                 .query_param("from")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(1);
+            let limit = req
+                .query_param("limit")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(MAX_BLOCKS_PER_PAGE)
+                .clamp(1, MAX_BLOCKS_PER_PAGE);
             let guard = state.lock().expect("node state mutex poisoned");
-            let blocks = guard.blocks_from(from_height);
+            let blocks = guard.blocks_from_paginated(from_height, limit);
             HttpResponse::ok_json(blocks_to_json(&blocks))
         }
 
@@ -1588,40 +1782,57 @@ fn run_announce_and_sync(
     };
 
     for (peer_addr, peer_height) in sync_candidates {
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
-        let local_h = state.lock().expect("node state mutex poisoned").height;
-        if peer_height <= local_h {
-            continue;
-        }
-        let target_path = format!("/p2p/blocks?from={}", local_h + 1);
-        let Ok((status, body)) = http_request(
-            &peer_addr,
-            "GET",
-            &target_path,
-            None,
-            None,
-            DEFAULT_PEER_TIMEOUT,
-        ) else {
-            continue;
-        };
-        if status != 200 {
-            continue;
-        }
-        let Ok(mut blocks) = parse_blocks_json(&body) else {
-            continue;
-        };
-        blocks.sort_by_key(|b| b.height);
+        // Paginated catch-up sync (up to MAX_BLOCKS_PER_PAGE per page, bounded iterations per pass).
+        for _page in 0..64 {
+            if shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let local_h = state.lock().expect("node state mutex poisoned").height;
+            if peer_height <= local_h {
+                break;
+            }
+            let target_path = format!(
+                "/p2p/blocks?from={}&limit={MAX_BLOCKS_PER_PAGE}",
+                local_h + 1
+            );
+            let Ok((status, body)) = http_request(
+                &peer_addr,
+                "GET",
+                &target_path,
+                None,
+                None,
+                DEFAULT_PEER_TIMEOUT,
+            ) else {
+                break;
+            };
+            if status != 200 {
+                break;
+            }
+            let Ok(mut blocks) = parse_blocks_json(&body) else {
+                break;
+            };
+            if blocks.is_empty() {
+                break;
+            }
+            let page_len = blocks.len();
+            blocks.sort_by_key(|b| b.height);
 
-        let mut guard = state.lock().expect("node state mutex poisoned");
-        for blk in blocks {
-            match guard.apply_remote_block(blk) {
-                Ok(ApplyBlockOutcome::Accepted) => {
-                    report.blocks_synced += 1;
+            let mut applied_in_page = 0usize;
+            {
+                let mut guard = state.lock().expect("node state mutex poisoned");
+                for blk in blocks {
+                    match guard.apply_remote_block(blk) {
+                        Ok(ApplyBlockOutcome::Accepted) => {
+                            report.blocks_synced += 1;
+                            applied_in_page += 1;
+                        }
+                        Ok(ApplyBlockOutcome::Duplicate) => {}
+                        Ok(ApplyBlockOutcome::NeedSync { .. }) | Err(_) => break,
+                    }
                 }
-                Ok(ApplyBlockOutcome::Duplicate) => {}
-                Ok(ApplyBlockOutcome::NeedSync { .. }) | Err(_) => break,
+            }
+            if applied_in_page == 0 || page_len < MAX_BLOCKS_PER_PAGE {
+                break;
             }
         }
     }
@@ -1928,7 +2139,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let deadline = Instant::now() + HTTP_READ_DEADLINE;
     let mut raw = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
 
@@ -1939,6 +2150,13 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         if raw.len() > MAX_HTTP_HEADER_BYTES {
             return Err("HTTP headers exceed maximum allowed size".to_string());
         }
+        let Some(remaining_time) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("HTTP request read deadline exceeded".to_string());
+        };
+        if remaining_time.is_zero() {
+            return Err("HTTP request read deadline exceeded".to_string());
+        }
+        let _ = stream.set_read_timeout(Some(remaining_time));
         let n = stream
             .read(&mut chunk)
             .map_err(|e| format!("failed to read HTTP request: {e}"))?;
@@ -1986,12 +2204,20 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     }
 
     let body_start = header_end + 4;
-    let mut body = Vec::with_capacity(content_length);
+    // Cap initial allocation so a spoofed large Content-Length cannot cause upfront OOM.
+    let mut body = Vec::with_capacity(content_length.min(8192));
     if raw.len() > body_start {
         let already = (raw.len() - body_start).min(content_length);
         body.extend_from_slice(&raw[body_start..body_start + already]);
     }
     while body.len() < content_length {
+        let Some(remaining_time) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("HTTP request body read deadline exceeded".to_string());
+        };
+        if remaining_time.is_zero() {
+            return Err("HTTP request body read deadline exceeded".to_string());
+        }
+        let _ = stream.set_read_timeout(Some(remaining_time));
         let remaining = content_length - body.len();
         let to_read = remaining.min(chunk.len());
         let n = stream
@@ -2184,6 +2410,7 @@ impl JsonValue {
 struct JsonParser<'a> {
     src: &'a [u8],
     pos: usize,
+    elements: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -2191,7 +2418,18 @@ impl<'a> JsonParser<'a> {
         Self {
             src: input.as_bytes(),
             pos: 0,
+            elements: 0,
         }
+    }
+
+    fn count_element(&mut self) -> Result<(), String> {
+        self.elements += 1;
+        if self.elements > MAX_JSON_ELEMENTS {
+            return Err(format!(
+                "JSON element limit exceeded (max {MAX_JSON_ELEMENTS})"
+            ));
+        }
+        Ok(())
     }
 
     fn skip_ws(&mut self) {
@@ -2208,6 +2446,7 @@ impl<'a> JsonParser<'a> {
         if depth > MAX_JSON_DEPTH {
             return Err("JSON nesting depth exceeded".to_string());
         }
+        self.count_element()?;
         self.skip_ws();
         let b = self
             .peek()
@@ -2820,5 +3059,112 @@ mod tests {
 
         child.stop();
         seed_node.stop();
+    }
+
+    #[test]
+    fn test_p2p_security_hardening_peer_cap_ssrf_pagination_json_limit_and_forged_sync() {
+        // 1. SSRF protection blocks cloud metadata (169.254.169.254) and multicast (224.0.0.1).
+        assert!(resolve_seed_addrs("169.254.169.254:80").is_err());
+        assert!(resolve_seed_addrs("224.0.0.1:8080").is_err());
+        assert!(resolve_seed_addrs("0.0.0.0:8080").is_err());
+        assert!(resolve_seed_addrs("[fe80::1]:8080").is_err());
+        assert!(resolve_seed_addrs("127.0.0.1:8080").is_ok());
+
+        // 2. JSON element cap rejects oversized arrays.
+        let mut huge_json = String::from("[");
+        for i in 0..(MAX_JSON_ELEMENTS + 10) {
+            if i > 0 {
+                huge_json.push(',');
+            }
+            huge_json.push('0');
+        }
+        huge_json.push(']');
+        assert!(
+            parse_json(&huge_json).is_err(),
+            "JSON parser must reject > MAX_JSON_ELEMENTS"
+        );
+
+        // 3. Peer table cap (MAX_PEERS = 64), SSRF rejection in upsert_peer,
+        //    forged future block rejected BEFORE NeedSync, and /p2p/blocks pagination <= 100.
+        let mut st = P2pNodeState::new(
+            P2pNodeConfig {
+                node_id: 0,
+                bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: "127.0.0.1:18080".to_string(),
+                seeds: vec![],
+                gossip_interval_ms: 1000,
+            },
+            "127.0.0.1:18080".parse().unwrap(),
+        )
+        .expect("init state");
+
+        assert!(
+            st.upsert_peer(PeerInfo {
+                node_id: 999,
+                addr: "169.254.169.254:80".to_string(),
+                height: 0,
+                pop_score: 0,
+                qber: 0.0,
+                last_seen_secs: 1,
+                healthy: true,
+            })
+            .is_err(),
+            "metadata IP must be rejected by upsert_peer"
+        );
+
+        for i in 1..=(MAX_PEERS as u64) {
+            st.upsert_peer(PeerInfo {
+                node_id: i,
+                addr: format!("127.0.0.1:{}", 20000 + i),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: i,
+                healthy: true,
+            })
+            .expect("insert within peer cap");
+        }
+        assert_eq!(st.peers.len(), MAX_PEERS);
+        assert!(
+            st.upsert_peer(PeerInfo {
+                node_id: 9999,
+                addr: "127.0.0.1:30000".to_string(),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: 9999,
+                healthy: true,
+            })
+            .is_err(),
+            "65th healthy peer must be rejected when table is at MAX_PEERS"
+        );
+
+        // Forged block at future height 50 must fail tag verification instead of returning NeedSync.
+        let mut forged_future = P2pBlock::seal(
+            50,
+            7,
+            &[0u8; 16],
+            now_secs(),
+            vec![P2pTx::new(1, 2, 10, 1, 1)],
+        );
+        forged_future.block_tag_hex = "0000000000000000000000000000dead".to_string();
+        assert!(
+            st.apply_remote_block(forged_future).is_err(),
+            "forged future block must be rejected before NeedSync"
+        );
+
+        // Pagination caps returned blocks at MAX_BLOCKS_PER_PAGE (100).
+        for i in 1..=110u32 {
+            st.commit_faucet(i, 10).expect("commit faucet block");
+        }
+        assert_eq!(st.blocks_from(1).len(), MAX_BLOCKS_PER_PAGE);
+        assert_eq!(st.blocks_from_paginated(1, 500).len(), MAX_BLOCKS_PER_PAGE);
+        assert_eq!(st.blocks_from_paginated(101, 50).len(), 10);
+
+        // GossipQueue caps at MAX_GOSSIP_QUEUE and deduplicates CatchUpSync.
+        let q = GossipQueue::new();
+        q.push(GossipJob::CatchUpSync);
+        q.push(GossipJob::CatchUpSync);
+        assert_eq!(q.jobs.lock().unwrap().len(), 1);
     }
 }

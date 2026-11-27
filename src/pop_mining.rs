@@ -113,6 +113,8 @@ pub enum PopError {
     },
     /// Tokenomics engine rejected recording a contribution or slashing.
     TokenomicsFailure(String),
+    /// Non-slashable coordinator rejection (e.g., stale epoch challenge or duplicate submission).
+    CoordinatorRejected(String),
     /// Invalid configuration or argument.
     InvalidParameter(&'static str),
 }
@@ -125,6 +127,8 @@ impl PopError {
     ///   (`SlashingOffense::InconsistentMpcShare`).
     /// - High-QBER / decoy-anomaly QKD links or empty batches trigger a **10% bond burn**
     ///   (`SlashingOffense::ExtendedDowntime`) for failing clean pad replenishment.
+    /// - Stale epoch challenges, duplicate coordinator entries, channel I/O failures, and
+    ///   parameter errors are non-slashable (`None`).
     pub const fn slashing_offense(&self) -> Option<SlashingOffense> {
         match self {
             Self::InvalidBeaverTriple { .. }
@@ -135,9 +139,10 @@ impl PopError {
             Self::QkdQberExceeded { .. }
             | Self::QkdDecoyAnomaly { .. }
             | Self::EmptyBatch(_) => Some(SlashingOffense::ExtendedDowntime),
-            Self::QkdChannelError(_) | Self::TokenomicsFailure(_) | Self::InvalidParameter(_) => {
-                None
-            }
+            Self::QkdChannelError(_)
+            | Self::TokenomicsFailure(_)
+            | Self::CoordinatorRejected(_)
+            | Self::InvalidParameter(_) => None,
         }
     }
 }
@@ -187,6 +192,7 @@ impl fmt::Display for PopError {
                 decoy_yield_ratio, min_ratio, max_ratio, single_photon_yield_lower_bound
             ),
             Self::TokenomicsFailure(msg) => write!(f, "tokenomics integration error: {msg}"),
+            Self::CoordinatorRejected(msg) => write!(f, "PoP coordinator rejected submission: {msg}"),
             Self::InvalidParameter(msg) => write!(f, "invalid PoP parameter: {msg}"),
         }
     }
@@ -596,10 +602,11 @@ fn random_usize() -> usize {
 /// Compute a universal Carter-Wegman polynomial digest over `F_(2^127 - 1)` for a byte slice.
 ///
 /// Packs input bytes into 15-byte (120-bit) limbs strictly below `PRIME_P = 2^127 - 1`
-/// and absorbs the exact byte length first to prevent zero-extension collisions.
+/// and absorbs the exact byte length multiplied by `r` first to prevent prefix/zero-extension
+/// collisions (e.g. `&[1]` vs `&[0, 0]`).
 pub fn cw_poly_digest(data: &[u8], challenge_r: u128) -> u128 {
     let r = reduce(challenge_r);
-    let mut acc = reduce(data.len() as u128);
+    let mut acc = mul_mod(reduce(data.len() as u128), r);
     for chunk in data.chunks(15) {
         let mut limb_bytes = [0u8; 16];
         limb_bytes[..chunk.len()].copy_from_slice(chunk);
@@ -619,7 +626,7 @@ pub fn compute_sample_commitment_tag(
     sample_mask_s: u128,
 ) -> AuditTag {
     let r = reduce(challenge_r);
-    let mut acc = cw_poly_digest(audit_pad_sample, r);
+    let mut acc = mul_mod(cw_poly_digest(audit_pad_sample, r), r);
     acc = mul_mod(add_mod(acc, reduce(validator_id as u128)), r);
     acc = mul_mod(add_mod(acc, reduce(epoch as u128)), r);
     acc = mul_mod(add_mod(acc, reduce(audited_pad_index as u128)), r);
@@ -635,7 +642,7 @@ pub fn compute_batch_commitment_tag(
     batch_mask_s: u128,
 ) -> AuditTag {
     let r = reduce(challenge_r);
-    let mut acc = reduce(page_digests.len() as u128);
+    let mut acc = mul_mod(reduce(page_digests.len() as u128), r);
     acc = mul_mod(add_mod(acc, reduce(validator_id as u128)), r);
     acc = mul_mod(add_mod(acc, reduce(epoch as u128)), r);
     for &digest in page_digests {
@@ -654,7 +661,7 @@ pub fn compute_challenged_slots_tag(
     slots_mask_s: u128,
 ) -> AuditTag {
     let r = reduce(challenge_r);
-    let mut acc = reduce(validator_id as u128);
+    let mut acc = mul_mod(reduce(validator_id as u128), r);
     acc = mul_mod(add_mod(acc, reduce(epoch as u128)), r);
     if !page_digests.is_empty() {
         for &raw_slot in pad_slot_indices {
@@ -723,6 +730,21 @@ impl Drop for MinedPadBatch {
     }
 }
 
+/// Pre-challenge Carter-Wegman batch commitment created BEFORE [`PopAuditor::issue_challenge`].
+///
+/// Binds every pad page in a mined batch prior to learning which slots will be audited, preventing
+/// adaptive post-challenge pad fabrication (commit-then-challenge soundness).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PopCommitment {
+    pub validator_id: ValidatorId,
+    pub pad_pages_mined: usize,
+    pub beaver_triples_mined: usize,
+    pub commit_r: u128,
+    pub commit_s: u128,
+    pub page_digests: Vec<u128>,
+    pub batch_commitment: AuditTag,
+}
+
 /// Interactive Proof-of-Pad challenge issued by `PopAuditor` for a validator and epoch.
 ///
 /// Uses one-time random scalar `challenge_r` and three independent uniform Carter-Wegman
@@ -756,6 +778,24 @@ impl PopChallenge {
         self.pad_slot_indices.first().copied().unwrap_or(0) % pad_pages
     }
 
+    /// Resolve ALL deduplicated challenged pad slot indices (preserving first-seen order).
+    pub fn resolve_pad_indices(&self, pad_pages: usize) -> Vec<usize> {
+        if pad_pages == 0 {
+            return Vec::new();
+        }
+        let mut resolved = Vec::with_capacity(self.pad_slot_indices.len().max(1));
+        for &raw in &self.pad_slot_indices {
+            let idx = raw % pad_pages;
+            if !resolved.contains(&idx) {
+                resolved.push(idx);
+            }
+        }
+        if resolved.is_empty() {
+            resolved.push(0);
+        }
+        resolved
+    }
+
     /// Resolve the sacrificed Beaver triple index for a batch of `beaver_triples` triples.
     #[inline]
     pub fn select_triple_index(&self, beaver_triples: usize) -> usize {
@@ -784,12 +824,14 @@ pub struct PopProof {
     pub pad_pages_mined: usize,
     /// Total Beaver triples mined in this batch (including the 1 sacrificed audit triple).
     pub beaver_triples_mined: usize,
-    /// Resolved index of the sacrificed audit pad page.
+    /// Resolved index of the primary sacrificed audit pad page.
     pub audited_pad_index: usize,
     /// Resolved index of the sacrificed audit Beaver triple.
     pub audited_triple_index: usize,
-    /// Sacrificed pad page opened for statistical entropy + Carter-Wegman verification.
+    /// Primary sacrificed pad page opened for statistical entropy + Carter-Wegman verification.
     pub audit_pad_sample: Vec<u8>,
+    /// ALL randomly challenged pad pages (`(slot_index, pad_bytes)`) opened and burned for audit.
+    pub audited_pad_samples: Vec<(usize, Vec<u8>)>,
     /// Sacrificed Beaver triple `(a, b, c)` opened for algebraic verification over `F_(2^127 - 1)`.
     pub sacrificed_triple: BeaverTriple,
     /// Per-page Carter-Wegman polynomial digests `cw_poly_digest(page_i, challenge_r)`.
@@ -824,6 +866,9 @@ impl PopProof {
 impl Drop for PopProof {
     fn drop(&mut self) {
         zeroize_slice(&mut self.audit_pad_sample);
+        for (_, sample) in &mut self.audited_pad_samples {
+            zeroize_slice(sample);
+        }
         // `sacrificed_triple` is zeroized by `BeaverTriple::drop`.
     }
 }
@@ -919,13 +964,45 @@ impl PopMiner {
         })
     }
 
+    /// Commit to a mined pad batch BEFORE receiving [`PopAuditor::issue_challenge`].
+    ///
+    /// Binds every pad page using Carter-Wegman polynomial digests evaluated at `commit_r` and
+    /// masked with `commit_s` so the miner cannot fabricate or swap pad pages after seeing the
+    /// auditor's random slot indices.
+    pub fn commit_batch(
+        batch: &MinedPadBatch,
+        commit_r: u128,
+        commit_s: u128,
+    ) -> PopCommitment {
+        let r = reduce(commit_r);
+        let s = reduce(commit_s);
+        let mut page_digests = Vec::with_capacity(batch.pad_pages.len());
+        for page in &batch.pad_pages {
+            page_digests.push(cw_poly_digest(page, r));
+        }
+        let batch_commitment =
+            compute_batch_commitment_tag(batch.validator_id, 0, &page_digests, r, s);
+        PopCommitment {
+            validator_id: batch.validator_id,
+            pad_pages_mined: batch.pad_pages.len(),
+            beaver_triples_mined: batch.beaver_triples.len(),
+            commit_r: r,
+            commit_s: s,
+            page_digests,
+            batch_commitment,
+        }
+    }
+
     /// Answer an auditor's interactive `PopChallenge` by committing to the entire mined pad
-    /// batch over `F_(2^127 - 1)` and sacrificing the challenged pad sample and Beaver triple.
-    pub fn answer_challenge(batch: &MinedPadBatch, challenge: &PopChallenge) -> PopProof {
+    /// batch over `F_(2^127 - 1)` and sacrificing (permanently removing and zeroizing from
+    /// `batch`) ALL challenged pad pages and the challenged Beaver triple so disclosed audit
+    /// material can NEVER be reused in production.
+    pub fn answer_challenge(batch: &mut MinedPadBatch, challenge: &PopChallenge) -> PopProof {
         let pad_pages_mined = batch.pad_pages.len();
         let beaver_triples_mined = batch.beaver_triples.len();
 
-        let audited_pad_index = challenge.select_pad_index(pad_pages_mined);
+        let resolved_slots = challenge.resolve_pad_indices(pad_pages_mined);
+        let audited_pad_index = resolved_slots.first().copied().unwrap_or(0);
         let audited_triple_index = challenge.select_triple_index(beaver_triples_mined);
 
         let mut page_digests = Vec::with_capacity(pad_pages_mined);
@@ -933,10 +1010,15 @@ impl PopMiner {
             page_digests.push(cw_poly_digest(page, challenge.challenge_r));
         }
 
-        let audit_pad_sample = batch
-            .pad_pages
-            .get(audited_pad_index)
-            .cloned()
+        let mut audited_pad_samples = Vec::with_capacity(resolved_slots.len());
+        for &slot_idx in &resolved_slots {
+            if let Some(page) = batch.pad_pages.get(slot_idx) {
+                audited_pad_samples.push((slot_idx, page.clone()));
+            }
+        }
+        let audit_pad_sample = audited_pad_samples
+            .first()
+            .map(|(_, sample)| sample.clone())
             .unwrap_or_default();
 
         let sacrificed_triple = batch
@@ -944,6 +1026,24 @@ impl PopMiner {
             .get(audited_triple_index)
             .cloned()
             .unwrap_or_else(BeaverTriple::zero);
+
+        // Burn (remove and volatile-zeroize) ALL sacrificed pad pages and the sacrificed Beaver
+        // triple from `batch` so disclosed audit secrets can NEVER be reused.
+        if !resolved_slots.is_empty() {
+            let mut burn_order = resolved_slots;
+            burn_order.sort_unstable_by(|a, b| b.cmp(a));
+            burn_order.dedup();
+            for idx in burn_order {
+                if idx < batch.pad_pages.len() {
+                    let mut burned_page = batch.pad_pages.remove(idx);
+                    zeroize_slice(&mut burned_page);
+                }
+            }
+        }
+        if audited_triple_index < batch.beaver_triples.len() {
+            let burned_triple = batch.beaver_triples.remove(audited_triple_index);
+            drop(burned_triple); // `BeaverTriple::drop` volatile-zeroizes (a, b, c).
+        }
 
         let batch_commitment = compute_batch_commitment_tag(
             batch.validator_id,
@@ -979,6 +1079,7 @@ impl PopMiner {
             audited_pad_index,
             audited_triple_index,
             audit_pad_sample,
+            audited_pad_samples,
             sacrificed_triple,
             page_digests,
             batch_commitment,
@@ -1024,22 +1125,31 @@ impl PopAuditor {
         }
     }
 
-    /// Verify a validator's `PopProof` against its issued `PopChallenge` using default
-    /// information-theoretic audit bounds.
+    /// Verify a validator's `PopProof` against its pre-challenge `PopCommitment` and issued
+    /// `PopChallenge` using default information-theoretic audit bounds.
     pub fn verify_proof(
+        commitment: &PopCommitment,
         challenge: &PopChallenge,
         proof: &PopProof,
     ) -> Result<PopVerificationReceipt, PopError> {
-        Self::verify_proof_with_policy(challenge, proof, &PopAuditPolicy::default())
+        Self::verify_proof_with_policy(commitment, challenge, proof, &PopAuditPolicy::default())
     }
 
-    /// Verify a validator's `PopProof` against its `PopChallenge` with an explicit `PopAuditPolicy`.
+    /// Verify a validator's `PopProof` against its pre-challenge `PopCommitment` and
+    /// `PopChallenge` with an explicit `PopAuditPolicy`.
     pub fn verify_proof_with_policy(
+        commitment: &PopCommitment,
         challenge: &PopChallenge,
         proof: &PopProof,
         policy: &PopAuditPolicy,
     ) -> Result<PopVerificationReceipt, PopError> {
-        // 1. Identity, epoch, and batch structural checks.
+        // 1. Identity, epoch, pre-commitment binding, and batch structural checks.
+        if commitment.validator_id != challenge.validator_id {
+            return Err(PopError::ChallengeMismatch(format!(
+                "commitment validator_id mismatch: challenge={}, commitment={}",
+                challenge.validator_id, commitment.validator_id
+            )));
+        }
         if proof.validator_id != challenge.validator_id {
             return Err(PopError::ChallengeMismatch(format!(
                 "validator_id mismatch: challenge={}, proof={}",
@@ -1052,11 +1162,25 @@ impl PopAuditor {
                 challenge.epoch, proof.epoch
             )));
         }
-        if proof.pad_pages_mined == 0 {
+        if proof.pad_pages_mined == 0 || commitment.pad_pages_mined == 0 {
             return Err(PopError::EmptyBatch("proof claims 0 mined pad pages"));
         }
-        if proof.beaver_triples_mined == 0 {
+        if proof.beaver_triples_mined == 0 || commitment.beaver_triples_mined == 0 {
             return Err(PopError::EmptyBatch("proof claims 0 mined Beaver triples"));
+        }
+        if commitment.pad_pages_mined != proof.pad_pages_mined
+            || commitment.beaver_triples_mined != proof.beaver_triples_mined
+        {
+            return Err(PopError::ChallengeMismatch(
+                "proof batch dimensions do not match pre-challenge commitment".into(),
+            ));
+        }
+        if commitment.page_digests.len() != commitment.pad_pages_mined {
+            return Err(PopError::ChallengeMismatch(format!(
+                "commitment page_digests length {} != pad_pages_mined {}",
+                commitment.page_digests.len(),
+                commitment.pad_pages_mined
+            )));
         }
         if proof.page_digests.len() != proof.pad_pages_mined {
             return Err(PopError::ChallengeMismatch(format!(
@@ -1066,13 +1190,61 @@ impl PopAuditor {
             )));
         }
 
-        let expected_pad_idx = challenge.select_pad_index(proof.pad_pages_mined);
+        // H-3: Reject any non-canonical field digest (>= PRIME_P) BEFORE MAC/uniqueness checks.
+        if commitment.commit_r == 0 || commitment.commit_r >= PRIME_P || commitment.commit_s >= PRIME_P {
+            return Err(PopError::InvalidCommitmentTag("non-canonical commitment key"));
+        }
+        if commitment.page_digests.iter().any(|&d| d >= PRIME_P) {
+            return Err(PopError::InvalidCommitmentTag(
+                "non-canonical commitment page_digest >= PRIME_P",
+            ));
+        }
+        if proof.page_digests.iter().any(|&d| d >= PRIME_P) {
+            return Err(PopError::InvalidCommitmentTag(
+                "non-canonical proof page_digest >= PRIME_P",
+            ));
+        }
+
+        // Verify the pre-challenge commitment tag itself in constant time.
+        let expected_pre_commit = compute_batch_commitment_tag(
+            commitment.validator_id,
+            0,
+            &commitment.page_digests,
+            commitment.commit_r,
+            commitment.commit_s,
+        );
+        if !ct_eq_16(&expected_pre_commit, &commitment.batch_commitment) {
+            return Err(PopError::InvalidCommitmentTag("pre_commitment"));
+        }
+
+        let expected_slots = challenge.resolve_pad_indices(proof.pad_pages_mined);
+        let expected_pad_idx = expected_slots[0];
         if proof.audited_pad_index != expected_pad_idx {
             return Err(PopError::ChallengeMismatch(format!(
                 "audited_pad_index mismatch: expected {expected_pad_idx}, got {}",
                 proof.audited_pad_index
             )));
         }
+        if proof.audited_pad_samples.len() != expected_slots.len() {
+            return Err(PopError::ChallengeMismatch(format!(
+                "audited_pad_samples count {} != expected challenged slot count {}",
+                proof.audited_pad_samples.len(),
+                expected_slots.len()
+            )));
+        }
+        for (&expected_idx, (got_idx, _)) in expected_slots.iter().zip(&proof.audited_pad_samples) {
+            if *got_idx != expected_idx {
+                return Err(PopError::ChallengeMismatch(format!(
+                    "audited_pad_samples slot mismatch: expected {expected_idx}, got {got_idx}"
+                )));
+            }
+        }
+        if proof.audited_pad_samples[0].1 != proof.audit_pad_sample {
+            return Err(PopError::ChallengeMismatch(
+                "primary audit_pad_sample does not match audited_pad_samples[0]".into(),
+            ));
+        }
+
         let expected_triple_idx = challenge.select_triple_index(proof.beaver_triples_mined);
         if proof.audited_triple_index != expected_triple_idx {
             return Err(PopError::ChallengeMismatch(format!(
@@ -1094,12 +1266,28 @@ impl PopAuditor {
             return Err(PopError::InvalidCommitmentTag("sample_commitment_tag"));
         }
 
-        let recomputed_sample_digest =
-            cw_poly_digest(&proof.audit_pad_sample, challenge.challenge_r).to_le_bytes();
-        let claimed_slot_digest = proof.page_digests[proof.audited_pad_index].to_le_bytes();
-        if !ct_eq_16(&recomputed_sample_digest, &claimed_slot_digest) {
-            return Err(PopError::InvalidCommitmentTag("audited_page_digest"));
+        // Verify EVERY opened challenged pad sample against BOTH the pre-challenge commitment
+        // AND the challenge-round digest, and audit entropy on ALL of them (C-1).
+        let mut primary_entropy_stats = None;
+        for (i, (slot_idx, sample)) in proof.audited_pad_samples.iter().enumerate() {
+            let pre_digest = cw_poly_digest(sample, commitment.commit_r).to_le_bytes();
+            let committed_digest = commitment.page_digests[*slot_idx].to_le_bytes();
+            if !ct_eq_16(&pre_digest, &committed_digest) {
+                return Err(PopError::InvalidCommitmentTag("pre_committed_page_digest"));
+            }
+
+            let recomputed_digest = cw_poly_digest(sample, challenge.challenge_r).to_le_bytes();
+            let claimed_digest = proof.page_digests[*slot_idx].to_le_bytes();
+            if !ct_eq_16(&recomputed_digest, &claimed_digest) {
+                return Err(PopError::InvalidCommitmentTag("audited_page_digest"));
+            }
+
+            let stats = audit_pad_entropy_with_policy(sample, policy)?;
+            if i == 0 {
+                primary_entropy_stats = Some(stats);
+            }
         }
+        let entropy_stats = primary_entropy_stats.expect("expected_slots is non-empty");
 
         let expected_batch_tag = compute_batch_commitment_tag(
             proof.validator_id,
@@ -1127,10 +1315,15 @@ impl PopAuditor {
         // 3. Sacrificed Beaver triple algebraic check over F_(2^127 - 1).
         proof.sacrificed_triple.verify()?;
 
-        // 4. Sacrificed pad sample statistical entropy audit (all-zero, monobit, runs, uniqueness).
-        let entropy_stats = audit_pad_entropy_with_policy(&proof.audit_pad_sample, policy)?;
-
-        // 5. Reject batches that clone identical pad pages across multiple slots.
+        // 4. Reject batches that clone identical pad pages across multiple slots (both pre-commit & proof).
+        let unique_commit_digests: BTreeSet<u128> =
+            commitment.page_digests.iter().copied().collect();
+        if unique_commit_digests.len() != commitment.pad_pages_mined {
+            return Err(PopError::DuplicatePadPages {
+                unique_pages: unique_commit_digests.len(),
+                claimed_pages: commitment.pad_pages_mined,
+            });
+        }
         let unique_digests: BTreeSet<u128> = proof.page_digests.iter().copied().collect();
         if unique_digests.len() != proof.pad_pages_mined {
             return Err(PopError::DuplicatePadPages {
@@ -1139,11 +1332,13 @@ impl PopAuditor {
             });
         }
 
-        // 6. BB84 + Decoy-State QKD link quality checks (QBER <= 0.11 & decoy ratio bounds).
+        // 5. BB84 + Decoy-State QKD link quality checks (QBER <= 0.11 & decoy ratio bounds).
         proof.qkd_telemetry.verify(policy)?;
 
-        // Net usable resources contributed after sacrificing 1 audit pad and 1 audit triple.
-        let usable_pad_pages = proof.pad_pages_mined.saturating_sub(1);
+        // Net usable resources contributed after sacrificing all challenged audit pads and 1 triple.
+        let usable_pad_pages = proof
+            .pad_pages_mined
+            .saturating_sub(proof.audited_pad_samples.len());
         let usable_beaver_triples = proof.beaver_triples_mined.saturating_sub(1);
 
         let contribution = EpochContribution {
@@ -1197,12 +1392,12 @@ pub struct PopEpochReport {
 pub struct PopEpochCoordinator;
 
 impl PopEpochCoordinator {
-    /// Audit all participating validators' `(PopChallenge, PopProof)` submissions for the
-    /// current epoch, credit honest validators in `tokenomics`, slash cheating validators,
+    /// Audit all participating validators' `(PopCommitment, PopChallenge, PopProof)` submissions
+    /// for the current epoch, credit honest validators in `tokenomics`, slash cheating validators,
     /// and settle the halving `VRNM` epoch subsidy + 80% Pad-Burn fee pool.
     pub fn run_audited_epoch(
         tokenomics: &mut TokenomicsEngine,
-        miners_proofs: &[(PopChallenge, PopProof)],
+        miners_proofs: &[(PopCommitment, PopChallenge, PopProof)],
     ) -> PopEpochReport {
         Self::run_audited_epoch_with_policy(tokenomics, miners_proofs, &PopAuditPolicy::default())
     }
@@ -1210,7 +1405,7 @@ impl PopEpochCoordinator {
     /// Audit and settle an epoch using an explicit `PopAuditPolicy`.
     pub fn run_audited_epoch_with_policy(
         tokenomics: &mut TokenomicsEngine,
-        miners_proofs: &[(PopChallenge, PopProof)],
+        miners_proofs: &[(PopCommitment, PopChallenge, PopProof)],
         policy: &PopAuditPolicy,
     ) -> PopEpochReport {
         let current_epoch = tokenomics.current_epoch();
@@ -1219,20 +1414,20 @@ impl PopEpochCoordinator {
         let mut outcomes = Vec::with_capacity(miners_proofs.len());
         let mut seen_validators = BTreeSet::new();
 
-        for (challenge, proof) in miners_proofs {
+        for (commitment, challenge, proof) in miners_proofs {
             let validator_id = challenge.validator_id;
 
             let audit_result = if challenge.epoch != current_epoch {
-                Err(PopError::ChallengeMismatch(format!(
+                Err(PopError::CoordinatorRejected(format!(
                     "stale or future challenge epoch {} != current epoch {current_epoch}",
                     challenge.epoch
                 )))
             } else if !seen_validators.insert(validator_id) {
-                Err(PopError::ChallengeMismatch(format!(
+                Err(PopError::CoordinatorRejected(format!(
                     "duplicate PoP submission for validator {validator_id} in epoch {current_epoch}"
                 )))
             } else {
-                PopAuditor::verify_proof_with_policy(challenge, proof, policy)
+                PopAuditor::verify_proof_with_policy(commitment, challenge, proof, policy)
             };
 
             match audit_result {
@@ -1290,6 +1485,10 @@ mod tests {
         DEFAULT_REQUIRED_BOND, FeeLane, INITIAL_EPOCH_REWARD, VERN_PER_VRNM, ValidatorStatus,
     };
 
+    fn commit_helper(batch: &MinedPadBatch) -> PopCommitment {
+        PopMiner::commit_batch(batch, random_nonzero_field_elem(), random_field_elem())
+    }
+
     #[test]
     fn test_honest_pop_miner_passes_full_audit_and_earns_epoch_payout() {
         let mut engine = TokenomicsEngine::with_defaults();
@@ -1307,35 +1506,43 @@ mod tests {
         let expected_fee_rewards = engine.pending_fee_rewards();
         assert!(expected_fee_rewards > 0);
 
-        let batch1 = PopMiner::mine_pad_batch(1, 8, 16).unwrap();
-        let batch2 = PopMiner::mine_pad_batch(2, 8, 16).unwrap();
+        let mut batch1 = PopMiner::mine_pad_batch(1, 8, 16).unwrap();
+        let mut batch2 = PopMiner::mine_pad_batch(2, 8, 16).unwrap();
+
+        let commit1 = commit_helper(&batch1);
+        let commit2 = commit_helper(&batch2);
 
         let ch1 = PopAuditor::issue_challenge(1, engine.current_epoch());
         let ch2 = PopAuditor::issue_challenge(2, engine.current_epoch());
 
-        let proof1 = PopMiner::answer_challenge(&batch1, &ch1);
-        let proof2 = PopMiner::answer_challenge(&batch2, &ch2);
+        let proof1 = PopMiner::answer_challenge(&mut batch1, &ch1);
+        let proof2 = PopMiner::answer_challenge(&mut batch2, &ch2);
+
+        // H-4: Sacrificed pad page(s) and Beaver triple were burned from batches!
+        assert_eq!(batch1.pad_pages.len(), 8 - proof1.audited_pad_samples.len());
+        assert_eq!(batch1.beaver_triples.len(), 15);
+        assert_eq!(batch2.pad_pages.len(), 8 - proof2.audited_pad_samples.len());
+        assert_eq!(batch2.beaver_triples.len(), 15);
 
         // Individual verification succeeds cleanly with valid stats.
-        let receipt1 = PopAuditor::verify_proof(&ch1, &proof1).unwrap();
+        let receipt1 = PopAuditor::verify_proof(&commit1, &ch1, &proof1).unwrap();
         assert_eq!(receipt1.validator_id, 1);
-        assert_eq!(receipt1.usable_pad_pages, 7);
+        assert_eq!(receipt1.usable_pad_pages, batch1.pad_pages.len());
         assert_eq!(receipt1.usable_beaver_triples, 15);
         assert!(receipt1.entropy_stats.monobit_z_score <= DEFAULT_MAX_MONOBIT_Z);
         assert!(receipt1.entropy_stats.runs_z_score <= DEFAULT_MAX_RUNS_Z);
         assert!(receipt1.qkd_telemetry.qber <= MAX_ALLOWED_QBER);
 
-        // Full audited epoch distributes halving subsidy + 80% fee pool equally to both honest miners.
-        let report = PopEpochCoordinator::run_audited_epoch(&mut engine, &[(ch1, proof1), (ch2, proof2)]);
+        // Full audited epoch distributes halving subsidy + 80% fee pool to honest miners.
+        let report = PopEpochCoordinator::run_audited_epoch(
+            &mut engine,
+            &[(commit1, ch1, proof1), (commit2, ch2, proof2)],
+        );
         assert_eq!(report.epoch, 0);
         assert_eq!(report.accepted.len(), 2);
         assert!(report.rejected.is_empty());
         assert_eq!(report.settlement.subsidy_minted, INITIAL_EPOCH_REWARD);
         assert_eq!(report.settlement.payouts.len(), 2);
-        assert_eq!(
-            report.settlement.payouts[0].total_reward,
-            report.settlement.payouts[1].total_reward
-        );
         assert_eq!(
             report.settlement.total_distributed + report.settlement.dust_rolled_over,
             INITIAL_EPOCH_REWARD + expected_fee_rewards
@@ -1349,17 +1556,18 @@ mod tests {
     fn test_fake_all_zero_pad_batch_rejected_by_entropy_audit() {
         let fake_pages = vec![vec![0u8; PAD_PAGE_BYTES]; 4];
         let triples = vec![BeaverTriple::generate(); 4];
-        let fake_batch = MinedPadBatch::from_raw_parts(
+        let mut fake_batch = MinedPadBatch::from_raw_parts(
             7,
             fake_pages,
             triples,
             QkdTelemetry::nominal_clean(),
         );
 
+        let commit = commit_helper(&fake_batch);
         let challenge = PopAuditor::issue_challenge(7, 0);
-        let proof = PopMiner::answer_challenge(&fake_batch, &challenge);
+        let proof = PopMiner::answer_challenge(&mut fake_batch, &challenge);
 
-        let err = PopAuditor::verify_proof(&challenge, &proof).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit, &challenge, &proof).unwrap_err();
         match err {
             PopError::EntropyAuditFailed { ref reason, stats } => {
                 assert!(
@@ -1378,17 +1586,18 @@ mod tests {
     fn test_fake_alternating_0xaa_pad_passes_monobit_but_caught_by_runs_test() {
         let alt_pages = vec![vec![0xAAu8; PAD_PAGE_BYTES]; 4];
         let triples = vec![BeaverTriple::generate(); 4];
-        let fake_batch = MinedPadBatch::from_raw_parts(
+        let mut fake_batch = MinedPadBatch::from_raw_parts(
             9,
             alt_pages,
             triples,
             QkdTelemetry::nominal_clean(),
         );
 
+        let commit = commit_helper(&fake_batch);
         let challenge = PopAuditor::issue_challenge(9, 0);
-        let proof = PopMiner::answer_challenge(&fake_batch, &challenge);
+        let proof = PopMiner::answer_challenge(&mut fake_batch, &challenge);
 
-        let err = PopAuditor::verify_proof(&challenge, &proof).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit, &challenge, &proof).unwrap_err();
         match err {
             PopError::EntropyAuditFailed { ref reason, stats } => {
                 let s = stats.expect("stats should be populated");
@@ -1417,26 +1626,30 @@ mod tests {
         engine.register_genesis_validator(2).unwrap();
 
         // Validator 1 is honest.
-        let honest_batch = PopMiner::mine_pad_batch(1, 6, 8).unwrap();
+        let mut honest_batch = PopMiner::mine_pad_batch(1, 6, 8).unwrap();
+        let commit1 = commit_helper(&honest_batch);
         let ch1 = PopAuditor::issue_challenge(1, 0);
-        let proof1 = PopMiner::answer_challenge(&honest_batch, &ch1);
+        let proof1 = PopMiner::answer_challenge(&mut honest_batch, &ch1);
 
         // Validator 2 mines real pads, then corrupts every Beaver triple (`c != a * b mod P`).
         let mut bad_batch = PopMiner::mine_pad_batch(2, 6, 8).unwrap();
         for triple in &mut bad_batch.beaver_triples {
             triple.c = add_mod(triple.c, 1);
         }
+        let commit2 = commit_helper(&bad_batch);
         let ch2 = PopAuditor::issue_challenge(2, 0);
-        let proof2 = PopMiner::answer_challenge(&bad_batch, &ch2);
+        let proof2 = PopMiner::answer_challenge(&mut bad_batch, &ch2);
 
         // Direct verify_proof catches InvalidBeaverTriple.
-        let err = PopAuditor::verify_proof(&ch2, &proof2).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit2, &ch2, &proof2).unwrap_err();
         assert!(matches!(err, PopError::InvalidBeaverTriple { .. }));
         assert_eq!(err.slashing_offense(), Some(SlashingOffense::InconsistentMpcShare));
 
         // Coordinator automatically applies 50% InconsistentMpcShare bond slash + forfeits epoch rewards!
-        let report =
-            PopEpochCoordinator::run_audited_epoch(&mut engine, &[(ch1, proof1), (ch2, proof2)]);
+        let report = PopEpochCoordinator::run_audited_epoch(
+            &mut engine,
+            &[(commit1, ch1, proof1), (commit2, ch2, proof2)],
+        );
         assert_eq!(report.accepted.len(), 1);
         assert_eq!(report.accepted[0].validator_id, 1);
         assert_eq!(report.rejected.len(), 1);
@@ -1466,9 +1679,10 @@ mod tests {
             triple.b = 0;
             triple.c = 0;
         }
+        let commit = commit_helper(&batch);
         let ch = PopAuditor::issue_challenge(5, 0);
-        let proof = PopMiner::answer_challenge(&batch, &ch);
-        let err = PopAuditor::verify_proof(&ch, &proof).unwrap_err();
+        let proof = PopMiner::answer_challenge(&mut batch, &ch);
+        let err = PopAuditor::verify_proof(&commit, &ch, &proof).unwrap_err();
         assert!(matches!(err, PopError::InvalidBeaverTriple { .. }));
     }
 
@@ -1477,10 +1691,11 @@ mod tests {
         let mut batch = PopMiner::mine_pad_batch(3, 6, 8).unwrap();
         batch.qkd_telemetry.qber = 0.24; // Way above 0.11 Shor-Preskill bound!
 
+        let commit = commit_helper(&batch);
         let ch = PopAuditor::issue_challenge(3, 0);
-        let proof = PopMiner::answer_challenge(&batch, &ch);
+        let proof = PopMiner::answer_challenge(&mut batch, &ch);
 
-        let err = PopAuditor::verify_proof(&ch, &proof).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit, &ch, &proof).unwrap_err();
         match err {
             PopError::QkdQberExceeded { qber, max_qber } => {
                 assert!((qber - 0.24).abs() < 1e-12);
@@ -1493,25 +1708,27 @@ mod tests {
 
     #[test]
     fn test_tampered_carter_wegman_proof_tag_rejected() {
-        let batch = PopMiner::mine_pad_batch(4, 6, 8).unwrap();
+        let mut batch = PopMiner::mine_pad_batch(4, 6, 8).unwrap();
+        let commit = commit_helper(&batch);
         let ch = PopAuditor::issue_challenge(4, 0);
+        let base_proof = PopMiner::answer_challenge(&mut batch, &ch);
 
         // 1. Flip a single bit in `sample_commitment_tag`.
-        let mut tampered_sample = PopMiner::answer_challenge(&batch, &ch);
+        let mut tampered_sample = base_proof.clone();
         tampered_sample.sample_commitment_tag[0] ^= 0x01;
-        let err = PopAuditor::verify_proof(&ch, &tampered_sample).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit, &ch, &tampered_sample).unwrap_err();
         assert_eq!(err, PopError::InvalidCommitmentTag("sample_commitment_tag"));
 
         // 2. Flip a single bit in `batch_commitment`.
-        let mut tampered_batch = PopMiner::answer_challenge(&batch, &ch);
+        let mut tampered_batch = base_proof.clone();
         tampered_batch.batch_commitment[15] ^= 0x80;
-        let err = PopAuditor::verify_proof(&ch, &tampered_batch).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit, &ch, &tampered_batch).unwrap_err();
         assert_eq!(err, PopError::InvalidCommitmentTag("batch_commitment"));
 
         // 3. Flip a single bit in `challenged_slots_tag`.
-        let mut tampered_slots = PopMiner::answer_challenge(&batch, &ch);
+        let mut tampered_slots = base_proof;
         tampered_slots.challenged_slots_tag[7] ^= 0x10;
-        let err = PopAuditor::verify_proof(&ch, &tampered_slots).unwrap_err();
+        let err = PopAuditor::verify_proof(&commit, &ch, &tampered_slots).unwrap_err();
         assert_eq!(err, PopError::InvalidCommitmentTag("challenged_slots_tag"));
     }
 
@@ -1521,16 +1738,17 @@ mod tests {
         // Clone a single genuine high-entropy page 4 times to fake 4 pages of work.
         let cloned_pages = vec![honest.pad_pages[0].clone(); 4];
         let triples = vec![BeaverTriple::generate(); 4];
-        let cloned_batch = MinedPadBatch::from_raw_parts(
+        let mut cloned_batch = MinedPadBatch::from_raw_parts(
             6,
             cloned_pages,
             triples,
             honest.qkd_telemetry,
         );
 
+        let commit = commit_helper(&cloned_batch);
         let ch = PopAuditor::issue_challenge(6, 0);
-        let proof = PopMiner::answer_challenge(&cloned_batch, &ch);
-        let err = PopAuditor::verify_proof(&ch, &proof).unwrap_err();
+        let proof = PopMiner::answer_challenge(&mut cloned_batch, &ch);
+        let err = PopAuditor::verify_proof(&commit, &ch, &proof).unwrap_err();
         assert_eq!(
             err,
             PopError::DuplicatePadPages {
@@ -1545,9 +1763,64 @@ mod tests {
         let mut batch = PopMiner::mine_pad_batch(8, 4, 4).unwrap();
         batch.qkd_telemetry.decoy_yield_ratio = 1.42; // Violates beam-splitter concavity (> 1.08)
 
+        let commit = commit_helper(&batch);
         let ch = PopAuditor::issue_challenge(8, 0);
-        let proof = PopMiner::answer_challenge(&batch, &ch);
-        let err = PopAuditor::verify_proof(&ch, &proof).unwrap_err();
+        let proof = PopMiner::answer_challenge(&mut batch, &ch);
+        let err = PopAuditor::verify_proof(&commit, &ch, &proof).unwrap_err();
         assert!(matches!(err, PopError::QkdDecoyAnomaly { .. }));
+    }
+
+    #[test]
+    fn test_universal_hash_no_prefix_collisions_canonical_digests_commit_binding_and_non_slashable_stale() {
+        // H-2: Universal hash prefix collision regression checks.
+        let r = random_nonzero_field_elem();
+        let s = random_field_elem();
+        assert_ne!(cw_poly_digest(&[1], r), cw_poly_digest(&[0, 0], r));
+        let digests = [42u128, 99u128];
+        assert_ne!(
+            compute_challenged_slots_tag(1, 10, &digests, &[0], r, s),
+            compute_challenged_slots_tag(2, 9, &digests, &[0], r, s)
+        );
+        assert_ne!(
+            compute_batch_commitment_tag(1, 10, &digests, r, s),
+            compute_batch_commitment_tag(2, 9, &digests, r, s)
+        );
+
+        // H-3: Reject non-canonical page_digest >= PRIME_P.
+        let mut batch = PopMiner::mine_pad_batch(11, 6, 6).unwrap();
+        let commit = commit_helper(&batch);
+        let ch = PopAuditor::issue_challenge(11, 0);
+        let mut bad_proof = PopMiner::answer_challenge(&mut batch, &ch);
+        bad_proof.page_digests[0] = PRIME_P;
+        let err = PopAuditor::verify_proof(&commit, &ch, &bad_proof).unwrap_err();
+        assert!(matches!(err, PopError::InvalidCommitmentTag(_)));
+
+        // C-1: Post-challenge page substitution against pre-committed PopCommitment MUST fail!
+        let batch_a = PopMiner::mine_pad_batch(12, 6, 6).unwrap();
+        let mut batch_b = PopMiner::mine_pad_batch(12, 6, 6).unwrap();
+        let commit_a = commit_helper(&batch_a);
+        let ch_ab = PopAuditor::issue_challenge(12, 0);
+        let proof_b = PopMiner::answer_challenge(&mut batch_b, &ch_ab);
+        let err = PopAuditor::verify_proof(&commit_a, &ch_ab, &proof_b).unwrap_err();
+        assert_eq!(
+            err,
+            PopError::InvalidCommitmentTag("pre_committed_page_digest")
+        );
+
+        // M-4: Stale epoch and duplicate coordinator submissions MUST NOT slash honest validators!
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.register_genesis_validator(1).unwrap();
+        let mut b_stale = PopMiner::mine_pad_batch(1, 6, 6).unwrap();
+        let c_stale = commit_helper(&b_stale);
+        let ch_stale = PopAuditor::issue_challenge(1, 999);
+        let p_stale = PopMiner::answer_challenge(&mut b_stale, &ch_stale);
+        let report = PopEpochCoordinator::run_audited_epoch(
+            &mut engine,
+            &[(c_stale, ch_stale, p_stale)],
+        );
+        assert_eq!(report.rejected.len(), 1);
+        assert!(report.rejected[0].2.is_none(), "stale epoch must not slash");
+        assert_eq!(engine.vault(1).unwrap().bond, DEFAULT_REQUIRED_BOND);
+        assert_eq!(engine.vault(1).unwrap().status, ValidatorStatus::Active);
     }
 }

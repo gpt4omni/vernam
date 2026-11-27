@@ -12,13 +12,14 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bft::{BftCluster, BftConfig, BinaryTx, WebOfTrustRegistry};
 use crate::explorer_ui::VERNAM_EXPLORER_HTML;
-use crate::field::zeroize_slice;
+use crate::field::{random_field_elem, random_nonzero_field_elem, zeroize_slice};
 use crate::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
 use crate::privacy_mpc::{
     BeaverPool, ConfidentialTransferRequest, DEFAULT_BUCKET_SIZE, DEFAULT_NUM_VALIDATORS,
@@ -38,6 +39,27 @@ pub const TREASURY_INITIAL_BALANCE: u64 = 10_000_000;
 
 /// Maximum number of recent explorer events retained in [`TestnetState::recent_events`].
 pub const MAX_RECENT_EVENTS: usize = 20;
+
+/// Maximum Express payout per `/faucet` request.
+pub const MAX_FAUCET_EXPRESS: u64 = 100_000;
+
+/// Maximum Shielded payout per `/faucet` request.
+pub const MAX_FAUCET_SHIELDED: u64 = 10_000;
+
+/// Maximum concurrent inbound HTTP connections before returning HTTP 503.
+const MAX_CONCURRENT_CONNS: usize = 64;
+
+/// Maximum external P2P peer entries retained from `POST /p2p/announce`.
+const MAX_EXTERNAL_PEERS: usize = 64;
+
+/// Maximum peer address string length accepted by `POST /p2p/announce`.
+const MAX_PEER_ADDR_LEN: usize = 128;
+
+/// Overall wall-clock deadline for reading a single HTTP request (Slowloris defense).
+const HTTP_READ_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Socket write timeout for HTTP responses.
+const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default initial Beaver triple pool size for the Shielded IT-MPC lane.
 const INITIAL_BEAVER_POOL_SIZE: usize = 512;
@@ -331,6 +353,16 @@ impl TestnetState {
         if express == 0 && shielded == 0 {
             return Err("faucet requires express > 0 or shielded > 0".to_string());
         }
+        if express > MAX_FAUCET_EXPRESS {
+            return Err(format!(
+                "express faucet amount {express} exceeds per-request cap {MAX_FAUCET_EXPRESS}"
+            ));
+        }
+        if shielded > MAX_FAUCET_SHIELDED {
+            return Err(format!(
+                "shielded faucet amount {shielded} exceeds per-request cap {MAX_FAUCET_SHIELDED}"
+            ));
+        }
 
         // Pre-validate shielded range ceiling before committing any BFT block so faucet is atomic.
         if shielded > 0 {
@@ -612,16 +644,10 @@ impl TestnetState {
     }
 
     /// Execute a full epoch rotation:
-    /// 1. Proactive Secret Sharing refresh across every shielded balance (`proactive_refresh_epoch`).
-    /// 2. Live BB84 + Decoy-State QKD link verification (`exchange_key`).
+    /// 1. Live BB84 + Decoy-State QKD link verification (`exchange_key`).
+    /// 2. Proactive Secret Sharing refresh across every shielded balance (`proactive_refresh_epoch`).
     /// 3. Proof-of-Pad epoch settlement & reward distribution in [`TokenomicsEngine`].
     pub fn refresh_epoch(&mut self) -> Result<EpochRefreshReceipt, String> {
-        let new_pss_epoch = self
-            .shielded_ledger
-            .proactive_refresh_epoch()
-            .map_err(|e| format!("PSS epoch refresh failed: {e}"))?;
-
-        // Run a live BB84 + Decoy-State QKD exchange for fresh quantum link telemetry.
         let mut qkd_res = self
             .qkd_channel
             .exchange_key(32)
@@ -631,6 +657,22 @@ impl TestnetState {
         let decoy_yield_ratio = qkd_res.decoy_yield_ratio;
         zeroize_slice(&mut qkd_res.alice_key);
         zeroize_slice(&mut qkd_res.bob_key);
+
+        self.apply_epoch_refresh_with_qkd(qber, qkd_sifted_bits, decoy_yield_ratio)
+    }
+
+    /// Apply PSS refresh and tokenomics settlement using QKD telemetry computed outside the mutex.
+    pub fn apply_epoch_refresh_with_qkd(
+        &mut self,
+        qber: f64,
+        qkd_sifted_bits: usize,
+        decoy_yield_ratio: f64,
+    ) -> Result<EpochRefreshReceipt, String> {
+        let new_pss_epoch = self
+            .shielded_ledger
+            .proactive_refresh_epoch()
+            .map_err(|e| format!("PSS epoch refresh failed: {e}"))?;
+
         self.last_qber = qber;
 
         // Record PSS refresh & QKD pad availability for online validators and settle PoP epoch.
@@ -907,6 +949,7 @@ pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub body: String,
+    pub auth_header: Option<String>,
 }
 
 /// Serialized HTTP/1.1 response.
@@ -960,18 +1003,23 @@ impl HttpResponse {
 
     /// Encode this response into an HTTP/1.1 byte buffer with CORS headers.
     pub fn to_http_bytes(&self) -> Vec<u8> {
+        let cors_origin = std::env::var("VRNM_CORS_ORIGIN")
+            .ok()
+            .filter(|s| !s.is_empty() && !s.contains('\r') && !s.contains('\n'))
+            .unwrap_or_else(|| "*".to_string());
         let header = format!(
             "HTTP/1.1 {} {}\r\n\
              Content-Type: {}\r\n\
              Content-Length: {}\r\n\
-             Access-Control-Allow-Origin: *\r\n\
+             Access-Control-Allow-Origin: {}\r\n\
              Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-             Access-Control-Allow-Headers: Content-Type\r\n\
+             Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
              Connection: close\r\n\r\n",
             self.status_code,
             self.status_text,
             self.content_type,
-            self.body.len()
+            self.body.len(),
+            cors_origin,
         );
         let mut buf = Vec::with_capacity(header.len() + self.body.len());
         buf.extend_from_slice(header.as_bytes());
@@ -980,13 +1028,57 @@ impl HttpResponse {
     }
 }
 
+fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Enforce optional `VRNM_API_TOKEN` bearer authentication on mutating/admin endpoints.
+/// When `VRNM_API_TOKEN` is unset or empty, requests remain open for local devnets/tests.
+fn check_api_auth(req: &HttpRequest) -> Result<(), HttpResponse> {
+    let Ok(expected) = std::env::var("VRNM_API_TOKEN") else {
+        return Ok(());
+    };
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let Some(header) = req.auth_header.as_deref() else {
+        return Err(HttpResponse::err_json(
+            401,
+            "Unauthorized",
+            "missing Authorization: Bearer token",
+        ));
+    };
+    let Some(provided) = header.strip_prefix("Bearer ") else {
+        return Err(HttpResponse::err_json(
+            401,
+            "Unauthorized",
+            "expected Authorization: Bearer <token>",
+        ));
+    };
+    if !ct_eq_bytes(provided.as_bytes(), expected.as_bytes()) {
+        return Err(HttpResponse::err_json(
+            401,
+            "Unauthorized",
+            "invalid bearer token",
+        ));
+    }
+    Ok(())
+}
+
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Read and parse a single HTTP/1.1 request from `stream`.
+/// Read and parse a single HTTP/1.1 request from `stream` with an overall wall-clock deadline.
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let deadline = Instant::now() + HTTP_READ_DEADLINE;
     let mut raw = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
 
@@ -997,6 +1089,13 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         if raw.len() > MAX_HTTP_HEADER_BYTES {
             return Err("HTTP headers exceed maximum allowed size".to_string());
         }
+        let Some(remaining_time) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("HTTP request read deadline exceeded".to_string());
+        };
+        if remaining_time.is_zero() {
+            return Err("HTTP request read deadline exceeded".to_string());
+        }
+        let _ = stream.set_read_timeout(Some(remaining_time));
         let n = stream
             .read(&mut chunk)
             .map_err(|e| format!("failed to read HTTP request: {e}"))?;
@@ -1029,13 +1128,17 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         .to_string();
 
     let mut content_length: usize = 0;
+    let mut auth_header: Option<String> = None;
     for line in lines {
         if let Some((name, val)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
+            let trimmed_name = name.trim();
+            if trimmed_name.eq_ignore_ascii_case("content-length") {
                 content_length = val
                     .trim()
                     .parse::<usize>()
                     .map_err(|_| "invalid Content-Length header".to_string())?;
+            } else if trimmed_name.eq_ignore_ascii_case("authorization") {
+                auth_header = Some(val.trim().to_string());
             }
         }
     }
@@ -1044,12 +1147,20 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     }
 
     let body_start = header_end + 4;
-    let mut body_bytes = Vec::with_capacity(content_length);
+    // Cap upfront allocation to avoid OOM from spoofed Content-Length headers.
+    let mut body_bytes = Vec::with_capacity(content_length.min(8192));
     if raw.len() > body_start {
         let already = (raw.len() - body_start).min(content_length);
         body_bytes.extend_from_slice(&raw[body_start..body_start + already]);
     }
     while body_bytes.len() < content_length {
+        let Some(remaining_time) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("HTTP request body read deadline exceeded".to_string());
+        };
+        if remaining_time.is_zero() {
+            return Err("HTTP request body read deadline exceeded".to_string());
+        }
+        let _ = stream.set_read_timeout(Some(remaining_time));
         let remaining = content_length - body_bytes.len();
         let to_read = remaining.min(chunk.len());
         let n = stream
@@ -1064,7 +1175,44 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let body = String::from_utf8(body_bytes)
         .map_err(|_| "HTTP request body is not valid UTF-8".to_string())?;
 
-    Ok(HttpRequest { method, path, body })
+    Ok(HttpRequest {
+        method,
+        path,
+        body,
+        auth_header,
+    })
+}
+
+struct ConnSlotGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnSlotGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_conn_slot(active: &Arc<AtomicUsize>) -> Option<ConnSlotGuard> {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONCURRENT_CONNS {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(ConnSlotGuard {
+                    active: Arc::clone(active),
+                });
+            }
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Zero-external-crate, VPS-ready live Vernam (`VRNM`) Testnet HTTP/1.1 Server + Web Explorer.
@@ -1096,13 +1244,28 @@ impl TestnetServer {
         Arc::clone(&self.state)
     }
 
-    /// Accept and serve HTTP/1.1 connections indefinitely (spawning a worker thread per client).
+    /// Accept and serve HTTP/1.1 connections indefinitely with bounded concurrency
+    /// (`MAX_CONCURRENT_CONNS`), returning HTTP 503 when saturated.
     pub fn serve_forever(&self) {
+        let active_conns = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
             match stream {
                 Ok(mut tcp) => {
+                    let Some(slot_guard) = try_acquire_conn_slot(&active_conns) else {
+                        let _ = tcp.set_write_timeout(Some(Duration::from_millis(500)));
+                        let resp = HttpResponse::err_json(
+                            503,
+                            "Service Unavailable",
+                            "server saturated: too many concurrent connections",
+                        )
+                        .to_http_bytes();
+                        let _ = tcp.write_all(&resp);
+                        let _ = tcp.flush();
+                        continue;
+                    };
                     let state = Arc::clone(&self.state);
                     thread::spawn(move || {
+                        let _guard = slot_guard;
                         Self::handle_connection(&state, &mut tcp);
                     });
                 }
@@ -1130,6 +1293,7 @@ impl TestnetServer {
     }
 
     fn handle_connection(state: &Arc<Mutex<TestnetState>>, stream: &mut TcpStream) {
+        let _ = stream.set_write_timeout(Some(HTTP_WRITE_TIMEOUT));
         let response = match read_http_request(stream) {
             Ok(req) => Self::route_request(state, &req),
             Err(err) => HttpResponse::err_json(400, "Bad Request", &err),
@@ -1181,11 +1345,18 @@ impl TestnetServer {
             }
 
             ("POST", "/p2p/announce") => {
+                if let Err(resp) = check_api_auth(req) {
+                    return resp;
+                }
                 let Some(raw_addr) = parse_json_str(&req.body, "addr") else {
                     return HttpResponse::err_json(400, "Bad Request", "missing string field 'addr'");
                 };
                 let trimmed = raw_addr.trim();
-                if trimmed.is_empty() || !trimmed.contains(':') || trimmed.chars().any(|c| c.is_whitespace()) {
+                if trimmed.is_empty()
+                    || trimmed.len() > MAX_PEER_ADDR_LEN
+                    || !trimmed.contains(':')
+                    || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
                     return HttpResponse::err_json(400, "Bad Request", "malformed peer 'addr'");
                 }
                 let node_id = parse_json_u64(&req.body, "node_id").unwrap_or(100);
@@ -1198,6 +1369,13 @@ impl TestnetServer {
                     .unwrap_or_else(|| guard.config.bind_addr.clone());
                 if trimmed != self_adv && trimmed != guard.config.bind_addr {
                     let is_new = !guard.external_peers.contains_key(trimmed);
+                    if is_new && guard.external_peers.len() >= MAX_EXTERNAL_PEERS {
+                        return HttpResponse::err_json(
+                            400,
+                            "Bad Request",
+                            "external peer table full",
+                        );
+                    }
                     guard
                         .external_peers
                         .insert(trimmed.to_string(), (node_id, height, pop_score, 0.0));
@@ -1209,28 +1387,40 @@ impl TestnetServer {
             }
 
             ("POST", "/pop/mine") => {
-                let mut guard = state.lock().expect("testnet state mutex poisoned");
-                let epoch = guard.tokenomics.current_epoch();
-                let mut proofs = Vec::new();
+                if let Err(resp) = check_api_auth(req) {
+                    return resp;
+                }
+                // Read current epoch briefly, then drop mutex so /health and /status never stall
+                // while PoP QKD/entropy mining & commit-then-challenge verification execute.
+                let (epoch, mut last_qber) = {
+                    let guard = state.lock().expect("testnet state mutex poisoned");
+                    (guard.tokenomics.current_epoch(), guard.last_qber)
+                };
+
+                let mut proofs = Vec::with_capacity(4);
                 let mut last_monobit_z = 0.0f64;
                 let mut last_runs_z = 0.0f64;
-                let mut last_qber = guard.last_qber;
                 let mut all_valid = true;
 
                 for vid in 0..4u64 {
                     match PopMiner::mine_pad_batch(vid, 8, 8) {
-                        Ok(batch) => {
+                        Ok(mut batch) => {
+                            let commit = PopMiner::commit_batch(
+                                &batch,
+                                random_nonzero_field_elem(),
+                                random_field_elem(),
+                            );
                             let challenge = PopAuditor::issue_challenge(vid, epoch);
-                            let proof = PopMiner::answer_challenge(&batch, &challenge)
+                            let proof = PopMiner::answer_challenge(&mut batch, &challenge)
                                 .with_liveness(1, 1);
-                            if let Ok(rcpt) = PopAuditor::verify_proof(&challenge, &proof) {
+                            if let Ok(rcpt) = PopAuditor::verify_proof(&commit, &challenge, &proof) {
                                 last_monobit_z = rcpt.entropy_stats.monobit_z_score;
                                 last_runs_z = rcpt.entropy_stats.runs_z_score;
                                 last_qber = rcpt.qkd_telemetry.qber;
                             } else {
                                 all_valid = false;
                             }
-                            proofs.push((challenge, proof));
+                            proofs.push((commit, challenge, proof));
                         }
                         Err(_) => {
                             all_valid = false;
@@ -1238,6 +1428,7 @@ impl TestnetServer {
                     }
                 }
 
+                let mut guard = state.lock().expect("testnet state mutex poisoned");
                 let report = PopEpochCoordinator::run_audited_epoch(&mut guard.tokenomics, &proofs);
                 let _ = guard.shielded_ledger.proactive_refresh_epoch();
                 guard.last_qber = last_qber;
@@ -1255,7 +1446,7 @@ impl TestnetServer {
                     guard.shielded_ledger.epoch(),
                     proofs.len(),
                     report.accepted.len(),
-                    all_valid,
+                    all_valid && report.accepted.len() == proofs.len() && !proofs.is_empty(),
                     last_monobit_z,
                     last_runs_z,
                     last_qber,
@@ -1271,6 +1462,9 @@ impl TestnetServer {
             }
 
             ("POST", "/faucet") => {
+                if let Err(resp) = check_api_auth(req) {
+                    return resp;
+                }
                 let Some(account_id_u64) = parse_json_u64(&req.body, "account_id") else {
                     return HttpResponse::err_json(
                         400,
@@ -1311,6 +1505,9 @@ impl TestnetServer {
             }
 
             ("POST", "/tx/express") => {
+                if let Err(resp) = check_api_auth(req) {
+                    return resp;
+                }
                 let Some(sender_u64) = parse_json_u64(&req.body, "sender") else {
                     return HttpResponse::err_json(
                         400,
@@ -1362,6 +1559,9 @@ impl TestnetServer {
             }
 
             ("POST", "/tx/shielded") => {
+                if let Err(resp) = check_api_auth(req) {
+                    return resp;
+                }
                 let Some(sender) = parse_json_u64(&req.body, "sender") else {
                     return HttpResponse::err_json(
                         400,
@@ -1413,8 +1613,31 @@ impl TestnetServer {
             }
 
             ("POST", "/epoch/refresh") => {
+                if let Err(resp) = check_api_auth(req) {
+                    return resp;
+                }
+                // Run the live BB84 + Decoy-State QKD link check OUTSIDE the state mutex so
+                // concurrent /health and /status probes never stall.
+                let mut ephemeral_qkd = Bb84Channel::default_channel();
+                let mut qkd_res = match ephemeral_qkd.exchange_key(32) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        return HttpResponse::err_json(
+                            400,
+                            "Bad Request",
+                            &format!("live BB84 QKD check failed: {e}"),
+                        );
+                    }
+                };
+                let qber = qkd_res.qber;
+                let qkd_sifted_bits = qkd_res.sifted_bits;
+                let decoy_yield_ratio = qkd_res.decoy_yield_ratio;
+                zeroize_slice(&mut qkd_res.alice_key);
+                zeroize_slice(&mut qkd_res.bob_key);
+
                 let mut guard = state.lock().expect("testnet state mutex poisoned");
-                match guard.refresh_epoch() {
+                match guard.apply_epoch_refresh_with_qkd(qber, qkd_sifted_bits, decoy_yield_ratio)
+                {
                     Ok(rcpt) => HttpResponse::ok_json(format!(
                         "{{\"status\":\"refreshed\",\"pss_epoch\":{},\"settled_tokenomics_epoch\":{},\"subsidy_minted_vern\":{},\"fee_rewards_distributed_vern\":{},\"fees_burned_in_epoch_vern\":{},\"total_burned_vern\":{},\"qber\":{:.6},\"qkd_sifted_bits\":{},\"decoy_yield_ratio\":{:.6}}}",
                         rcpt.pss_epoch,
@@ -1467,406 +1690,6 @@ impl TestnetServer {
         }
     }
 }
-
-// ============================================================================
-// 5. Self-Contained Dark-Mode Vernam (VRNM) Testnet Web Explorer & Wallet UI
-// ============================================================================
-
-#[allow(dead_code)]
-const EXPLORER_HTML: &str = r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Vernam (VRNM) Live Testnet Explorer</title>
-<style>
-  :root {
-    --bg: #070b14;
-    --panel: #0f172a;
-    --panel-2: #152038;
-    --border: #1e2d4d;
-    --text: #e2e8f0;
-    --muted: #94a3b8;
-    --emerald: #10b981;
-    --cyan: #22d3ee;
-    --violet: #a78bfa;
-    --amber: #f59e0b;
-    --rose: #fb7185;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
-    background: radial-gradient(circle at top right, #0f1d3a 0%, var(--bg) 55%);
-    color: var(--text);
-    min-height: 100vh;
-    padding: 24px;
-    line-height: 1.5;
-  }
-  .container { max-width: 1220px; margin: 0 auto; }
-  header {
-    display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-    gap: 16px; padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 24px;
-  }
-  .brand { display: flex; align-items: center; gap: 14px; }
-  .logo {
-    width: 44px; height: 44px; border-radius: 12px;
-    background: linear-gradient(135deg, var(--emerald), var(--cyan));
-    display: grid; place-items: center; font-weight: 800; color: #04101d; font-size: 20px;
-    box-shadow: 0 0 24px rgba(34, 211, 238, 0.25);
-  }
-  .brand h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
-  .brand p { font-size: 13px; color: var(--muted); }
-  .pill {
-    display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px;
-    border-radius: 999px; background: rgba(16, 185, 129, 0.12);
-    border: 1px solid rgba(16, 185, 129, 0.35); color: var(--emerald);
-    font-size: 12px; font-weight: 600;
-  }
-  .dot {
-    width: 8px; height: 8px; border-radius: 50%; background: var(--emerald);
-    box-shadow: 0 0 10px var(--emerald); animation: pulse 1.8s infinite;
-  }
-  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.35;} }
-  .kpi-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 14px; margin-bottom: 24px;
-  }
-  .card {
-    background: rgba(15, 23, 42, 0.9); border: 1px solid var(--border);
-    border-radius: 14px; padding: 18px; backdrop-filter: blur(8px);
-  }
-  .kpi-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-  .kpi-val {
-    font-size: 24px; font-weight: 700; margin-top: 6px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  .kpi-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .c-cyan { color: var(--cyan); }
-  .c-emerald { color: var(--emerald); }
-  .c-violet { color: var(--violet); }
-  .c-amber { color: var(--amber); }
-  .c-rose { color: var(--rose); }
-  .section-title {
-    font-size: 14px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: 0.06em; color: var(--muted); margin-bottom: 12px;
-  }
-  .validators {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-    gap: 12px; margin-bottom: 24px;
-  }
-  .v-card {
-    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 14px;
-  }
-  .v-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-  .v-name { font-weight: 700; font-size: 15px; }
-  .v-badge {
-    font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
-    background: rgba(16, 185, 129, 0.15); color: var(--emerald);
-  }
-  .v-meta {
-    font-size: 12px; color: var(--muted);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  .ops-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-    gap: 16px; margin-bottom: 24px;
-  }
-  .card h2 { font-size: 16px; margin-bottom: 6px; }
-  .card .desc { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
-  .row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 10px; }
-  .row-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
-  label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-  input {
-    width: 100%; padding: 9px 11px; border-radius: 8px; border: 1px solid var(--border);
-    background: #091020; color: var(--text); font-size: 13px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  input:focus { outline: none; border-color: var(--cyan); }
-  button {
-    width: 100%; padding: 10px 14px; border-radius: 9px; border: none;
-    font-weight: 600; font-size: 13px; cursor: pointer; transition: opacity 0.15s, transform 0.1s;
-  }
-  button:hover { opacity: 0.92; }
-  button:active { transform: scale(0.99); }
-  .btn-emerald { background: linear-gradient(135deg, #10b981, #059669); color: #04101d; }
-  .btn-cyan { background: linear-gradient(135deg, #22d3ee, #0284c7); color: #04101d; }
-  .btn-violet { background: linear-gradient(135deg, #a78bfa, #7c3aed); color: #ffffff; }
-  .btn-amber { background: linear-gradient(135deg, #f59e0b, #d97706); color: #04101d; }
-  .out-box {
-    margin-top: 10px; padding: 9px 11px; border-radius: 8px; background: #091020;
-    border: 1px solid var(--border); font-size: 12px; min-height: 36px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    color: var(--muted); word-break: break-all;
-  }
-  .share-box {
-    background: #080e1c; border: 1px dashed #2e3f68; border-radius: 10px; padding: 12px; margin-top: 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px;
-  }
-  .share-line { margin-top: 6px; word-break: break-all; }
-  .events {
-    max-height: 240px; overflow-y: auto; font-size: 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  .event-row {
-    padding: 7px 10px; border-bottom: 1px solid rgba(30, 45, 77, 0.6); color: #cbd5e1;
-  }
-  .event-row:last-child { border-bottom: none; }
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <div class="brand">
-      <div class="logo">V</div>
-      <div>
-        <h1>Vernam (VRNM) Live Testnet Explorer</h1>
-        <p>Zero Computational Crypto &bull; OTP + Carter-Wegman BFT &bull; Sharded Shamir IT-MPC &bull; BB84 QKD</p>
-      </div>
-    </div>
-    <div class="pill"><span class="dot"></span><span id="net-badge">vernam-vrnm-testnet &bull; LIVE</span></div>
-  </header>
-
-  <section class="kpi-grid">
-    <div class="card">
-      <div class="kpi-label">BFT Block Height</div>
-      <div class="kpi-val c-cyan" id="k-blocks">0</div>
-      <div class="kpi-sub">2-Phase OTP+CW BFT</div>
-    </div>
-    <div class="card">
-      <div class="kpi-label">Express Lane Txs</div>
-      <div class="kpi-val c-emerald" id="k-express">0</div>
-      <div class="kpi-sub" id="k-tps">Live TPS: 0.0/s</div>
-    </div>
-    <div class="card">
-      <div class="kpi-label">Shielded MPC Txs</div>
-      <div class="kpi-val c-violet" id="k-shielded">0</div>
-      <div class="kpi-sub" id="k-beaver">Beaver Pool: --</div>
-    </div>
-    <div class="card">
-      <div class="kpi-label">PSS Secret Epoch</div>
-      <div class="kpi-val c-amber" id="k-epoch">1</div>
-      <div class="kpi-sub" id="k-pop-epoch">PoP Epoch: 0</div>
-    </div>
-    <div class="card">
-      <div class="kpi-label">BB84 QKD QBER</div>
-      <div class="kpi-val c-emerald" id="k-qber">0.000%</div>
-      <div class="kpi-sub">Shor-Preskill Limit &lt; 11%</div>
-    </div>
-    <div class="card">
-      <div class="kpi-label">Total Burned VRNM</div>
-      <div class="kpi-val c-rose" id="k-burned">0</div>
-      <div class="kpi-sub" id="k-supply">Supply: --</div>
-    </div>
-  </section>
-
-  <div class="section-title">Validator Committee (Equal 1-Human = 1-Vote PoP &bull; Flat Bond)</div>
-  <section class="validators" id="validator-grid"></section>
-
-  <section class="ops-grid">
-    <div class="card">
-      <h2>Testnet Faucet</h2>
-      <p class="desc">Settles Express funds via real 2-phase BFT from Treasury + mints Shielded Shamir shares.</p>
-      <div class="row-3">
-        <div><label>Account ID (0-63)</label><input id="f-acct" type="number" value="1" min="0" max="63"></div>
-        <div><label>Express Amt</label><input id="f-exp" type="number" value="1000" min="0"></div>
-        <div><label>Shielded Amt</label><input id="f-sh" type="number" value="500" min="0" max="65535"></div>
-      </div>
-      <button class="btn-emerald" onclick="doFaucet()">Mint / Drip Testnet VRNM</button>
-      <div class="out-box" id="f-out">Ready.</div>
-    </div>
-
-    <div class="card">
-      <h2>Express Lane Send (2-Phase BFT)</h2>
-      <p class="desc">Finalizes a 32-byte BinaryTx across V0..V3 with 80/20 Pad-Burn fee.</p>
-      <div class="row-3">
-        <div><label>Sender ID</label><input id="e-from" type="number" value="1" min="0" max="63"></div>
-        <div><label>Recipient ID</label><input id="e-to" type="number" value="2" min="0" max="63"></div>
-        <div><label>Amount</label><input id="e-amt" type="number" value="50" min="1"></div>
-      </div>
-      <button class="btn-cyan" onclick="doExpress()">Send Express BFT Tx</button>
-      <div class="out-box" id="e-out">Ready.</div>
-    </div>
-
-    <div class="card">
-      <h2>Shielded Private Send (IT-MPC)</h2>
-      <p class="desc">Blinded one-hot bucket selector + 16-bit range proof over F_(2^127-1) using Beaver triples.</p>
-      <div class="row">
-        <div><label>Sender ID</label><input id="s-from" type="number" value="1" min="0" max="63"></div>
-        <div><label>Amount</label><input id="s-amt" type="number" value="25" min="1" max="65535"></div>
-      </div>
-      <div class="row">
-        <div><label>Recipient Bucket (0-3)</label><input id="s-bkt" type="number" value="0" min="0" max="3"></div>
-        <div><label>Recipient Slot (0-15)</label><input id="s-slot" type="number" value="2" min="0" max="15"></div>
-      </div>
-      <button class="btn-violet" onclick="doShielded()">Send Blinded Shielded Tx</button>
-      <div class="out-box" id="s-out">Ready.</div>
-    </div>
-
-    <div class="card">
-      <h2>Proactive Secret Sharing &amp; QKD Refresh</h2>
-      <p class="desc">Rotates all Shamir polynomials (z(0)=0), settles PoP epoch rewards, and runs a live BB84 check.</p>
-      <button class="btn-amber" onclick="doRefresh()">Run PSS Epoch Refresh + BB84 Check</button>
-      <div class="out-box" id="r-out">Click to rotate all validator shares without changing balances.</div>
-    </div>
-  </section>
-
-  <section class="ops-grid">
-    <div class="card">
-      <h2>Account &amp; 127-Bit Shamir Share Inspector</h2>
-      <p class="desc">Compare owner-reconstructed balance with raw random Shamir shares held by V0 &amp; V1.</p>
-      <div class="row">
-        <div><label>Inspect Account ID (0-63)</label><input id="i-acct" type="number" value="1" min="0" max="63"></div>
-        <div style="display:flex;align-items:end;"><button class="btn-cyan" onclick="loadBalance()">Inspect Account</button></div>
-      </div>
-      <div class="share-box" id="bal-box">
-        <div>Express Balance: <strong class="c-emerald" id="b-exp">--</strong> &nbsp;|&nbsp; Shielded Balance: <strong class="c-violet" id="b-sh">--</strong> &nbsp;|&nbsp; PSS Epoch: <strong class="c-amber" id="b-ep">--</strong></div>
-        <div class="share-line">V0 Shamir Share (F_p noise): <span class="c-cyan" id="b-v0">--</span></div>
-        <div class="share-line">V1 Shamir Share (F_p noise): <span class="c-violet" id="b-v1">--</span></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Live Network Event Stream</h2>
-      <p class="desc">Last 20 finalized BFT blocks, Shielded MPC settlements, and PSS/BB84 epoch rotations.</p>
-      <div class="events" id="event-list">Loading...</div>
-    </div>
-  </section>
-</div>
-
-<script>
-let prevExpress = 0;
-let prevTime = Date.now();
-
-function fmtVrnm(vern) {
-  return (vern / 1e8).toFixed(4) + ' VRNM';
-}
-
-async function api(path, method = 'GET', body = null) {
-  const opts = { method, headers: {} };
-  if (body !== null) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-  const res = await fetch(path, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-  return data;
-}
-
-async function refreshStatus() {
-  try {
-    const s = await api('/status');
-    const now = Date.now();
-    const dt = Math.max((now - prevTime) / 1000, 0.2);
-    const tps = Math.max(0, (s.express_txs - prevExpress) / dt);
-    prevExpress = s.express_txs;
-    prevTime = now;
-
-    document.getElementById('k-blocks').textContent = s.blocks_finalized;
-    document.getElementById('k-express').textContent = s.express_txs;
-    document.getElementById('k-tps').textContent = 'Live TPS: ' + tps.toFixed(1) + '/s';
-    document.getElementById('k-shielded').textContent = s.shielded_txs;
-    document.getElementById('k-beaver').textContent = 'Beaver Pool: ' + s.beaver_pool_remaining;
-    document.getElementById('k-epoch').textContent = s.pss_epoch;
-    document.getElementById('k-pop-epoch').textContent = 'PoP Epoch: ' + s.tokenomics_epoch;
-    document.getElementById('k-qber').textContent = (s.last_qber * 100).toFixed(3) + '%';
-    document.getElementById('k-burned').textContent = fmtVrnm(s.total_burned_vern);
-    document.getElementById('k-supply').textContent = 'Circulating: ' + fmtVrnm(s.circulating_supply_vern);
-
-    const vGrid = document.getElementById('validator-grid');
-    vGrid.innerHTML = s.validators.map(v => `
-      <div class="v-card">
-        <div class="v-head">
-          <span class="v-name">${v.label} ${v.wot_verified ? '(PoP Human)' : ''}</span>
-          <span class="v-badge">${v.online ? v.status : 'OFFLINE'}</span>
-        </div>
-        <div class="v-meta">Height: #${v.height} &bull; Vote Weight: ${v.voting_power}</div>
-        <div class="v-meta">Bond: ${fmtVrnm(v.bond_vern)}</div>
-        <div class="v-meta">Rewards: ${fmtVrnm(v.reward_balance_vern)}</div>
-      </div>
-    `).join('');
-
-    const evEl = document.getElementById('event-list');
-    const evs = (s.recent_events || []).slice().reverse();
-    evEl.innerHTML = evs.length
-      ? evs.map(e => `<div class="event-row">${e.replace(/</g, '&lt;')}</div>`).join('')
-      : '<div class="event-row">No events yet.</div>';
-  } catch (err) {
-    document.getElementById('net-badge').textContent = 'RECONNECTING...';
-  }
-}
-
-async function loadBalance() {
-  const id = parseInt(document.getElementById('i-acct').value, 10) || 0;
-  try {
-    const b = await api('/balance/' + id);
-    document.getElementById('b-exp').textContent = b.express_balance;
-    document.getElementById('b-sh').textContent = b.shielded_balance;
-    document.getElementById('b-ep').textContent = b.epoch;
-    document.getElementById('b-v0').textContent = b.v0_shamir_share;
-    document.getElementById('b-v1').textContent = b.v1_shamir_share;
-  } catch (err) {
-    document.getElementById('b-v0').textContent = 'Error: ' + err.message;
-  }
-}
-
-async function doFaucet() {
-  const out = document.getElementById('f-out');
-  try {
-    const res = await api('/faucet', 'POST', {
-      account_id: parseInt(document.getElementById('f-acct').value, 10),
-      express: parseInt(document.getElementById('f-exp').value, 10) || 0,
-      shielded: parseInt(document.getElementById('f-sh').value, 10) || 0
-    });
-    out.textContent = `Credited Acct #${res.account_id} | Express=${res.express_balance}, Shielded=${res.shielded_balance}`;
-    document.getElementById('i-acct').value = res.account_id;
-    await Promise.all([refreshStatus(), loadBalance()]);
-  } catch (err) { out.textContent = 'Error: ' + err.message; }
-}
-
-async function doExpress() {
-  const out = document.getElementById('e-out');
-  try {
-    const res = await api('/tx/express', 'POST', {
-      sender: parseInt(document.getElementById('e-from').value, 10),
-      recipient: parseInt(document.getElementById('e-to').value, 10),
-      amount: parseInt(document.getElementById('e-amt').value, 10)
-    });
-    out.textContent = `Block #${res.block_height} finalized (Leader V${res.leader_id}) | Burned ${res.burned_vern} vern`;
-    await Promise.all([refreshStatus(), loadBalance()]);
-  } catch (err) { out.textContent = 'Error: ' + err.message; }
-}
-
-async function doShielded() {
-  const out = document.getElementById('s-out');
-  try {
-    const res = await api('/tx/shielded', 'POST', {
-      sender: parseInt(document.getElementById('s-from').value, 10),
-      recipient_bucket: parseInt(document.getElementById('s-bkt').value, 10),
-      recipient_slot: parseInt(document.getElementById('s-slot').value, 10),
-      amount: parseInt(document.getElementById('s-amt').value, 10)
-    });
-    out.textContent = `Blinded MPC settled (${res.triples_consumed} triples) | Burned ${res.burned_vern} vern`;
-    await Promise.all([refreshStatus(), loadBalance()]);
-  } catch (err) { out.textContent = 'Error: ' + err.message; }
-}
-
-async function doRefresh() {
-  const out = document.getElementById('r-out');
-  try {
-    const res = await api('/epoch/refresh', 'POST', {});
-    out.textContent = `PSS Epoch #${res.pss_epoch} | PoP Subsidy ${fmtVrnm(res.subsidy_minted_vern)} | BB84 QBER ${(res.qber*100).toFixed(3)}%`;
-    await Promise.all([refreshStatus(), loadBalance()]);
-  } catch (err) { out.textContent = 'Error: ' + err.message; }
-}
-
-refreshStatus();
-loadBalance();
-setInterval(() => { refreshStatus(); loadBalance(); }, 3000);
-</script>
-</body>
-</html>
-"##;
 
 // ============================================================================
 // 6. Comprehensive End-to-End TCP/HTTP Unit Tests
@@ -1992,7 +1815,7 @@ mod tests {
         );
         assert_eq!(code, 200, "shielded tx failed: {body}");
         assert_eq!(parse_json_str(&body, "status").as_deref(), Some("settled"));
-        assert_eq!(parse_json_u64(&body, "triples_consumed"), Some(64));
+        assert_eq!(parse_json_u64(&body, "triples_consumed"), Some(65));
         assert_eq!(parse_json_u64(&body, "burned_vern"), Some(50_000));
 
         // 6. GET /balance/2 before PSS epoch refresh
@@ -2072,13 +1895,13 @@ mod tests {
         assert_eq!(f0.shielded_balance, 1000);
         assert_eq!(f0.block_height, Some(1));
 
-        // Run 10 shielded transfers (10 * 64 = 640 triples > INITIAL_BEAVER_POOL_SIZE 512)
+        // Run 10 shielded transfers (10 * 65 = 650 triples > INITIAL_BEAVER_POOL_SIZE 512)
         // to prove automatic BeaverPool replenishment and exact balance conservation.
         for _ in 0..10 {
             let rcpt = state
                 .shielded_transfer(0, 1, 3, 10)
                 .expect("shielded transfer with auto-refill");
-            assert_eq!(rcpt.triples_consumed, 64);
+            assert_eq!(rcpt.triples_consumed, 65);
         }
         assert_eq!(state.shielded_txs, 10);
         assert_eq!(state.account_balance(0).unwrap().shielded_balance, 900);
@@ -2117,5 +1940,74 @@ mod tests {
         assert!(body.is_empty());
 
         handle.join().expect("server thread exited cleanly");
+    }
+
+    #[test]
+    fn test_testnet_server_faucet_caps_peer_caps_and_pop_mine() {
+        let config = TestnetConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            num_buckets: 4,
+            max_accounts: 64,
+        };
+        let state = Arc::new(Mutex::new(TestnetState::new(config).expect("init state")));
+
+        // Faucet caps enforce MAX_FAUCET_EXPRESS and MAX_FAUCET_SHIELDED.
+        {
+            let mut g = state.lock().unwrap();
+            assert!(g.faucet(1, MAX_FAUCET_EXPRESS + 1, 0).is_err());
+            assert!(g.faucet(1, 0, MAX_FAUCET_SHIELDED + 1).is_err());
+            assert!(g.faucet(1, MAX_FAUCET_EXPRESS, MAX_FAUCET_SHIELDED).is_ok());
+        }
+
+        // /p2p/announce rejects oversized peer addr (> 128 chars) and caps external_peers at 64.
+        let long_addr = format!("{}:8080", "a".repeat(130));
+        let resp_long = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/p2p/announce".to_string(),
+                body: format!("{{\"addr\":\"{long_addr}\",\"node_id\":1}}"),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_long.status_code, 400);
+
+        for i in 0..MAX_EXTERNAL_PEERS {
+            let resp = TestnetServer::route_request(
+                &state,
+                &HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/p2p/announce".to_string(),
+                    body: format!("{{\"addr\":\"10.0.0.1:{}\",\"node_id\":{}}}", 9000 + i, i),
+                    auth_header: None,
+                },
+            );
+            assert_eq!(resp.status_code, 200);
+        }
+        let resp_overflow = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/p2p/announce".to_string(),
+                body: "{\"addr\":\"10.0.0.1:9999\",\"node_id\":999}".to_string(),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_overflow.status_code, 400);
+
+        // /pop/mine runs PoP commit-then-challenge outside the lock and settles cleanly.
+        let resp_pop = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/pop/mine".to_string(),
+                body: "{}".to_string(),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_pop.status_code, 200, "pop mine failed: {}", resp_pop.body);
+        assert!(resp_pop.body.contains("\"beaver_verified\":true"));
+        assert_eq!(parse_json_u64(&resp_pop.body, "passed_validators"), Some(4));
+        assert_eq!(parse_json_u64(&resp_pop.body, "audited_validators"), Some(4));
     }
 }

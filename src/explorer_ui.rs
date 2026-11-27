@@ -1265,39 +1265,57 @@ async function runPopMine() {
       }
     }
 
-    const audit = res.audit || res.entropy_audit || res;
-    const monobitPass = audit.monobit_passed ?? audit.monobit_ok ?? (usedFallback ? true : true);
-    const runsPass = audit.runs_passed ?? audit.runs_ok ?? (usedFallback ? true : true);
-    const beaverPass = audit.beaver_passed ?? audit.beaver_ok ?? audit.beaver_spot_check_passed ?? (usedFallback ? true : true);
-    const qberVal = Number(res.qber ?? audit.qber ?? (latestStatus ? latestStatus.last_qber : 0));
-    const qberPass = audit.qkd_qber_passed ?? audit.qber_ok ?? (qberVal < 0.11);
+    const audit = res.audit || res.entropy_audit || res || {};
+    const hasMonobitZ = typeof audit.monobit_z === 'number' && Number.isFinite(audit.monobit_z);
+    const hasRunsZ = typeof audit.runs_z === 'number' && Number.isFinite(audit.runs_z);
+    const monobitPass = hasMonobitZ
+      ? Math.abs(audit.monobit_z) <= 6.0
+      : (audit.monobit_passed === true);
+    const runsPass = hasRunsZ
+      ? Math.abs(audit.runs_z) <= 6.0
+      : (audit.runs_passed === true);
+    const auditedVals = Number(audit.audited_validators ?? res.audited_validators ?? 0);
+    const passedVals = Number(audit.passed_validators ?? res.passed_validators ?? 0);
+    const beaverPass =
+      (audit.beaver_verified === true && auditedVals > 0 && passedVals === auditedVals) ||
+      audit.beaver_passed === true ||
+      audit.beaver_spot_check_passed === true;
+    const rawQber = res.qber ?? audit.qber;
+    const qberVal = rawQber != null ? Number(rawQber) : NaN;
+    const qberPass = Number.isFinite(qberVal) && qberVal >= 0 && qberVal <= 0.11;
 
     setAuditBadge('aud-monobit', Boolean(monobitPass));
     setAuditBadge('aud-runs', Boolean(runsPass));
     setAuditBadge('aud-beaver', Boolean(beaverPass));
     setAuditBadge('aud-qber', Boolean(qberPass));
 
-    if (audit.monobit_ones_ratio != null) {
+    if (hasMonobitZ) {
+      document.getElementById('aud-monobit-val').textContent = 'Monobit z-score: ' + audit.monobit_z.toFixed(3) + ' (|z| <= 6.0)';
+    } else if (audit.monobit_ones_ratio != null) {
       document.getElementById('aud-monobit-val').textContent = 'Ones ratio: ' + (Number(audit.monobit_ones_ratio) * 100).toFixed(2) + '%';
-    } else if (audit.ones_count != null) {
-      document.getElementById('aud-monobit-val').textContent = 'Ones count: ' + audit.ones_count;
     } else {
-      document.getElementById('aud-monobit-val').textContent = usedFallback ? 'Verified via PSS/QKD' : 'Balanced 50/50 OTP bits';
+      document.getElementById('aud-monobit-val').textContent = usedFallback ? 'Unavailable on /epoch/refresh' : 'Missing monobit telemetry';
     }
 
-    if (audit.runs_count != null) {
+    if (hasRunsZ) {
+      document.getElementById('aud-runs-val').textContent = 'Runs z-score: ' + audit.runs_z.toFixed(3) + ' (|z| <= 6.0)';
+    } else if (audit.runs_count != null) {
       document.getElementById('aud-runs-val').textContent = 'Runs observed: ' + audit.runs_count;
     } else {
-      document.getElementById('aud-runs-val').textContent = usedFallback ? 'Verified via PSS/QKD' : 'No bias / repetition';
+      document.getElementById('aud-runs-val').textContent = usedFallback ? 'Unavailable on /epoch/refresh' : 'Missing runs telemetry';
     }
 
-    if (audit.beaver_triples_checked != null) {
-      document.getElementById('aud-beaver-val').textContent = 'Checked ' + audit.beaver_triples_checked + ' triples (0 faults)';
+    if (auditedVals > 0) {
+      document.getElementById('aud-beaver-val').textContent = 'Validators passed: ' + passedVals + '/' + auditedVals + ' (beaver=' + (audit.beaver_verified === true ? 'OK' : 'FAIL') + ')';
+    } else if (audit.beaver_triples_checked != null) {
+      document.getElementById('aud-beaver-val').textContent = 'Checked ' + audit.beaver_triples_checked + ' triples';
     } else {
-      document.getElementById('aud-beaver-val').textContent = 'Spot-check verified in F_p';
+      document.getElementById('aud-beaver-val').textContent = 'Missing Beaver audit proof';
     }
 
-    document.getElementById('aud-qber-val').textContent = 'Live QBER: ' + (qberVal * 100).toFixed(3) + '% (< 11%)';
+    document.getElementById('aud-qber-val').textContent = Number.isFinite(qberVal)
+      ? 'Live QBER: ' + (qberVal * 100).toFixed(3) + '% (<= 11%)'
+      : 'Missing QBER telemetry';
 
     const subsidy = res.subsidy_minted_vern ?? res.subsidy_vern ?? res.reward_vern ?? 0;
     const epochNum = res.settled_tokenomics_epoch ?? res.epoch ?? res.pss_epoch ?? 0;
@@ -1539,5 +1557,17 @@ mod tests {
                 "explorer HTML must remain 100% offline/air-gapped (found forbidden external reference: {needle})"
             );
         }
+    }
+
+    #[test]
+    fn test_pop_audit_badges_fail_closed_and_read_real_fields() {
+        assert!(
+            !VERNAM_EXPLORER_HTML.contains("usedFallback ? true : true"),
+            "PoP badges must never default to true on missing fields"
+        );
+        assert!(VERNAM_EXPLORER_HTML.contains("audit.beaver_verified === true"));
+        assert!(VERNAM_EXPLORER_HTML.contains("passedVals === auditedVals"));
+        assert!(VERNAM_EXPLORER_HTML.contains("Math.abs(audit.monobit_z) <= 6.0"));
+        assert!(VERNAM_EXPLORER_HTML.contains("Math.abs(audit.runs_z) <= 6.0"));
     }
 }

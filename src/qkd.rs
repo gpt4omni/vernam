@@ -21,7 +21,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::field::{PRIME_P, fill_os_random, zeroize_slice};
+use crate::field::{
+    PRIME_P, add_mod, ct_eq_16, fill_os_random, mul_mod, reduce, zeroize_slice, zeroize_u128,
+};
 
 /// Shor-Preskill unconditional security QBER threshold for BB84 (11%).
 pub const BB84_QBER_ABORT_THRESHOLD: f64 = 0.11;
@@ -59,6 +61,8 @@ pub enum QkdError {
     InvalidParameter(String),
     /// Buffered key pool could not satisfy the request (e.g., shut down).
     PoolExhausted { requested: usize, available: usize },
+    /// Post-reconciliation universal Carter-Wegman confirmation tag failed (residual key mismatch).
+    ReconciliationFailed(String),
     /// Requested QKD peer link is unavailable.
     PeerUnavailable(String),
 }
@@ -105,6 +109,9 @@ impl fmt::Display for QkdError {
                 f,
                 "QKD key pool exhausted: requested {requested} bytes, available {available} bytes"
             ),
+            QkdError::ReconciliationFailed(msg) => {
+                write!(f, "QKD post-reconciliation confirmation failed: {msg}")
+            }
             QkdError::PeerUnavailable(peer) => write!(f, "QKD peer unavailable: {peer}"),
         }
     }
@@ -1007,12 +1014,14 @@ impl<E: EntropySource> Bb84Channel<E> {
         let mut total_pa_raw_bits = 0usize;
 
         let mut remaining_bytes = num_bytes;
-        for _ in 0..num_blocks {
+        for block_idx in 0..num_blocks {
             let chunk_bytes = remaining_bytes.min(PA_OUTPUT_BLOCK_BYTES);
             remaining_bytes -= chunk_bytes;
             let ob = chunk_bytes * 8;
-            // Conservative 2.25x raw-to-output ratio + security margin rounded to 64-bit word.
-            let rb = ((ob * 9 / 4) + margin).max(512).div_ceil(64) * 64;
+            // Conservative 2.25x raw-to-output ratio + security margin (+128 bits on block 0 for
+            // the post-reconciliation universal confirmation tag) rounded to 64-bit word.
+            let confirm_extra = if block_idx == 0 { 128 } else { 0 };
+            let rb = ((ob * 9 / 4) + margin + confirm_extra).max(512).div_ceil(64) * 64;
             block_out_bits.push(ob);
             block_raw_bits.push(rb);
             total_pa_raw_bits += rb;
@@ -1120,11 +1129,35 @@ impl<E: EntropySource> Bb84Channel<E> {
         // Step 4: Discard sacrificed QBER sample words; reconcile remaining bits if noisy.
         let alice_pa = &mut alice_sifted[sample_words..];
         let bob_pa = &mut bob_sifted[sample_words..];
-        let leaked_reconciliation_bits = if qber > 0.0 || intrinsic_err > 0.0 {
-            reconcile_words_cascade(alice_pa, bob_pa)
+        let mut leaked_reconciliation_bits = if qber > 0.0 || intrinsic_err > 0.0 {
+            reconcile_words_cascade(alice_pa, bob_pa, qber.max(intrinsic_err))
         } else {
             0
         };
+
+        // Step 4b: ALWAYS run a 128-bit universal Carter-Wegman confirmation tag comparing
+        // `alice_pa` and `bob_pa` BEFORE privacy amplification (aborting on any residual mismatch).
+        let mut confirm_r = (((stream.next_u64()? as u128) | ((stream.next_u64()? as u128) << 64))
+            & PRIME_P)
+            .max(1);
+        if confirm_r >= PRIME_P {
+            confirm_r = 1;
+        }
+        let mut confirm_s =
+            reduce((stream.next_u64()? as u128) | ((stream.next_u64()? as u128) << 64));
+        let alice_confirm = cw_confirm_tag_u64(alice_pa, confirm_r, confirm_s);
+        let bob_confirm = cw_confirm_tag_u64(bob_pa, confirm_r, confirm_s);
+        zeroize_u128(&mut confirm_r);
+        zeroize_u128(&mut confirm_s);
+        leaked_reconciliation_bits += 128;
+
+        if !ct_eq_16(&alice_confirm, &bob_confirm) {
+            zeroize_u64_slice(&mut alice_sifted);
+            zeroize_u64_slice(&mut bob_sifted);
+            return Err(QkdError::ReconciliationFailed(
+                "post-reconciliation universal confirmation tag mismatch".into(),
+            ));
+        }
 
         // Verify Devetak-Winter / Renner extractable min-entropy budget.
         let qber_bound = qber.max(intrinsic_err);
@@ -1157,8 +1190,12 @@ impl<E: EntropySource> Bb84Channel<E> {
             word_cursor += rw;
 
             let chunk_bytes = ob / 8;
-            alice_key.extend_from_slice(&u64s_to_bytes(&a_hash, chunk_bytes));
-            bob_key.extend_from_slice(&u64s_to_bytes(&b_hash, chunk_bytes));
+            let mut a_bytes = u64s_to_bytes(&a_hash, chunk_bytes);
+            let mut b_bytes = u64s_to_bytes(&b_hash, chunk_bytes);
+            alice_key.extend_from_slice(&a_bytes);
+            bob_key.extend_from_slice(&b_bytes);
+            zeroize_slice(&mut a_bytes);
+            zeroize_slice(&mut b_bytes);
 
             zeroize_u64_slice(&mut a_hash);
             zeroize_u64_slice(&mut b_hash);
@@ -1185,17 +1222,32 @@ impl<E: EntropySource> Bb84Channel<E> {
     }
 }
 
+/// 128-bit universal Carter-Wegman confirmation tag over `u64` sifted key words in `F_(2^127 - 1)`.
+fn cw_confirm_tag_u64(words: &[u64], r: u128, s: u128) -> [u8; 16] {
+    let r = reduce(r);
+    let s = reduce(s);
+    let mut acc = mul_mod(reduce(words.len() as u128), r);
+    for &w in words {
+        acc = mul_mod(add_mod(acc, w as u128), r);
+    }
+    add_mod(acc, s).to_le_bytes()
+}
+
 /// Cascade-style strided binary-search parity reconciliation for slightly noisy
-/// honest channels (`0 < qber <= 0.11`). Uses coprime strides to permute bit positions
-/// across passes and backtracks into earlier passes on each correction, returning the
-/// exact number of parity bits leaked on the public classical channel.
-fn reconcile_words_cascade(alice: &[u64], bob: &mut [u64]) -> usize {
+/// honest channels (`0 < qber <= 0.11`). Scales initial block size with observed QBER,
+/// uses coprime strides to permute bit positions across passes, and backtracks across
+/// `&strides[..=pass_idx]` on each correction, returning the exact number of parity bits
+/// leaked on the public classical channel.
+fn reconcile_words_cascade(alice: &[u64], bob: &mut [u64], observed_qber: f64) -> usize {
     let total_bits = alice.len() * 64;
     if total_bits == 0 {
         return 0;
     }
 
-    let block_size = 32usize.min(total_bits);
+    let est_qber = observed_qber.clamp(0.005, 0.25);
+    let block_size = ((0.73 / est_qber).round() as usize)
+        .clamp(8, 64)
+        .min(total_bits);
     let candidate_strides = [1usize, 17, 53, 109, 227];
     let mut strides = Vec::with_capacity(4);
     for &s in &candidate_strides {
@@ -1229,12 +1281,12 @@ fn reconcile_words_cascade(alice: &[u64], bob: &mut [u64]) -> usize {
         }
 
         // Cascade backtracking: whenever pass `pass_idx` flips a bit, re-check its
-        // containing block in earlier passes (no extra top-level parity bit leaked
-        // since those block parities were already exchanged).
-        if pass_idx > 0 && !fixed_indices.is_empty() {
+        // containing block across `&strides[..=pass_idx]` (no extra top-level parity bit
+        // leaked since those block parities were already exchanged).
+        if !fixed_indices.is_empty() {
             let mut worklist = fixed_indices.clone();
             while let Some(bit_pos) = worklist.pop() {
-                for &prev_stride in &strides[..pass_idx] {
+                for &prev_stride in &strides[..=pass_idx] {
                     // Find `t` such that `(t * prev_stride) % total_bits == bit_pos`.
                     let inv = mod_inverse(prev_stride, total_bits);
                     let t = ((bit_pos as u128 * inv as u128) % total_bits as u128) as usize;
@@ -1303,7 +1355,7 @@ fn strided_index(t: usize, stride: usize, total_bits: usize) -> usize {
     if stride == 1 {
         t
     } else {
-        (t * stride) % total_bits
+        (((t as u128) * (stride as u128)) % (total_bits as u128)) as usize
     }
 }
 
@@ -1528,13 +1580,28 @@ impl BufferedQkdPool {
         for idx in 0..config.num_channels {
             let shared_clone = Arc::clone(&shared);
             let ch_cfg = config.channel_config.clone();
-            let handle = thread::Builder::new()
+            match thread::Builder::new()
                 .name(format!("vernam-qkd-ch-{idx}"))
                 .spawn(move || Self::worker_loop(shared_clone, ch_cfg))
-                .map_err(|e| {
-                    QkdError::EntropyFailure(format!("failed to spawn QKD worker thread: {e}"))
-                })?;
-            workers.push(handle);
+            {
+                Ok(handle) => workers.push(handle),
+                Err(e) => {
+                    {
+                        let mut guard = shared.state.lock().expect("pool mutex poisoned");
+                        guard.shutdown = true;
+                        shared.refill_cv.notify_all();
+                        shared.data_cv.notify_all();
+                    }
+                    for h in workers.drain(..) {
+                        let _ = h.join();
+                    }
+                    let mut guard = shared.state.lock().expect("pool mutex poisoned");
+                    zeroize_slice(&mut guard.ring);
+                    return Err(QkdError::EntropyFailure(format!(
+                        "failed to spawn QKD worker thread: {e}"
+                    )));
+                }
+            }
         }
 
         let pool = Self { shared, workers };
@@ -1643,9 +1710,11 @@ impl BufferedQkdPool {
                 let taken = guard.pop_and_zeroize(&mut dst[offset..]);
                 offset += taken;
 
-                if guard.len < guard.low_watermark && !guard.refilling && guard.last_error.is_none()
-                {
+                let projected = guard.len + guard.in_flight_bytes;
+                if projected < guard.low_watermark {
                     guard.refilling = true;
+                }
+                if guard.refilling && projected < guard.capacity && guard.last_error.is_none() {
                     self.shared.refill_cv.notify_all();
                 }
             } else {
@@ -2108,5 +2177,21 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, QkdError::EavesdropperDetected { .. }));
+    }
+
+    #[test]
+    fn test_qkd_confirmation_tag_and_strided_index_overflow_safety() {
+        let a = [0x1122_3344_5566_7788u64, 0x99AA_BBCC_DDEE_FF00u64];
+        let mut b = a;
+        let r = 0x1234_5678_9ABC_DEF1u128;
+        let s = 0x0FED_CBA9_8765_4321u128;
+        assert_eq!(cw_confirm_tag_u64(&a, r, s), cw_confirm_tag_u64(&b, r, s));
+        b[1] ^= 1u64 << 17;
+        assert_ne!(cw_confirm_tag_u64(&a, r, s), cw_confirm_tag_u64(&b, r, s));
+
+        // Ensure u128 arithmetic avoids usize multiplication overflow in strided_index.
+        let large_total = (usize::MAX / 4).max(1024);
+        let idx = strided_index(large_total - 1, 227, large_total);
+        assert!(idx < large_total);
     }
 }

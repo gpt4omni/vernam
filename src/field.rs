@@ -125,6 +125,16 @@ pub fn random_field_elem() -> u128 {
     }
 }
 
+/// Uniform random non-zero element in [1, PRIME_P) using rejection sampling.
+pub fn random_nonzero_field_elem() -> u128 {
+    loop {
+        let v = random_field_elem();
+        if v != 0 {
+            return v;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

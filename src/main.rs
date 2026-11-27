@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use vernam_rs::bft::{BftCluster, BftConfig, BinaryTx};
 use vernam_rs::fast_engine::run_speed_benchmarks;
+use vernam_rs::field::{random_field_elem, random_nonzero_field_elem};
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
 use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
 use vernam_rs::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
@@ -25,7 +26,7 @@ use vernam_rs::tokenomics::{
 use vernam_rs::turbo_crypto::run_turbo_crypto_bench;
 use vernam_rs::turbo_express::run_turbo_express_bench;
 use vernam_rs::turbo_shielded::run_turbo_shielded_bench;
-use vernam_rs::wallet::{DEFAULT_NODE_URL, VernamWallet, WalletRpcClient};
+use vernam_rs::wallet::{DEFAULT_NODE_URL, VernamWallet, WalletRpcClient, validate_wallet_name};
 
 fn fmt_vrnm(verns: u64) -> String {
     format!("{:.4} VRNM", verns as f64 / VERN_PER_VRNM as f64)
@@ -109,7 +110,8 @@ fn resolve_wallet_dir(args: &[String], name_flag: &str) -> Result<PathBuf, Strin
     }
     let name = get_flag(args, name_flag)
         .ok_or_else(|| format!("missing required {name_flag} <wallet_name> (or --dir <path>)"))?;
-    Ok(wallet_base_dir().join(name))
+    let valid = validate_wallet_name(&name).map_err(|e| format!("{e}"))?;
+    Ok(wallet_base_dir().join(valid))
 }
 
 fn next_free_account_id(base: &Path) -> u32 {
@@ -150,7 +152,8 @@ fn resolve_recipient(to_arg: &str) -> Result<(u32, usize, usize), String> {
         let slot = (id as usize) % 16;
         return Ok((id, bucket, slot));
     }
-    let target_dir = wallet_base_dir().join(to_arg);
+    let valid_name = validate_wallet_name(to_arg).map_err(|e| format!("invalid recipient '{to_arg}': {e}"))?;
+    let target_dir = wallet_base_dir().join(valid_name);
     let w = VernamWallet::open(&target_dir).map_err(|e| {
         format!(
             "could not parse recipient '{to_arg}' as account_id or open local wallet at {}: {e}",
@@ -223,17 +226,20 @@ fn cmd_pop_mine() -> Result<(), String> {
     let epoch = tok.current_epoch();
     let mut proofs = Vec::new();
     for vid in 0..4u64 {
-        let batch = PopMiner::mine_pad_batch(vid, 8, 8).map_err(|e| format!("{e}"))?;
+        let mut batch = PopMiner::mine_pad_batch(vid, 8, 8).map_err(|e| format!("{e}"))?;
+        let commit =
+            PopMiner::commit_batch(&batch, random_nonzero_field_elem(), random_field_elem());
         let challenge = PopAuditor::issue_challenge(vid, epoch);
-        let proof = PopMiner::answer_challenge(&batch, &challenge).with_liveness(1, 1);
-        let rcpt = PopAuditor::verify_proof(&challenge, &proof).map_err(|e| format!("{e}"))?;
+        let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
+        let rcpt =
+            PopAuditor::verify_proof(&commit, &challenge, &proof).map_err(|e| format!("{e}"))?;
         println!(
             "  Validator V{vid}: PASS | monobit_z={:.3} runs_z={:.3} QBER={:.2}% beaver_triple=OK",
             rcpt.entropy_stats.monobit_z_score,
             rcpt.entropy_stats.runs_z_score,
             rcpt.qkd_telemetry.qber * 100.0
         );
-        proofs.push((challenge, proof));
+        proofs.push((commit, challenge, proof));
     }
     let report = PopEpochCoordinator::run_audited_epoch(&mut tok, &proofs);
     println!(
@@ -291,11 +297,13 @@ fn cmd_miner(args: &[String]) -> Result<(), String> {
         let t0 = Instant::now();
         // Strictly single-threaded 1-core execution when cores == 1 (or parallel workers if > 1).
         let (rcpt, total_pages, total_triples) = if cores == 1 {
-            let batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
+            let mut batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
                 .map_err(|e| format!("PoP mine failed: {e}"))?;
+            let commit =
+                PopMiner::commit_batch(&batch, random_nonzero_field_elem(), random_field_elem());
             let challenge = PopAuditor::issue_challenge(validator_id, round as u64);
-            let proof = PopMiner::answer_challenge(&batch, &challenge).with_liveness(1, 1);
-            let rcpt = PopAuditor::verify_proof(&challenge, &proof)
+            let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
+            let rcpt = PopAuditor::verify_proof(&commit, &challenge, &proof)
                 .map_err(|e| format!("self-audit failed: {e}"))?;
             (rcpt, pages, triples)
         } else {
@@ -304,11 +312,17 @@ fn cmd_miner(args: &[String]) -> Result<(), String> {
                 let mut handles = Vec::with_capacity(cores);
                 for c in 0..cores {
                     handles.push(s.spawn(move || -> Result<_, String> {
-                        let batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
+                        let mut batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
                             .map_err(|e| format!("worker {c}: {e}"))?;
+                        let cm = PopMiner::commit_batch(
+                            &batch,
+                            random_nonzero_field_elem(),
+                            random_field_elem(),
+                        );
                         let ch = PopAuditor::issue_challenge(validator_id, round as u64);
-                        let pr = PopMiner::answer_challenge(&batch, &ch).with_liveness(1, 1);
-                        PopAuditor::verify_proof(&ch, &pr).map_err(|e| format!("worker {c}: {e}"))
+                        let pr = PopMiner::answer_challenge(&mut batch, &ch).with_liveness(1, 1);
+                        PopAuditor::verify_proof(&cm, &ch, &pr)
+                            .map_err(|e| format!("worker {c}: {e}"))
                     }));
                 }
                 for h in handles {
@@ -381,10 +395,11 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
     match sub {
         "create" => {
             let name = get_flag(rest, "--name").ok_or("missing --name <wallet_name>")?;
+            let valid_name = validate_wallet_name(&name).map_err(|e| format!("{e}"))?;
             let dir = if let Some(d) = get_flag(rest, "--dir") {
                 PathBuf::from(d)
             } else {
-                wallet_base_dir().join(&name)
+                wallet_base_dir().join(valid_name)
             };
             let account_id = match get_flag(rest, "--id") {
                 Some(s) => s.parse::<u32>().map_err(|_| "invalid --id <u32>")?,
@@ -650,9 +665,13 @@ fn cmd_demo() {
 
     // 1. WAL OTP
     println!("[1/6] Zeroized OTP + Crash-Safe WAL PadBook + Carter-Wegman MAC");
-    let wal_path = std::env::temp_dir().join("vernam_demo_pad.bin");
-    let _ = std::fs::remove_file(&wal_path);
-    let _ = std::fs::remove_file(WalPadBook::wal_path_for(&wal_path));
+    let demo_dir = std::env::temp_dir().join(format!(
+        "vernam_demo_{}_{:016x}",
+        std::process::id(),
+        random_field_elem() as u64
+    ));
+    fs::create_dir_all(&demo_dir).expect("create unique demo temp dir");
+    let wal_path = demo_dir.join("vernam_demo_pad.bin");
     {
         let pages: Vec<PadPage> = (0..4).map(|i| PadPage::generate(i, FRAME_BYTES)).collect();
         let mut wal = WalPadBook::create(&wal_path, FRAME_BYTES, pages).expect("create WAL");
@@ -670,8 +689,7 @@ fn cmd_demo() {
             reloaded.remaining()
         );
     }
-    let _ = std::fs::remove_file(&wal_path);
-    let _ = std::fs::remove_file(WalPadBook::wal_path_for(&wal_path));
+    let _ = fs::remove_dir_all(&demo_dir);
 
     // 2. Express 2-Phase Batched BFT + Offline Catch-up
     println!("[2/6] Express Lane (VRNM-Fast): 2-Phase Batched BFT + Offline Quorum Catch-Up");
@@ -767,8 +785,9 @@ fn cmd_demo() {
     let slash_rcpt = tok.slash_validator(3, SlashingOffense::Equivocation).unwrap();
     let settlement = tok.settle_epoch();
     let audit_key = OneTimeAuditKey::generate();
+    let verifier_key = audit_key.duplicate_for_verifier();
     let audit_tag = audit_key.tag_settlement(&settlement);
-    assert!(audit_key.verify_settlement(&settlement, &audit_tag));
+    assert!(verifier_key.verify_settlement(&settlement, &audit_tag));
     println!("  Hard supply cap        : {}", fmt_vrnm(MAX_SUPPLY));
     println!(
         "  Equivocator V3 slashed : {} burned (status={:?})",

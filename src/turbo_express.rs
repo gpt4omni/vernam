@@ -35,7 +35,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering, compiler_fence};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, compiler_fence};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -912,9 +912,11 @@ pub fn reconstruct_batch(
     } else {
         let mut slots: Vec<Option<TurboTx>> = vec![None; total];
         for &(idx, tx) in &compact.prefilled_txs {
-            if (idx as usize) < total {
-                slots[idx as usize] = Some(tx);
+            let i = idx as usize;
+            if i >= total || slots[i].is_some() {
+                return Err(vec![i]);
             }
+            slots[i] = Some(tx);
         }
         let mut sid_iter = compact.short_ids.iter();
         let mut missing = Vec::new();
@@ -1039,6 +1041,11 @@ impl TurboLedger {
         prev_tag: &[u8; 16],
         txs: &[TurboTx],
     ) -> Result<(), TurboExpressError> {
+        if self.undo_len != 0 {
+            return Err(TurboExpressError::InvalidParameters(
+                "cannot stage_batch while a previous staged batch is still uncommitted",
+            ));
+        }
         if height != self.height + 1 || !ct_eq_16(prev_tag, &self.tip_tag) {
             return Err(TurboExpressError::ChainLinkMismatch {
                 expected_height: self.height + 1,
@@ -1411,25 +1418,65 @@ impl<T> SyncSlot<T> {
 unsafe impl<T: Send> Sync for SyncSlot<T> {}
 
 /// Low-latency adaptive spin-yield-sleep wait for a generation counter reaching `target`.
+/// Returns `false` immediately if the cluster `poisoned` sentinel is set (worker panic),
+/// preventing deadlocks across coordinator and sibling worker threads.
 #[inline(always)]
-fn wait_gen_eq(atom: &AtomicU64, target: u64) {
+fn wait_gen_eq(atom: &AtomicU64, target: u64, poisoned: &AtomicBool) -> bool {
     // Fast spin path: covers intra-round peer barriers and back-to-back blocks in < 500 ns.
     for _ in 0..8192u32 {
         if atom.load(Ordering::Acquire) == target {
-            return;
+            return true;
+        }
+        if poisoned.load(Ordering::Acquire) {
+            return false;
         }
         std::hint::spin_loop();
     }
     // Medium yield path: polite to OS scheduler under contention.
     for _ in 0..64u32 {
         if atom.load(Ordering::Acquire) == target {
-            return;
+            return true;
+        }
+        if poisoned.load(Ordering::Acquire) {
+            return false;
         }
         thread::yield_now();
     }
     // Idle sleep path: prevents idle clusters from burning CPU between bursts.
     while atom.load(Ordering::Acquire) != target {
+        if poisoned.load(Ordering::Acquire) {
+            return false;
+        }
         thread::sleep(Duration::from_micros(25));
+    }
+    true
+}
+
+/// Panic sentinel guard: if a persistent validator thread unwinds before clean `Shutdown`,
+/// marks `ClusterShared::poisoned = true` so no peer or coordinator can deadlock or race on `Drop`.
+struct WorkerPanicGuard {
+    shared: Arc<ClusterShared>,
+    armed: bool,
+}
+
+impl WorkerPanicGuard {
+    fn new(shared: Arc<ClusterShared>) -> Self {
+        Self {
+            shared,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WorkerPanicGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.poisoned.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1482,6 +1529,8 @@ struct ClusterShared {
 
     /// Per-validator end-of-command completion generation (`Release`).
     worker_done: [AlignedAtomicU64; TURBO_NUM_VALIDATORS],
+    /// Worker panic sentinel checked by `wait_gen_eq` and `Drop` to prevent deadlocks or UB.
+    poisoned: AtomicBool,
 }
 
 impl ClusterShared {
@@ -1500,6 +1549,7 @@ impl ClusterShared {
             worker_voters: std::array::from_fn(|_| SyncSlot::new([false; TURBO_NUM_VALIDATORS])),
             worker_snapshot: std::array::from_fn(|_| SyncSlot::new(None)),
             worker_done: std::array::from_fn(|_| AlignedAtomicU64::new(0)),
+            poisoned: AtomicBool::new(false),
         }
     }
 }
@@ -1516,11 +1566,15 @@ struct PersistentValidator {
 impl PersistentValidator {
     /// Main event loop for persistent validator thread `self.id`.
     fn run_loop(mut self, shared: Arc<ClusterShared>) {
+        let mut panic_guard = WorkerPanicGuard::new(Arc::clone(&shared));
         let me = self.id as usize;
         let mut next_gen = 1u64;
 
         loop {
-            wait_gen_eq(&shared.cmd_gen.0, next_gen);
+            if !wait_gen_eq(&shared.cmd_gen.0, next_gen, &shared.poisoned) {
+                panic_guard.disarm();
+                return;
+            }
 
             // SAFETY: Coordinator wrote `shared.cmd` before `cmd_gen.store(next_gen, Release)`
             // and will not mutate `shared.cmd` until all 4 `worker_done` reach `next_gen`.
@@ -1529,6 +1583,7 @@ impl PersistentValidator {
                 ClusterCommand::Idle => {}
                 ClusterCommand::Shutdown => {
                     shared.worker_done[me].0.store(next_gen, Ordering::Release);
+                    panic_guard.disarm();
                     return;
                 }
                 ClusterCommand::Snapshot => {
@@ -1625,7 +1680,12 @@ impl PersistentValidator {
                     }
 
                     // Wait for leader's published PrePrepare block tag.
-                    wait_gen_eq(&shared.leader_tag_gen.0, gen_id);
+                    if !wait_gen_eq(&shared.leader_tag_gen.0, gen_id, &shared.poisoned) {
+                        if staged {
+                            self.ledger.abort_staged();
+                        }
+                        return;
+                    }
                     if shared.leader_tag_ok.0.load(Ordering::Relaxed) == 0 {
                         if staged {
                             self.ledger.abort_staged();
@@ -1647,7 +1707,9 @@ impl PersistentValidator {
                     }
                 }
                 None => {
-                    wait_gen_eq(&shared.leader_tag_gen.0, gen_id);
+                    if !wait_gen_eq(&shared.leader_tag_gen.0, gen_id, &shared.poisoned) {
+                        return;
+                    }
                     local_err = Some(TurboExpressError::MissingBlockSealKey { height });
                 }
             }
@@ -1693,8 +1755,11 @@ impl PersistentValidator {
         // Phase 2: Authenticate Inbound Prepare Votes -> Quorum (>= 3) -> Commit Votes
         // --------------------------------------------------------------------
         for sender in 0..TURBO_NUM_VALIDATORS {
-            if sender != me {
-                wait_gen_eq(&shared.prepare_ready[sender].0, gen_id);
+            if sender != me && !wait_gen_eq(&shared.prepare_ready[sender].0, gen_id, &shared.poisoned) {
+                if staged {
+                    self.ledger.abort_staged();
+                }
+                return;
             }
         }
 
@@ -1709,37 +1774,24 @@ impl PersistentValidator {
                 // SAFETY: `sender` released `prepare_ready[sender] == gen_id` after writing its row.
                 let frame_opt = unsafe { (*shared.prepare_mailboxes[sender].0.get())[me] };
                 if let Some(frame) = frame_opt {
-                    match self.inbound[sender].as_mut() {
-                        Some(deck) => match deck.open_vote(&frame, sender as u32, self.id) {
-                            Ok(pt) => {
-                                if decode_and_check_vote(
-                                    &pt,
-                                    TurboVoteKind::Prepare,
-                                    sender as u32,
-                                    height,
-                                    view,
-                                    &proposed_tag,
-                                ) {
-                                    prepare_votes += 1;
-                                }
-                            }
-                            Err(err) => {
-                                local_err = Some(err);
-                                break;
-                            }
-                        },
-                        None => {
-                            local_err = Some(TurboExpressError::OtpDeckExhausted);
-                            break;
-                        }
+                    // Tolerate up to f = 1 Byzantine bad vote frame; count only valid peer votes.
+                    if let Some(deck) = self.inbound[sender].as_mut()
+                        && let Ok(pt) = deck.open_vote(&frame, sender as u32, self.id)
+                        && decode_and_check_vote(
+                            &pt,
+                            TurboVoteKind::Prepare,
+                            sender as u32,
+                            height,
+                            view,
+                            &proposed_tag,
+                        )
+                    {
+                        prepare_votes += 1;
                     }
                 }
             }
 
-            if local_err.is_some() {
-                self.ledger.abort_staged();
-                staged = false;
-            } else if prepare_votes < TURBO_QUORUM {
+            if prepare_votes < TURBO_QUORUM {
                 self.ledger.abort_staged();
                 staged = false;
                 local_err = Some(TurboExpressError::QuorumNotReached {
@@ -1789,8 +1841,11 @@ impl PersistentValidator {
         // Phase 3: Authenticate Inbound Commit Votes -> Quorum (>= 3) -> O(1) Commit / Rollback
         // --------------------------------------------------------------------
         for sender in 0..TURBO_NUM_VALIDATORS {
-            if sender != me {
-                wait_gen_eq(&shared.commit_ready[sender].0, gen_id);
+            if sender != me && !wait_gen_eq(&shared.commit_ready[sender].0, gen_id, &shared.poisoned) {
+                if staged {
+                    self.ledger.abort_staged();
+                }
+                return;
             }
         }
 
@@ -1806,46 +1861,34 @@ impl PersistentValidator {
                 // SAFETY: `sender` released `commit_ready[sender] == gen_id` after writing its row.
                 let frame_opt = unsafe { (*shared.commit_mailboxes[sender].0.get())[me] };
                 if let Some(frame) = frame_opt {
-                    match self.inbound[sender].as_mut() {
-                        Some(deck) => match deck.open_vote(&frame, sender as u32, self.id) {
-                            Ok(pt) => {
-                                if decode_and_check_vote(
-                                    &pt,
-                                    TurboVoteKind::Commit,
-                                    sender as u32,
-                                    height,
-                                    view,
-                                    &proposed_tag,
-                                ) {
-                                    voters[sender] = true;
-                                    commit_votes += 1;
-                                }
-                            }
-                            Err(err) => {
-                                local_err = Some(err);
-                                break;
-                            }
-                        },
-                        None => {
-                            local_err = Some(TurboExpressError::OtpDeckExhausted);
-                            break;
-                        }
+                    // Tolerate up to f = 1 Byzantine bad Commit frame; commit if >= 3 honest votes.
+                    if let Some(deck) = self.inbound[sender].as_mut()
+                        && let Ok(pt) = deck.open_vote(&frame, sender as u32, self.id)
+                        && decode_and_check_vote(
+                            &pt,
+                            TurboVoteKind::Commit,
+                            sender as u32,
+                            height,
+                            view,
+                            &proposed_tag,
+                        )
+                    {
+                        voters[sender] = true;
+                        commit_votes += 1;
                     }
                 }
             }
 
-            if local_err.is_none() && commit_votes >= TURBO_QUORUM {
+            if commit_votes >= TURBO_QUORUM {
                 self.ledger.commit_staged(height, proposed_tag);
             } else {
                 self.ledger.abort_staged();
                 voters = [false; TURBO_NUM_VALIDATORS];
-                if local_err.is_none() {
-                    local_err = Some(TurboExpressError::QuorumNotReached {
-                        phase: "Commit",
-                        votes: commit_votes,
-                        quorum: TURBO_QUORUM,
-                    });
-                }
+                local_err = Some(TurboExpressError::QuorumNotReached {
+                    phase: "Commit",
+                    votes: commit_votes,
+                    quorum: TURBO_QUORUM,
+                });
             }
         }
 
@@ -1962,8 +2005,12 @@ impl TurboExpressCluster {
     }
 
     /// Dispatch a command to all 4 persistent validator threads and wait for all 4 to finish.
+    /// Returns `Err(ClusterShutdown)` immediately if any worker thread has panicked/poisoned.
     #[inline]
-    fn dispatch_and_wait(&mut self, cmd: ClusterCommand) -> u64 {
+    fn dispatch_and_wait(&mut self, cmd: ClusterCommand) -> Result<u64, TurboExpressError> {
+        if self.shared.poisoned.load(Ordering::Acquire) {
+            return Err(TurboExpressError::ClusterShutdown);
+        }
         let gen_id = self.next_gen;
         self.next_gen += 1;
 
@@ -1975,7 +2022,9 @@ impl TurboExpressCluster {
         self.shared.cmd_gen.0.store(gen_id, Ordering::Release);
 
         for i in 0..TURBO_NUM_VALIDATORS {
-            wait_gen_eq(&self.shared.worker_done[i].0, gen_id);
+            if !wait_gen_eq(&self.shared.worker_done[i].0, gen_id, &self.shared.poisoned) {
+                return Err(TurboExpressError::ClusterShutdown);
+            }
         }
 
         // Release any `Arc<[TurboTx]>` held inside `shared.cmd` immediately once quiescent.
@@ -1985,7 +2034,7 @@ impl TurboExpressCluster {
             *self.shared.cmd.0.get() = ClusterCommand::Idle;
         }
 
-        gen_id
+        Ok(gen_id)
     }
 
     /// Execute a full 2-phase BFT round (`PrePrepare -> Prepare -> Commit`) across all 4
@@ -2040,7 +2089,7 @@ impl TurboExpressCluster {
             prev_tag,
             batch,
             forced_block_tag,
-        }));
+        }))?;
 
         // Collect per-validator outcomes (all 4 workers are now quiescent).
         let mut commit_voters = [false; TURBO_NUM_VALIDATORS];
@@ -2103,7 +2152,8 @@ impl TurboExpressCluster {
 
     /// Capture consistent read-only snapshots of all 4 isolated validator ledgers.
     pub fn all_validator_snapshots(&mut self) -> [TurboValidatorSnapshot; TURBO_NUM_VALIDATORS] {
-        self.dispatch_and_wait(ClusterCommand::Snapshot);
+        self.dispatch_and_wait(ClusterCommand::Snapshot)
+            .expect("cluster poisoned while taking snapshots");
         std::array::from_fn(|vid| {
             // SAFETY: All 4 workers wrote `worker_snapshot[vid]` before `worker_done[vid]` Release.
             unsafe {
@@ -2139,14 +2189,34 @@ impl Drop for TurboExpressCluster {
         if self.handles.is_empty() {
             return;
         }
-        let gen_id = self.next_gen;
-        self.next_gen += 1;
 
-        // SAFETY: All workers are idle waiting on `cmd_gen == gen_id`.
-        unsafe {
-            *self.shared.cmd.0.get() = ClusterCommand::Shutdown;
+        // Wait for quiescence on `self.next_gen - 1` before touching `UnsafeCell` `shared.cmd`.
+        // If any worker panicked (`poisoned == true`), NEVER mutate `shared.cmd` — signal
+        // `poisoned` so all remaining workers exit their `wait_gen_eq` loops safely!
+        let prev_gen = self.next_gen - 1;
+        let mut all_quiescent = !self.shared.poisoned.load(Ordering::Acquire);
+        if all_quiescent {
+            for i in 0..TURBO_NUM_VALIDATORS {
+                if !wait_gen_eq(&self.shared.worker_done[i].0, prev_gen, &self.shared.poisoned) {
+                    all_quiescent = false;
+                    break;
+                }
+            }
         }
-        self.shared.cmd_gen.0.store(gen_id, Ordering::Release);
+
+        if all_quiescent && !self.shared.poisoned.load(Ordering::Acquire) {
+            let gen_id = self.next_gen;
+            self.next_gen += 1;
+
+            // SAFETY: All 4 workers are verified quiescent at `prev_gen`, waiting on `cmd_gen == gen_id`.
+            unsafe {
+                *self.shared.cmd.0.get() = ClusterCommand::Shutdown;
+            }
+            self.shared.cmd_gen.0.store(gen_id, Ordering::Release);
+        } else {
+            // Poisoned fallback: wake any waiting workers via `poisoned = true` without touching `cmd`.
+            self.shared.poisoned.store(true, Ordering::SeqCst);
+        }
 
         for handle in self.handles.drain(..) {
             let _ = handle.join();
@@ -2550,5 +2620,48 @@ mod tests {
         assert!(bench.express_tps > 1_000_000.0);
         assert!(bench.elapsed_secs > 0.0);
         assert!(bench.ms_per_block > 0.0);
+    }
+
+    #[test]
+    fn test_stage_batch_rejects_uncommitted_and_reconstruct_validates_prefilled_bounds() {
+        let mut ledger = TurboLedger::new(vec![1_000u64; 8]);
+        let tx1 = [TurboTx::new(0, 1, 100, 1)];
+        ledger.stage_batch(1, &TURBO_GENESIS_TAG, &tx1).unwrap();
+        // M-5: Second stage_batch before commit/abort MUST fail without corrupting undo_log.
+        let err = ledger
+            .stage_batch(1, &TURBO_GENESIS_TAG, &tx1)
+            .unwrap_err();
+        assert!(matches!(err, TurboExpressError::InvalidParameters(_)));
+        ledger.abort_staged();
+        assert_eq!(ledger.balance_of(0), 1_000);
+        assert_eq!(ledger.balance_of(1), 1_000);
+
+        // M-5: Out-of-bounds and duplicate prefilled_txs indices must be rejected cleanly.
+        let mp = HashMap::new();
+        let mut out = Vec::new();
+        let oob_compact = TurboCompactBatch {
+            height: 1,
+            view: 0,
+            leader_id: 0,
+            prev_tag: TURBO_GENESIS_TAG,
+            block_tag: [0u8; 16],
+            short_ids: vec![],
+            prefilled_txs: vec![(99, TurboTx::new(0, 1, 10, 1))],
+        };
+        assert!(reconstruct_batch(&mp, &oob_compact, &mut out).is_err());
+
+        let dup_compact = TurboCompactBatch {
+            height: 1,
+            view: 0,
+            leader_id: 0,
+            prev_tag: TURBO_GENESIS_TAG,
+            block_tag: [0u8; 16],
+            short_ids: vec![],
+            prefilled_txs: vec![
+                (0, TurboTx::new(0, 1, 10, 1)),
+                (0, TurboTx::new(0, 1, 20, 2)),
+            ],
+        };
+        assert!(reconstruct_batch(&mp, &dup_compact, &mut out).is_err());
     }
 }

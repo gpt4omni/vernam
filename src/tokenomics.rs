@@ -476,9 +476,17 @@ pub struct EpochSettlement {
 /// One-time information-theoretic authentication key over F_(2^127 - 1) for audit receipts.
 ///
 /// Key material is volatile-zeroized on drop via `crate::field::zeroize_u128`.
+/// Every signing and verification method consumes `self` so a one-time Carter-Wegman key
+/// cannot accidentally be reused across two distinct messages.
 pub struct OneTimeAuditKey {
     r: u128,
     s: u128,
+}
+
+impl fmt::Debug for OneTimeAuditKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OneTimeAuditKey([REDACTED])")
+    }
 }
 
 impl OneTimeAuditKey {
@@ -498,31 +506,39 @@ impl OneTimeAuditKey {
         }
     }
 
-    /// Compute a Carter-Wegman polynomial MAC over an `EpochSettlement` summary:
-    /// `tag = (sum_i m_i * r^(i+1) + s) mod (2^127 - 1)`.
-    pub fn tag_settlement(&self, settlement: &EpochSettlement) -> AuditTag {
-        let words: [u64; 9] = [
-            settlement.epoch,
-            settlement.subsidy_minted,
-            settlement.fee_rewards_distributed,
-            settlement.fees_burned_in_epoch,
-            settlement.total_distributed,
-            settlement.dust_rolled_over,
-            settlement.circulating_supply,
-            settlement.total_burned,
-            settlement.payouts.len() as u64,
-        ];
-        self.mac_u64_slice(&words)
+    /// Create a paired one-time verifier copy (analogous to `PadPage::duplicate_for_peer`)
+    /// so signer and verifier can each consume their own single-use `OneTimeAuditKey`.
+    pub fn duplicate_for_verifier(&self) -> Self {
+        Self {
+            r: self.r,
+            s: self.s,
+        }
     }
 
-    /// Verify an `EpochSettlement` audit tag in constant time via `ct_eq_16`.
-    pub fn verify_settlement(&self, settlement: &EpochSettlement, tag: &AuditTag) -> bool {
-        let expected = self.tag_settlement(settlement);
-        ct_eq_16(&expected, tag)
+    fn settlement_words(settlement: &EpochSettlement) -> Vec<u64> {
+        let mut words = Vec::with_capacity(11 + settlement.payouts.len() * 4);
+        // Domain tag = 1 for EpochSettlement.
+        words.push(1);
+        words.push(settlement.epoch);
+        words.push(settlement.subsidy_minted);
+        words.push(settlement.fee_rewards_distributed);
+        words.push(settlement.fees_burned_in_epoch);
+        words.push(settlement.total_distributed);
+        words.push(settlement.dust_rolled_over);
+        words.push(settlement.circulating_supply);
+        words.push(settlement.total_burned);
+        words.push(settlement.total_minted);
+        words.push(settlement.payouts.len() as u64);
+        for p in &settlement.payouts {
+            words.push(p.validator_id);
+            words.push(p.equal_participation_reward);
+            words.push(p.entropy_availability_reward);
+            words.push(p.total_reward);
+        }
+        words
     }
 
-    /// Compute a Carter-Wegman polynomial MAC over a `SlashingReceipt`.
-    pub fn tag_slashing(&self, receipt: &SlashingReceipt) -> AuditTag {
+    fn slashing_words(receipt: &SlashingReceipt) -> [u64; 8] {
         let offense_code = match receipt.offense {
             SlashingOffense::Equivocation => 1,
             SlashingOffense::InconsistentMpcShare => 2,
@@ -534,20 +550,44 @@ impl OneTimeAuditKey {
             ValidatorStatus::Jailed => 3,
             ValidatorStatus::Ejected => 4,
         };
-        let words: [u64; 6] = [
+        [
+            // Domain tag = 2 for SlashingReceipt.
+            2,
             receipt.validator_id,
             offense_code,
             receipt.epoch,
             receipt.slashed_amount,
             receipt.remaining_bond,
             status_code,
-        ];
+            receipt.epoch_rewards_forfeited as u64,
+        ]
+    }
+
+    /// Compute a one-time Carter-Wegman polynomial MAC over EVERY field of an `EpochSettlement`
+    /// (including `total_minted` and all `payouts` entries), consuming `self` so the key is zeroized.
+    pub fn tag_settlement(self, settlement: &EpochSettlement) -> AuditTag {
+        let words = Self::settlement_words(settlement);
         self.mac_u64_slice(&words)
     }
 
-    /// Verify a `SlashingReceipt` audit tag in constant time via `ct_eq_16`.
-    pub fn verify_slashing(&self, receipt: &SlashingReceipt, tag: &AuditTag) -> bool {
-        let expected = self.tag_slashing(receipt);
+    /// Verify an `EpochSettlement` audit tag in constant time via `ct_eq_16`, consuming `self`.
+    pub fn verify_settlement(self, settlement: &EpochSettlement, tag: &AuditTag) -> bool {
+        let words = Self::settlement_words(settlement);
+        let expected = self.mac_u64_slice(&words);
+        ct_eq_16(&expected, tag)
+    }
+
+    /// Compute a one-time Carter-Wegman polynomial MAC over EVERY field of a `SlashingReceipt`
+    /// (including `epoch_rewards_forfeited`), consuming `self` so the key is zeroized.
+    pub fn tag_slashing(self, receipt: &SlashingReceipt) -> AuditTag {
+        let words = Self::slashing_words(receipt);
+        self.mac_u64_slice(&words)
+    }
+
+    /// Verify a `SlashingReceipt` audit tag in constant time via `ct_eq_16`, consuming `self`.
+    pub fn verify_slashing(self, receipt: &SlashingReceipt, tag: &AuditTag) -> bool {
+        let words = Self::slashing_words(receipt);
+        let expected = self.mac_u64_slice(&words);
         ct_eq_16(&expected, tag)
     }
 
@@ -772,14 +812,22 @@ impl TokenomicsEngine {
         self.total_burned += breakdown.burn_share;
         self.circulating_supply -= breakdown.burn_share;
 
-        self.fees_burned_in_current_epoch += breakdown.burn_share;
-        self.total_fees_collected += breakdown.total_fee;
-        self.total_fees_burned += breakdown.burn_share;
-        self.total_fees_rewarded += breakdown.validator_reward_share;
+        self.fees_burned_in_current_epoch = self
+            .fees_burned_in_current_epoch
+            .saturating_add(breakdown.burn_share);
+        self.total_fees_collected = self
+            .total_fees_collected
+            .saturating_add(breakdown.total_fee);
+        self.total_fees_burned = self
+            .total_fees_burned
+            .saturating_add(breakdown.burn_share);
+        self.total_fees_rewarded = self
+            .total_fees_rewarded
+            .saturating_add(breakdown.validator_reward_share);
 
         match lane {
-            FeeLane::Express => self.express_tx_count += 1,
-            FeeLane::Shielded => self.shielded_tx_count += 1,
+            FeeLane::Express => self.express_tx_count = self.express_tx_count.saturating_add(1),
+            FeeLane::Shielded => self.shielded_tx_count = self.shielded_tx_count.saturating_add(1),
         }
 
         Ok(breakdown)
@@ -821,8 +869,8 @@ impl TokenomicsEngine {
             ((vault.bond as u128 * offense.slash_bps() as u128) / BPS_DENOMINATOR as u128) as u64;
 
         vault.bond -= slash_amount;
-        vault.slashing_events += 1;
-        vault.total_slashed += slash_amount;
+        vault.slashing_events = vault.slashing_events.saturating_add(1);
+        vault.total_slashed = vault.total_slashed.saturating_add(slash_amount);
         vault.forfeited_current_epoch = true;
 
         vault.status = match offense {
@@ -835,8 +883,8 @@ impl TokenomicsEngine {
         let new_status = vault.status;
 
         self.total_bonded -= slash_amount;
-        self.total_burned += slash_amount;
-        self.total_slashed_burned += slash_amount;
+        self.total_burned = self.total_burned.saturating_add(slash_amount);
+        self.total_slashed_burned = self.total_slashed_burned.saturating_add(slash_amount);
         self.circulating_supply -= slash_amount;
 
         Ok(SlashingReceipt {
@@ -1373,21 +1421,42 @@ mod tests {
             )
             .unwrap();
 
-        let mut settlement = engine.settle_epoch();
+        let settlement = engine.settle_epoch();
         let key = OneTimeAuditKey::generate();
+        let vkey_ok = key.duplicate_for_verifier();
+        let vkey_burned = key.duplicate_for_verifier();
+        let vkey_minted = key.duplicate_for_verifier();
+        let vkey_payout = key.duplicate_for_verifier();
         let tag = key.tag_settlement(&settlement);
-        assert!(key.verify_settlement(&settlement, &tag));
+        assert!(vkey_ok.verify_settlement(&settlement, &tag));
 
-        // Tampering with burned or minted totals invalidates the Carter-Wegman MAC.
-        settlement.total_burned += 1;
-        assert!(!key.verify_settlement(&settlement, &tag));
+        // Tampering with total_burned invalidates the Carter-Wegman MAC.
+        let mut bad_burned = settlement.clone();
+        bad_burned.total_burned += 1;
+        assert!(!vkey_burned.verify_settlement(&bad_burned, &tag));
 
-        // Slashing receipt IT-MAC verification.
+        // Tampering with total_minted invalidates the Carter-Wegman MAC.
+        let mut bad_minted = settlement.clone();
+        bad_minted.total_minted += 1;
+        assert!(!vkey_minted.verify_settlement(&bad_minted, &tag));
+
+        // Tampering with any payout entry invalidates the Carter-Wegman MAC.
+        let mut bad_payout = settlement.clone();
+        bad_payout.payouts[0].total_reward += 1;
+        assert!(!vkey_payout.verify_settlement(&bad_payout, &tag));
+
+        // Slashing receipt IT-MAC verification (including epoch_rewards_forfeited).
         let receipt = engine
             .slash_validator(1, SlashingOffense::ExtendedDowntime)
             .unwrap();
         let key2 = OneTimeAuditKey::generate();
+        let vkey2_ok = key2.duplicate_for_verifier();
+        let vkey2_forfeit = key2.duplicate_for_verifier();
         let slash_tag = key2.tag_slashing(&receipt);
-        assert!(key2.verify_slashing(&receipt, &slash_tag));
+        assert!(vkey2_ok.verify_slashing(&receipt, &slash_tag));
+
+        let mut bad_receipt = receipt.clone();
+        bad_receipt.epoch_rewards_forfeited = false;
+        assert!(!vkey2_forfeit.verify_slashing(&bad_receipt, &slash_tag));
     }
 }

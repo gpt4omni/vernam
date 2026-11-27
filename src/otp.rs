@@ -379,7 +379,10 @@ pub fn seal_frame(
     payload: &[u8],
 ) -> Result<([u8; FRAME_BYTES], [u8; MAC_TAG_BYTES]), OtpError> {
     let mut frame = pack_frame(payload)?;
-    otp_xor_in_place(&mut frame, page.enc_key())?;
+    if let Err(err) = otp_xor_in_place(&mut frame, page.enc_key()) {
+        zeroize_slice(&mut frame);
+        return Err(err);
+    }
 
     let mut mac_input = [0u8; 8 + FRAME_BYTES];
     mac_input[..8].copy_from_slice(&page.page_id.to_be_bytes());
@@ -710,6 +713,9 @@ impl WalPadBook {
         wal_file.write_all(WAL_MAGIC)?;
         wal_file.sync_all()?;
 
+        // Persist directory entries for newly created pad & WAL files on Unix.
+        sync_parent_dir(&data_path)?;
+
         let mut book = Self {
             data_path,
             wal_path,
@@ -847,13 +853,21 @@ impl WalPadBook {
         }
         zeroize_slice(&mut rec_buf);
 
-        // Open (or create if absent) and replay the WAL.
+        // Open and replay the WAL. If data file already has slots (`total_slots > 0`), a missing
+        // or empty WAL could mask previously burned pages (catastrophic two-time-pad risk) and
+        // MUST fail closed with `CorruptStorage`.
         let mut wal_file = if wal_path.exists() {
             open_secret_file(&wal_path, false)?
+        } else if total_slots > 0 {
+            return Err(OtpError::CorruptStorage(
+                "companion WAL file missing for non-empty pad book (refusing to risk pad reuse)"
+                    .into(),
+            ));
         } else {
             let mut f = open_secret_file(&wal_path, true)?;
             f.write_all(WAL_MAGIC)?;
             f.sync_all()?;
+            sync_parent_dir(&wal_path)?;
             f
         };
 
@@ -861,6 +875,11 @@ impl WalPadBook {
         let mut wal_burned = BTreeSet::new();
 
         if wal_len == 0 {
+            if total_slots > 0 {
+                return Err(OtpError::CorruptStorage(
+                    "companion WAL file is empty for non-empty pad book".into(),
+                ));
+            }
             wal_file.write_all(WAL_MAGIC)?;
             wal_file.sync_all()?;
         } else {
@@ -889,9 +908,13 @@ impl WalPadBook {
                 if op == WAL_OP_BURN && pid_inv == !pid {
                     wal_burned.insert(pid);
                     valid_wal_end = WAL_HEADER_LEN + (i + 1) * WAL_RECORD_LEN as u64;
-                } else {
-                    // Torn WAL record at tail: stop replay and truncate tail.
+                } else if i + 1 == num_wal_recs {
+                    // Only tolerate a torn tail at the very last WAL record.
                     break;
+                } else {
+                    return Err(OtpError::CorruptStorage(format!(
+                        "corrupt mid-WAL record at index {i} of {num_wal_recs}"
+                    )));
                 }
             }
 
@@ -959,9 +982,8 @@ impl WalPadBook {
         Ok(rec_off)
     }
 
-    /// Persist WAL burn record (`fsync`), then overwrite on-disk page key bytes with zeros (`fsync`).
-    fn persist_burn_and_wipe(&mut self, page_id: u64, slot_idx: u64) -> Result<(), OtpError> {
-        // Step 1: Append BURN record to WAL and fsync BEFORE touching data file or returning page.
+    /// Step 1: Append BURN record to WAL and `fsync` BEFORE touching data file or returning page.
+    fn append_wal_burn(&mut self, page_id: u64) -> Result<(), OtpError> {
         let mut wal_rec = [0u8; WAL_RECORD_LEN];
         wal_rec[0] = WAL_OP_BURN;
         wal_rec[1..9].copy_from_slice(&page_id.to_be_bytes());
@@ -969,15 +991,17 @@ impl WalPadBook {
         self.wal_file.seek(SeekFrom::End(0))?;
         self.wal_file.write_all(&wal_rec)?;
         self.wal_file.sync_all()?;
+        Ok(())
+    }
 
-        // Step 2: Overwrite state, mac_r, mac_s, and enc_key bytes on disk with zeros + fsync.
+    /// Step 2: Overwrite state, `mac_r`, `mac_s`, and `enc_key` bytes on disk with zeros + `fsync`.
+    fn wipe_disk_slot(&mut self, slot_idx: u64) -> Result<(), OtpError> {
         let record_size = Self::record_size_for(self.enc_key_bytes);
         let wipe_offset = Self::slot_wipe_offset(slot_idx, record_size)?;
         let zeros = vec![0u8; 1 + 16 + 16 + self.enc_key_bytes];
         self.data_file.seek(SeekFrom::Start(wipe_offset))?;
         self.data_file.write_all(&zeros)?;
         self.data_file.sync_all()?;
-
         Ok(())
     }
 
@@ -1034,16 +1058,24 @@ impl WalPadBook {
             return Err(OtpError::PageNotFound(page_id));
         };
 
-        // Durability FIRST: fsync WAL burn + fsync zeroed disk slot BEFORE returning page!
-        self.persist_burn_and_wipe(page_id, slot_idx)?;
+        // Step 1: Durability FIRST — fsync WAL burn record before releasing or modifying RAM.
+        self.append_wal_burn(page_id)?;
 
-        // Only now update in-memory state and hand the page to the caller.
+        // Immediately retire page from RAM (`pages`/`slot_map`) and mark `burned` even if Step 2
+        // disk wipe fails, guaranteeing zero reuse within the live process.
         self.slot_map.remove(&page_id);
         self.burned.insert(page_id);
         let page = self
             .pages
             .remove(&page_id)
             .expect("slot_map and pages must stay in sync");
+
+        // Step 2: Overwrite on-disk key bytes with zeros + fsync.
+        if let Err(err) = self.wipe_disk_slot(slot_idx) {
+            drop(page); // Volatile-zeroize in RAM.
+            return Err(err);
+        }
+
         Ok(page)
     }
 
@@ -1095,7 +1127,12 @@ impl WalPadBook {
             Ok(())
         })();
         zeroize_slice(&mut buf);
-        write_res?;
+        if let Err(err) = write_res {
+            let committed_len = PAD_HEADER_LEN + self.total_slots * record_size as u64;
+            let _ = self.data_file.set_len(committed_len);
+            let _ = self.data_file.sync_all();
+            return Err(err.into());
+        }
 
         for page in pages {
             let slot_idx = self.total_slots;
@@ -1168,6 +1205,22 @@ fn open_secret_file(path: &Path, create_truncate: bool) -> io::Result<File> {
     #[cfg(unix)]
     opts.mode(0o600);
     opts.open(path)
+}
+
+/// Fsync the parent directory of `path` on Unix so newly created file entries survive power loss.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let f = File::open(dir)?;
+    f.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1496,5 +1549,56 @@ mod tests {
             elapsed.as_secs() < 5,
             "10,000 OTP+MAC ops unexpectedly slow: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn test_wal_missing_empty_and_mid_corruption_rejected() {
+        let path = unique_temp_path("corrupt_wal");
+        cleanup_wal_files(&path);
+
+        let initial_pages = vec![
+            PadPage::generate(0, FRAME_BYTES),
+            PadPage::generate(1, FRAME_BYTES),
+        ];
+        {
+            let mut book = WalPadBook::create(&path, FRAME_BYTES, initial_pages).unwrap();
+            let _ = book.pop_page(0).unwrap();
+        }
+        let wal_path = WalPadBook::wal_path_for(&path);
+
+        // 1. Missing WAL for non-empty pad book MUST fail with CorruptStorage.
+        fs::remove_file(&wal_path).unwrap();
+        assert!(matches!(
+            WalPadBook::open(&path),
+            Err(OtpError::CorruptStorage(_))
+        ));
+
+        // 2. Empty WAL (0 bytes) for non-empty pad book MUST fail with CorruptStorage.
+        File::create(&wal_path).unwrap();
+        assert!(matches!(
+            WalPadBook::open(&path),
+            Err(OtpError::CorruptStorage(_))
+        ));
+
+        // 3. Mid-WAL corruption (corrupt record 0 followed by valid record 1) MUST fail!
+        {
+            let mut f = open_secret_file(&wal_path, true).unwrap();
+            f.write_all(WAL_MAGIC).unwrap();
+            // Record 0: corrupt op byte
+            f.write_all(&[0xFF; WAL_RECORD_LEN]).unwrap();
+            // Record 1: valid burn for page 1
+            let mut rec1 = [0u8; WAL_RECORD_LEN];
+            rec1[0] = WAL_OP_BURN;
+            rec1[1..9].copy_from_slice(&1u64.to_be_bytes());
+            rec1[9..17].copy_from_slice(&(!1u64).to_be_bytes());
+            f.write_all(&rec1).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(matches!(
+            WalPadBook::open(&path),
+            Err(OtpError::CorruptStorage(_))
+        ));
+
+        cleanup_wal_files(&path);
     }
 }

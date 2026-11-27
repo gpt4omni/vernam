@@ -975,6 +975,8 @@ pub struct ConsensusVote {
     pub block_tag: [u8; 16],
     pub prev_tag: [u8; 16],
     pub tx_count: u32,
+    /// For `MsgKind::ViewChange`: optional highest locked view (`block_tag` holds locked tag).
+    pub locked_view: Option<u64>,
 }
 
 impl ConsensusVote {
@@ -982,20 +984,25 @@ impl ConsensusVote {
     pub fn to_payload(&self) -> [u8; WIRE_PAYLOAD_LEN] {
         let mut buf = [0u8; WIRE_PAYLOAD_LEN];
         buf[0] = self.kind as u8;
-        // bytes 1..4 reserved zero
+        buf[1] = u8::from(self.locked_view.is_some());
+        // bytes 2..4 reserved zero
         buf[4..8].copy_from_slice(&self.voter_id.to_le_bytes());
         buf[8..16].copy_from_slice(&self.height.to_le_bytes());
         buf[16..24].copy_from_slice(&self.view.to_le_bytes());
         buf[24..40].copy_from_slice(&self.block_tag);
         buf[40..56].copy_from_slice(&self.prev_tag);
-        buf[56..60].copy_from_slice(&self.tx_count.to_le_bytes());
-        // bytes 60..64 reserved zero
+        if let Some(lv) = self.locked_view {
+            buf[56..64].copy_from_slice(&lv.to_le_bytes());
+        } else {
+            buf[56..60].copy_from_slice(&self.tx_count.to_le_bytes());
+        }
         buf
     }
 
     /// Zero-allocation deserialization from a fixed 64-byte wire payload.
     pub fn from_payload(buf: &[u8; WIRE_PAYLOAD_LEN]) -> Result<Self, BftError> {
         let kind = MsgKind::from_u8(buf[0])?;
+        let has_lock = buf[1] != 0;
         let voter_id = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         let height = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         let view = u64::from_le_bytes(buf[16..24].try_into().unwrap());
@@ -1003,7 +1010,12 @@ impl ConsensusVote {
         block_tag.copy_from_slice(&buf[24..40]);
         let mut prev_tag = [0u8; 16];
         prev_tag.copy_from_slice(&buf[40..56]);
-        let tx_count = u32::from_le_bytes(buf[56..60].try_into().unwrap());
+        let (tx_count, locked_view) = if has_lock {
+            let lv = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+            (0u32, Some(lv))
+        } else {
+            (u32::from_le_bytes(buf[56..60].try_into().unwrap()), None)
+        };
 
         Ok(Self {
             kind,
@@ -1013,6 +1025,7 @@ impl ConsensusVote {
             block_tag,
             prev_tag,
             tx_count,
+            locked_view,
         })
     }
 }
@@ -1035,16 +1048,20 @@ pub struct BlockCertificate {
 struct RoundState {
     proposed_block: Option<TxBatchBlock>,
     prepare_votes: BTreeMap<[u8; 16], BTreeSet<u32>>,
+    prepare_voter_tag: BTreeMap<u32, [u8; 16]>,
     commit_votes: BTreeMap<[u8; 16], BTreeSet<u32>>,
+    commit_voter_tag: BTreeMap<u32, [u8; 16]>,
     prepared_tag: Option<[u8; 16]>,
-    view_change_votes: BTreeMap<u64, BTreeSet<u32>>,
+    view_change_votes: BTreeMap<u64, BTreeMap<u32, Option<(u64, [u8; 16])>>>,
 }
 
 impl RoundState {
     fn clear(&mut self) {
         self.proposed_block = None;
         self.prepare_votes.clear();
+        self.prepare_voter_tag.clear();
         self.commit_votes.clear();
+        self.commit_voter_tag.clear();
         self.prepared_tag = None;
         self.view_change_votes.clear();
     }
@@ -1057,6 +1074,10 @@ pub struct BftValidator {
     pub config: BftConfig,
     pub online: bool,
     pub current_view: u64,
+    /// Highest view in which this validator achieved a `2f + 1` Prepare lock for `next_height()`.
+    pub locked_view: Option<u64>,
+    /// Block integrity tag locked at `locked_view` (preserved safely across `ViewChange`s).
+    pub locked_block_tag: Option<[u8; 16]>,
     pub ledger: LedgerState,
     pub committed_blocks: BTreeMap<u64, TxBatchBlock>,
     pub certificates: BTreeMap<u64, BlockCertificate>,
@@ -1156,6 +1177,25 @@ impl BftValidator {
             });
         }
 
+        if txs.len() > self.config.max_batch_txs {
+            return Err(BftError::BatchTooLarge {
+                count: txs.len(),
+                max: self.config.max_batch_txs,
+            });
+        }
+
+        // Validate batch BEFORE consuming the single-use block sealing key.
+        let precheck_block = TxBatchBlock {
+            height,
+            view,
+            leader_id: self.id,
+            prev_tag: self.ledger.tip_tag,
+            txs,
+            block_tag: GENESIS_TAG,
+        };
+        self.ledger.validate_batch_readonly(&precheck_block)?;
+        let TxBatchBlock { txs, .. } = precheck_block;
+
         let seal_key = self.seal_deck.take_key(height, view)?;
         let block = TxBatchBlock::seal_with_limit(
             height,
@@ -1166,7 +1206,6 @@ impl BftValidator {
             seal_key,
             self.config.max_batch_txs,
         )?;
-        self.ledger.validate_batch_readonly(&block)?;
 
         self.round.clear();
         self.round.proposed_block = Some(block.clone());
@@ -1175,6 +1214,7 @@ impl BftValidator {
             .entry(block.block_tag)
             .or_default()
             .insert(self.id);
+        self.round.prepare_voter_tag.insert(self.id, block.block_tag);
 
         let pre_prepare_vote = ConsensusVote {
             kind: MsgKind::PrePrepare,
@@ -1184,6 +1224,7 @@ impl BftValidator {
             block_tag: block.block_tag,
             prev_tag: block.prev_tag,
             tx_count: block.txs.len() as u32,
+            locked_view: None,
         };
         let prepare_vote = ConsensusVote {
             kind: MsgKind::Prepare,
@@ -1240,6 +1281,8 @@ impl BftValidator {
             if !ct_eq_16(&existing.block_tag, &block.block_tag) {
                 return Err(BftError::ConflictingPrePrepare { height, view });
             }
+            // Idempotent duplicate matching PrePrepare: already verified & voted in this round.
+            return Ok(Vec::new());
         }
 
         let seal_key = self.seal_deck.take_key(height, view)?;
@@ -1261,6 +1304,7 @@ impl BftValidator {
             .entry(block_tag)
             .or_default()
             .insert(self.id);
+        self.round.prepare_voter_tag.insert(self.id, block_tag);
 
         let prepare_vote = ConsensusVote {
             kind: MsgKind::Prepare,
@@ -1270,12 +1314,14 @@ impl BftValidator {
             block_tag,
             prev_tag,
             tx_count,
+            locked_view: None,
         };
         self.broadcast_vote(online_peers, &prepare_vote)
     }
 
     /// **Phase 1 (Prepare):** Ingest an inbound OTP+CW authenticated `Prepare` frame.
-    /// Enforces flat 1-validator = 1-equal-vote deduplication.
+    /// Enforces flat 1-validator = 1-equal-vote deduplication and rejects equivocating votes
+    /// for two different `block_tag`s in the same `(height, view, Prepare)`.
     pub fn on_prepare_frame(&mut self, frame: &WireFrame) -> Result<(), BftError> {
         if !self.online {
             return Err(BftError::ValidatorOffline(self.id));
@@ -1289,6 +1335,17 @@ impl BftValidator {
             return Err(BftError::InvalidEncoding("mismatched Prepare vote"));
         }
 
+        if let Some(prev_tag) = self.round.prepare_voter_tag.get(&vote.voter_id) {
+            if !ct_eq_16(prev_tag, &vote.block_tag) {
+                return Err(BftError::InvalidEncoding(
+                    "equivocating Prepare vote for conflicting block_tag",
+                ));
+            }
+            return Ok(());
+        }
+        self.round
+            .prepare_voter_tag
+            .insert(vote.voter_id, vote.block_tag);
         self.round
             .prepare_votes
             .entry(vote.block_tag)
@@ -1336,11 +1393,15 @@ impl BftValidator {
         }
 
         self.round.prepared_tag = Some(tag);
+        // Lock on this prepared block so safety is preserved across any subsequent ViewChange.
+        self.locked_view = Some(view);
+        self.locked_block_tag = Some(tag);
         self.round
             .commit_votes
             .entry(tag)
             .or_default()
             .insert(self.id);
+        self.round.commit_voter_tag.insert(self.id, tag);
 
         let commit_vote = ConsensusVote {
             kind: MsgKind::Commit,
@@ -1350,11 +1411,13 @@ impl BftValidator {
             block_tag: tag,
             prev_tag,
             tx_count,
+            locked_view: None,
         };
         self.broadcast_vote(online_peers, &commit_vote)
     }
 
-    /// **Phase 2 (Commit):** Ingest an inbound OTP+CW authenticated `Commit` frame.
+    /// **Phase 2 (Commit):** Ingest an inbound OTP+CW authenticated `Commit` frame, rejecting
+    /// equivocating Commit votes for conflicting `block_tag`s in the same `(height, view)`.
     pub fn on_commit_frame(&mut self, frame: &WireFrame) -> Result<(), BftError> {
         if !self.online {
             return Err(BftError::ValidatorOffline(self.id));
@@ -1368,6 +1431,17 @@ impl BftValidator {
             return Err(BftError::InvalidEncoding("mismatched Commit vote"));
         }
 
+        if let Some(prev_tag) = self.round.commit_voter_tag.get(&vote.voter_id) {
+            if !ct_eq_16(prev_tag, &vote.block_tag) {
+                return Err(BftError::InvalidEncoding(
+                    "equivocating Commit vote for conflicting block_tag",
+                ));
+            }
+            return Ok(());
+        }
+        self.round
+            .commit_voter_tag
+            .insert(vote.voter_id, vote.block_tag);
         self.round
             .commit_votes
             .entry(vote.block_tag)
@@ -1438,12 +1512,15 @@ impl BftValidator {
         self.committed_blocks.insert(block.height, block);
         self.certificates.insert(cert.height, cert.clone());
         self.current_view = 0;
+        self.locked_view = None;
+        self.locked_block_tag = None;
         self.round.clear();
 
         Ok(cert)
     }
 
-    /// Broadcast an authenticated `ViewChange` vote for `target_view` to all `online_peers`.
+    /// Broadcast an authenticated `ViewChange` vote for `target_view` (`> self.current_view`)
+    /// carrying any locked `(locked_view, locked_block_tag)` to all `online_peers`.
     pub fn start_view_change(
         &mut self,
         target_view: u64,
@@ -1452,25 +1529,35 @@ impl BftValidator {
         if !self.online {
             return Err(BftError::ValidatorOffline(self.id));
         }
+        if target_view <= self.current_view {
+            return Err(BftError::InvalidEncoding(
+                "ViewChange target_view must be strictly greater than current_view",
+            ));
+        }
+        let my_lock = match (self.locked_view, self.locked_block_tag) {
+            (Some(lv), Some(lt)) => Some((lv, lt)),
+            _ => None,
+        };
         self.round
             .view_change_votes
             .entry(target_view)
             .or_default()
-            .insert(self.id);
+            .insert(self.id, my_lock);
 
         let vote = ConsensusVote {
             kind: MsgKind::ViewChange,
             voter_id: self.id,
             height: self.next_height(),
             view: target_view,
-            block_tag: GENESIS_TAG,
+            block_tag: my_lock.map(|(_, t)| t).unwrap_or(GENESIS_TAG),
             prev_tag: self.ledger.tip_tag,
             tx_count: 0,
+            locked_view: my_lock.map(|(v, _)| v),
         };
         self.broadcast_vote(online_peers, &vote)
     }
 
-    /// Ingest an inbound authenticated `ViewChange` vote frame.
+    /// Ingest an inbound authenticated `ViewChange` vote frame carrying optional locked state.
     pub fn on_view_change_frame(&mut self, frame: &WireFrame) -> Result<(), BftError> {
         if !self.online {
             return Err(BftError::ValidatorOffline(self.id));
@@ -1479,25 +1566,34 @@ impl BftValidator {
         if vote.kind != MsgKind::ViewChange
             || vote.voter_id != frame.from
             || vote.height != self.next_height()
+            || vote.view <= self.current_view
         {
             return Err(BftError::InvalidEncoding("mismatched ViewChange vote"));
         }
-        self.round
-            .view_change_votes
-            .entry(vote.view)
-            .or_default()
-            .insert(vote.voter_id);
+        let lock = vote.locked_view.map(|lv| (lv, vote.block_tag));
+        let entry = self.round.view_change_votes.entry(vote.view).or_default();
+        if let Some(existing) = entry.get(&vote.voter_id) {
+            if *existing != lock {
+                return Err(BftError::InvalidEncoding(
+                    "equivocating ViewChange lock for same target_view",
+                ));
+            }
+            return Ok(());
+        }
+        entry.insert(vote.voter_id, lock);
         Ok(())
     }
 
-    /// Advance to `target_view` if `>= 2f + 1` equal `ViewChange` votes have been verified.
+    /// Advance to `target_view` (`> self.current_view`) if `>= 2f + 1` equal `ViewChange` votes
+    /// have been verified, preserving the highest-view lock across the view transition.
     pub fn try_complete_view_change(&mut self, target_view: u64) -> Result<(), BftError> {
-        let count = self
-            .round
-            .view_change_votes
-            .get(&target_view)
-            .map(BTreeSet::len)
-            .unwrap_or(0);
+        if target_view <= self.current_view {
+            return Err(BftError::InvalidEncoding(
+                "ViewChange target_view must be strictly greater than current_view",
+            ));
+        }
+        let votes = self.round.view_change_votes.get(&target_view);
+        let count = votes.map(BTreeMap::len).unwrap_or(0);
         if count < self.config.quorum() {
             return Err(BftError::QuorumNotReached {
                 phase: "ViewChange",
@@ -1506,6 +1602,15 @@ impl BftValidator {
                 max_votes: count,
                 quorum: self.config.quorum(),
             });
+        }
+        // Preserve highest-view lock reported by the ViewChange quorum.
+        if let Some(map) = votes {
+            for lock in map.values().flatten() {
+                if self.locked_view.is_none_or(|cur| lock.0 >= cur) {
+                    self.locked_view = Some(lock.0);
+                    self.locked_block_tag = Some(lock.1);
+                }
+            }
         }
         self.current_view = target_view;
         self.round.clear();
@@ -1538,6 +1643,7 @@ impl BftValidator {
             block_tag: cert.block_tag,
             prev_tag: cert.prev_tag,
             tx_count: cert.tx_count,
+            locked_view: None,
         };
         let frame = self.send_vote_frame(target_id, &vote)?;
         Ok(Some(frame))
@@ -1569,6 +1675,8 @@ pub fn sync_validator_from_quorum(
     // Bring validator back online and clear any stale round state.
     validators[idx].online = true;
     validators[idx].current_view = 0;
+    validators[idx].locked_view = None;
+    validators[idx].locked_block_tag = None;
     validators[idx].round.clear();
 
     let max_peer_height = validators
@@ -1640,21 +1748,33 @@ pub fn sync_validator_from_quorum(
             });
         }
 
-        // Step 4: Retrieve the matching block from an attesting peer and verify its metadata
-        // plus its dedicated single-use Carter-Wegman seal using target's own unused seal key.
-        let candidate_block = attesting_peers.iter().find_map(|&peer_id| {
-            let b = validators[peer_id as usize].committed_blocks.get(&h)?;
+        // Step 4: Require at least `f + 1` matching candidate block bodies (identical height, view,
+        // leader, tags, AND full tx payload) from attesting peers BEFORE consuming target's
+        // single-use Carter-Wegman seal key, so a single Byzantine peer cannot burn it on a fake body!
+        let required_body_matches = config.max_faults() + 1;
+        let mut body_tallies: Vec<(TxBatchBlock, usize)> = Vec::new();
+        for &peer_id in &attesting_peers {
+            let Some(b) = validators[peer_id as usize].committed_blocks.get(&h) else {
+                continue;
+            };
             if b.height == h
                 && b.view == cert_view
                 && b.txs.len() as u32 == cert_tx_count
                 && ct_eq_16(&b.block_tag, &cert_tag)
                 && ct_eq_16(&b.prev_tag, &cert_prev)
             {
-                Some(b.clone())
-            } else {
-                None
+                if let Some((_, count)) = body_tallies.iter_mut().find(|(cand, _)| cand == b) {
+                    *count += 1;
+                } else {
+                    body_tallies.push((b.clone(), 1));
+                }
             }
-        });
+        }
+
+        let candidate_block = body_tallies
+            .into_iter()
+            .find(|(_, count)| *count >= required_body_matches)
+            .map(|(block, _)| block);
 
         let Some(block) = candidate_block else {
             return Err(BftError::SyncBlockUnavailable { height: h });
@@ -1737,6 +1857,8 @@ impl BftCluster {
                 config,
                 online: true,
                 current_view: 0,
+                locked_view: None,
+                locked_block_tag: None,
                 ledger: LedgerState::new(initial_balances.clone()),
                 committed_blocks: BTreeMap::new(),
                 certificates: BTreeMap::new(),
@@ -1774,10 +1896,14 @@ impl BftCluster {
     /// `target_view` once `>= 2f + 1` equal `ViewChange` wire frames are verified.
     pub fn execute_view_change(&mut self, target_view: u64) -> Result<(), BftError> {
         let online = self.online_ids();
-        if online.len() < self.config.quorum() {
+        if online.is_empty() || online.len() < self.config.quorum() {
+            let height = online
+                .first()
+                .map(|&id| self.validators[id as usize].next_height())
+                .unwrap_or(0);
             return Err(BftError::QuorumNotReached {
                 phase: "ViewChange",
-                height: self.validators[online[0] as usize].next_height(),
+                height,
                 view: target_view,
                 max_votes: online.len(),
                 quorum: self.config.quorum(),
@@ -1790,7 +1916,10 @@ impl BftCluster {
             vc_frames.extend(frames);
         }
         for frame in &vc_frames {
-            self.validators[frame.to as usize].on_view_change_frame(frame)?;
+            match self.validators[frame.to as usize].on_view_change_frame(frame) {
+                Ok(()) | Err(BftError::InvalidMac | BftError::InvalidEncoding(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         for &id in &online {
             self.validators[id as usize].try_complete_view_change(target_view)?;
@@ -1841,9 +1970,13 @@ impl BftCluster {
             prepare_frames.extend(follower_prepares);
         }
 
-        // Phase 1: Deliver all Prepare frames over pairwise OTP+CW links
+        // Phase 1: Deliver all Prepare frames over pairwise OTP+CW links (ignore individual
+        // Byzantine InvalidMac/InvalidEncoding frames; fail only if quorum < 2f + 1).
         for frame in &prepare_frames {
-            self.validators[frame.to as usize].on_prepare_frame(frame)?;
+            match self.validators[frame.to as usize].on_prepare_frame(frame) {
+                Ok(()) | Err(BftError::InvalidMac | BftError::InvalidEncoding(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         // Validators reaching 2f + 1 Prepares emit pairwise Commit frames
@@ -1853,9 +1986,12 @@ impl BftCluster {
             commit_frames.extend(frames);
         }
 
-        // Phase 2: Deliver all Commit frames over pairwise OTP+CW links
+        // Phase 2: Deliver all Commit frames over pairwise OTP+CW links (tolerate Byzantine frames).
         for frame in &commit_frames {
-            self.validators[frame.to as usize].on_commit_frame(frame)?;
+            match self.validators[frame.to as usize].on_commit_frame(frame) {
+                Ok(()) | Err(BftError::InvalidMac | BftError::InvalidEncoding(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         // Finalize commit on every online validator
@@ -1946,6 +2082,7 @@ impl BftCluster {
                 block_tag: block_a.block_tag,
                 prev_tag: block_a.prev_tag,
                 tx_count: block_a.txs.len() as u32,
+                locked_view: None,
             };
             let pp_frame = self.validators[leader_id as usize].send_vote_frame(target, &pp_vote)?;
             let leader_prep = self.validators[leader_id as usize].send_vote_frame(
@@ -1974,6 +2111,7 @@ impl BftCluster {
                 block_tag: block_b.block_tag,
                 prev_tag: block_b.prev_tag,
                 tx_count: block_b.txs.len() as u32,
+                locked_view: None,
             };
             let pp_frame = self.validators[leader_id as usize].send_vote_frame(target, &pp_vote)?;
             let leader_prep = self.validators[leader_id as usize].send_vote_frame(
@@ -2324,6 +2462,7 @@ mod tests {
             block_tag: [0x11u8; 16],
             prev_tag: [0x22u8; 16],
             tx_count: 500,
+            locked_view: None,
         };
         let payload = vote.to_payload();
         let frame = out_deck.seal_frame(1, 2, &payload).unwrap();
@@ -2590,5 +2729,75 @@ mod tests {
         assert_eq!(wot.voting_weight(candidate), 1);
         assert_eq!(wot.verified_count(), 5);
         assert!(wot.require_admitted(candidate).is_ok());
+    }
+
+    #[test]
+    fn test_view_change_monotonic_lock_preservation_equivocation_and_empty_online_guard() {
+        let config = BftConfig::default(); // N=4, f=1, quorum=3
+        let mut cluster = BftCluster::new(config, initial_test_balances(), 64, 8, 4);
+
+        // L-4: execute_view_change when all validators offline must not panic.
+        for id in 0..4u32 {
+            cluster.set_online(id, false).unwrap();
+        }
+        assert!(matches!(
+            cluster.execute_view_change(1),
+            Err(BftError::QuorumNotReached {
+                phase: "ViewChange",
+                ..
+            })
+        ));
+        for id in 0..4u32 {
+            cluster.set_online(id, true).unwrap();
+        }
+
+        // C-3: ViewChange cannot regress or stay on current_view.
+        assert!(cluster.execute_view_change(0).is_err());
+        cluster.execute_view_change(1).unwrap();
+        assert!(cluster.execute_view_change(1).is_err());
+        assert!(cluster.execute_view_change(0).is_err());
+
+        // C-3: Locked state is carried in ViewChange votes and preserved across view transitions.
+        let lock_tag = [0x77u8; 16];
+        cluster.validators[0].locked_view = Some(1);
+        cluster.validators[0].locked_block_tag = Some(lock_tag);
+        cluster.execute_view_change(2).unwrap();
+        for v in &cluster.validators {
+            assert_eq!(v.current_view, 2);
+            assert_eq!(v.locked_view, Some(1));
+            assert_eq!(v.locked_block_tag, Some(lock_tag));
+        }
+
+        // H-3: Equivocating Prepare votes from same validator for two different tags are rejected.
+        let v1_vote_a = ConsensusVote {
+            kind: MsgKind::Prepare,
+            voter_id: 1,
+            height: 1,
+            view: 2,
+            block_tag: [0xAAu8; 16],
+            prev_tag: GENESIS_TAG,
+            tx_count: 1,
+            locked_view: None,
+        };
+        let v1_vote_b = ConsensusVote {
+            block_tag: [0xBBu8; 16],
+            ..v1_vote_a
+        };
+        let f_a = cluster.validators[1].send_vote_frame(0, &v1_vote_a).unwrap();
+        let f_b = cluster.validators[1].send_vote_frame(0, &v1_vote_b).unwrap();
+        cluster.validators[0].on_prepare_frame(&f_a).unwrap();
+        assert!(matches!(
+            cluster.validators[0].on_prepare_frame(&f_b),
+            Err(BftError::InvalidEncoding(_))
+        ));
+
+        // M-7: leader_propose validates batch BEFORE burning seal key.
+        // At height 1, view 2, leader is (1 + 2) % 4 = 3.
+        let bad_txs = vec![BinaryTx::new(0, 0, 100, 1, 1)]; // self-transfer
+        let online = cluster.online_ids();
+        assert!(cluster.validators[3].leader_propose(bad_txs, &online).is_err());
+        // Seal key for (1, 2) must still be available for a valid proposal!
+        let good_txs = vec![BinaryTx::new(0, 1, 100, 1, 1)];
+        assert!(cluster.validators[3].leader_propose(good_txs, &online).is_ok());
     }
 }

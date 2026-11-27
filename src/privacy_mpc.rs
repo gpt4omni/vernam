@@ -129,6 +129,16 @@ fn zeroize_u128_slice(buf: &mut [u128]) {
     }
 }
 
+/// Sample a uniform non-zero field element in `[1, PRIME_P)` from OS entropy.
+fn random_nonzero_field_elem() -> u128 {
+    loop {
+        let v = random_field_elem();
+        if v != 0 {
+            return v;
+        }
+    }
+}
+
 /// Fill `out` with uniform random elements in `[0, PRIME_P)` using a single batched OS entropy
 /// read and unbiased rejection sampling.
 fn fill_random_field_elems(out: &mut [u128]) {
@@ -487,11 +497,19 @@ pub fn proactive_refresh_epoch_batch(
 ///
 /// Intentionally does NOT implement `Clone` or `Copy` to enforce strict one-time consumption at
 /// compile time, and zeroizes all shares on `Drop`.
-#[derive(Debug)]
 pub struct BeaverTriple {
     a: Vec<u128>,
     b: Vec<u128>,
     c: Vec<u128>,
+}
+
+impl fmt::Debug for BeaverTriple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaverTriple")
+            .field("validators", &self.a.len())
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BeaverTriple {
@@ -525,11 +543,21 @@ impl Drop for BeaverTriple {
 /// Offline factory and pool of single-use Shamir-shared Beaver triples.
 ///
 /// Automatically zeroizes all unused triples when dropped.
-#[derive(Debug)]
 pub struct BeaverPool {
     threshold: usize,
     num_validators: usize,
     triples: Vec<BeaverTriple>,
+}
+
+impl fmt::Debug for BeaverPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaverPool")
+            .field("threshold", &self.threshold)
+            .field("num_validators", &self.num_validators)
+            .field("available", &self.triples.len())
+            .field("triples", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BeaverPool {
@@ -656,7 +684,7 @@ impl Drop for BeaverPool {
     }
 }
 
-/// Local share addition `[x] + [y]`.
+/// Local share addition `[x] + [y]`, rejecting non-canonical field elements `>= PRIME_P`.
 pub fn mpc_add(x: &[u128], y: &[u128]) -> Result<Vec<u128>, MpcError> {
     if x.len() != y.len() {
         return Err(MpcError::InvalidShareLength {
@@ -664,10 +692,18 @@ pub fn mpc_add(x: &[u128], y: &[u128]) -> Result<Vec<u128>, MpcError> {
             got: y.len(),
         });
     }
-    Ok(x.iter().zip(y.iter()).map(|(&a, &b)| add_mod(a, b)).collect())
+    let mut out = Vec::with_capacity(x.len());
+    for (&a, &b) in x.iter().zip(y.iter()) {
+        if a >= PRIME_P || b >= PRIME_P {
+            zeroize_u128_slice(&mut out);
+            return Err(MpcError::FieldElementOutOfRange);
+        }
+        out.push(add_mod(a, b));
+    }
+    Ok(out)
 }
 
-/// Local share subtraction `[x] - [y]`.
+/// Local share subtraction `[x] - [y]`, rejecting non-canonical field elements `>= PRIME_P`.
 pub fn mpc_sub(x: &[u128], y: &[u128]) -> Result<Vec<u128>, MpcError> {
     if x.len() != y.len() {
         return Err(MpcError::InvalidShareLength {
@@ -675,7 +711,15 @@ pub fn mpc_sub(x: &[u128], y: &[u128]) -> Result<Vec<u128>, MpcError> {
             got: y.len(),
         });
     }
-    Ok(x.iter().zip(y.iter()).map(|(&a, &b)| sub_mod(a, b)).collect())
+    let mut out = Vec::with_capacity(x.len());
+    for (&a, &b) in x.iter().zip(y.iter()) {
+        if a >= PRIME_P || b >= PRIME_P {
+            zeroize_u128_slice(&mut out);
+            return Err(MpcError::FieldElementOutOfRange);
+        }
+        out.push(sub_mod(a, b));
+    }
+    Ok(out)
 }
 
 /// Local public scalar multiplication `scalar * [x]`.
@@ -684,16 +728,38 @@ pub fn mpc_scale(x: &[u128], scalar: u128) -> Vec<u128> {
     x.iter().map(|&a| mul_mod(a, scalar)).collect()
 }
 
-/// Local addition of a public constant `[x] + constant`.
+/// Local addition of a public constant `[x] + constant`, rejecting non-canonical elements `>= PRIME_P`.
 #[inline]
-pub fn mpc_add_const(x: &[u128], constant: u128) -> Vec<u128> {
-    x.iter().map(|&a| add_mod(a, constant)).collect()
+pub fn mpc_add_const(x: &[u128], constant: u128) -> Result<Vec<u128>, MpcError> {
+    if constant >= PRIME_P {
+        return Err(MpcError::FieldElementOutOfRange);
+    }
+    let mut out = Vec::with_capacity(x.len());
+    for &a in x {
+        if a >= PRIME_P {
+            zeroize_u128_slice(&mut out);
+            return Err(MpcError::FieldElementOutOfRange);
+        }
+        out.push(add_mod(a, constant));
+    }
+    Ok(out)
 }
 
-/// Local subtraction of a public constant `[x] - constant`.
+/// Local subtraction of a public constant `[x] - constant`, rejecting non-canonical elements `>= PRIME_P`.
 #[inline]
-pub fn mpc_sub_const(x: &[u128], constant: u128) -> Vec<u128> {
-    x.iter().map(|&a| sub_mod(a, constant)).collect()
+pub fn mpc_sub_const(x: &[u128], constant: u128) -> Result<Vec<u128>, MpcError> {
+    if constant >= PRIME_P {
+        return Err(MpcError::FieldElementOutOfRange);
+    }
+    let mut out = Vec::with_capacity(x.len());
+    for &a in x {
+        if a >= PRIME_P {
+            zeroize_u128_slice(&mut out);
+            return Err(MpcError::FieldElementOutOfRange);
+        }
+        out.push(sub_mod(a, constant));
+    }
+    Ok(out)
 }
 
 /// Online Beaver multiplication `[x * y]` consuming a single-use [`BeaverTriple`].
@@ -782,7 +848,6 @@ pub fn mpc_mul(
 /// A client-submitted confidential transfer request containing Shamir-shared bit decompositions
 /// for the transfer amount `v`, the post-transfer remainder `r = B_sender - v`, and the blinded
 /// one-hot recipient selector `s_0..s_{K-1}` over `recipient_bucket`.
-#[derive(Debug)]
 pub struct ConfidentialTransferRequest {
     /// Global sender account ID (`bucket_id * bucket_size + slot`).
     pub sender: usize,
@@ -794,6 +859,19 @@ pub struct ConfidentialTransferRequest {
     pub r_bits: Vec<Vec<u128>>,
     /// Shamir shares of one-hot recipient selector `s_k in {0, 1}`, `sum_k s_k = 1`.
     pub selector_shares: Vec<Vec<u128>>,
+}
+
+impl fmt::Debug for ConfidentialTransferRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfidentialTransferRequest")
+            .field("sender", &self.sender)
+            .field("recipient_bucket", &self.recipient_bucket)
+            .field("v_bits_len", &self.v_bits.len())
+            .field("r_bits_len", &self.r_bits.len())
+            .field("selector_len", &self.selector_shares.len())
+            .field("shares", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ConfidentialTransferRequest {
@@ -922,9 +1000,17 @@ impl Drop for ConfidentialTransferRequest {
 }
 
 /// A fixed-size anonymity bucket storing Shamir-shared liquid balances for `bucket_size` accounts.
-#[derive(Debug)]
 struct AnonymityBucket {
     balances: Vec<Vec<u128>>,
+}
+
+impl fmt::Debug for AnonymityBucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnonymityBucket")
+            .field("slots", &self.balances.len())
+            .field("balances", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Drop for AnonymityBucket {
@@ -957,13 +1043,25 @@ impl Drop for VerifiedTransferDelta {
 ///
 /// Accounts are partitioned into buckets of size `K = bucket_size` so every confidential transfer
 /// performs `O(K) = O(1)` blinded updates instead of `O(total_users)`.
-#[derive(Debug)]
 pub struct ShardedPrivateLedger {
     cache: LagrangeCache,
     bucket_size: usize,
     bit_width: usize,
     epoch: u64,
+    total_minted: u128,
     buckets: Vec<AnonymityBucket>,
+}
+
+impl fmt::Debug for ShardedPrivateLedger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardedPrivateLedger")
+            .field("num_buckets", &self.buckets.len())
+            .field("bucket_size", &self.bucket_size)
+            .field("bit_width", &self.bit_width)
+            .field("epoch", &self.epoch)
+            .field("balances", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ShardedPrivateLedger {
@@ -997,6 +1095,7 @@ impl ShardedPrivateLedger {
             bucket_size,
             bit_width,
             epoch: 1,
+            total_minted: 0,
             buckets,
         })
     }
@@ -1049,10 +1148,11 @@ impl ShardedPrivateLedger {
         &self.cache
     }
 
-    /// Number of Beaver triples consumed by a single confidential transfer (`2*W + 2*K`).
+    /// Number of Beaver triples consumed by a single confidential transfer
+    /// (`2*W + 2*K + 1`, including 1 blinding triple for `[rho] * [B_sender - v - r]`).
     #[inline]
     pub fn triples_per_transfer(&self) -> usize {
-        2 * self.bit_width + 2 * self.bucket_size
+        2 * self.bit_width + 2 * self.bucket_size + 1
     }
 
     /// Map a global `account_id` to `(bucket_id, slot_in_bucket)`.
@@ -1079,6 +1179,9 @@ impl ShardedPrivateLedger {
     }
 
     /// Mint/credit an initial liquid balance into `account_id` using fresh Shamir shares.
+    ///
+    /// Enforces both `existing_balance + amount <= 2^bit_width - 1` and total minted supply
+    /// `<= 2^bit_width - 1` so no subsequent transfer can push any account above `max_val`.
     pub fn mint_initial_balance(
         &mut self,
         account_id: usize,
@@ -1095,6 +1198,23 @@ impl ShardedPrivateLedger {
             ));
         }
         let (bucket_id, slot) = self.account_location(account_id)?;
+        let existing = self
+            .cache
+            .reconstruct_and_verify(&self.buckets[bucket_id].balances[slot])?;
+        if existing.checked_add(amount).is_none_or(|sum| sum > max_val) {
+            return Err(MpcError::InvalidParameters(
+                "existing balance + mint amount exceeds 2^bit_width - 1",
+            ));
+        }
+        if self
+            .total_minted
+            .checked_add(amount)
+            .is_none_or(|sum| sum > max_val)
+        {
+            return Err(MpcError::InvalidParameters(
+                "total ledger supply would exceed safe 2^bit_width - 1 cap",
+            ));
+        }
         let mut delta = split_secret(
             amount,
             self.cache.threshold(),
@@ -1104,6 +1224,7 @@ impl ShardedPrivateLedger {
         for (b, &d) in bal.iter_mut().zip(delta.iter()) {
             *b = add_mod(*b, d);
         }
+        self.total_minted += amount;
         zeroize_u128_slice(&mut delta);
         Ok(())
     }
@@ -1136,7 +1257,7 @@ impl ShardedPrivateLedger {
         pool: &mut BeaverPool,
         fail_err: MpcError,
     ) -> Result<(), MpcError> {
-        let mut bit_minus_one = mpc_sub_const(bit_shares, 1);
+        let mut bit_minus_one = mpc_sub_const(bit_shares, 1)?;
         let triple = pool.pop()?;
         let prod_res = mpc_mul(bit_shares, &bit_minus_one, triple, &self.cache);
         zeroize_u128_slice(&mut bit_minus_one);
@@ -1198,15 +1319,30 @@ impl ShardedPrivateLedger {
             self.verify_bit_share(bit_shares, pool, MpcError::RangeProofFailed)?;
         }
 
-        // 3. Recompose [v] and [r] linearly and enforce B_sender - v - r == 0.
+        // 3. Recompose [v] and [r] linearly and enforce B_sender - v - r == 0 using a
+        //    multiplicatively blinded zero-check [rho * eq_check] with uniform non-zero [rho]
+        //    so a failed check leaks ZERO bits about B_sender or concurrent incoming credits.
         let v_shares = self.compose_bits(&req.v_bits);
         let mut r_shares = self.compose_bits(&req.r_bits);
         let mut diff = mpc_sub(sender_balance_shares, &v_shares)?;
         let mut eq_check = mpc_sub(&diff, &r_shares)?;
-        let opened_eq = self.cache.reconstruct_and_verify(&eq_check);
         zeroize_u128_slice(&mut r_shares);
         zeroize_u128_slice(&mut diff);
+
+        let mut rho = random_nonzero_field_elem();
+        let mut rho_shares = split_secret(
+            rho,
+            self.cache.threshold(),
+            self.cache.num_validators(),
+        )?;
+        zeroize_u128(&mut rho);
+        let blind_triple = pool.pop()?;
+        let blind_res = mpc_mul(&rho_shares, &eq_check, blind_triple, &self.cache);
+        zeroize_u128_slice(&mut rho_shares);
         zeroize_u128_slice(&mut eq_check);
+        let mut blinded_eq = blind_res?;
+        let opened_eq = self.cache.reconstruct_and_verify(&blinded_eq);
+        zeroize_u128_slice(&mut blinded_eq);
         if opened_eq? != 0 {
             return Err(MpcError::BalanceCheckFailed);
         }
@@ -1411,11 +1547,20 @@ fn compute_carter_wegman_tag(
 /// Single-use OTP encryption pad + Carter-Wegman universal MAC key for one [`CoverFrame`].
 ///
 /// Intentionally non-`Clone` to prevent accidental one-time pad reuse; zeroized on `Drop`.
-#[derive(Debug)]
 pub struct CoverFrameKey {
     otp_pad: [u8; COVER_FRAME_BODY_SIZE],
     mac_r: u128,
     mac_s: u128,
+}
+
+impl fmt::Debug for CoverFrameKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoverFrameKey")
+            .field("otp_pad", &"<redacted>")
+            .field("mac_r", &"<redacted>")
+            .field("mac_s", &"<redacted>")
+            .finish()
+    }
 }
 
 impl CoverFrameKey {
@@ -2103,5 +2248,51 @@ mod tests {
             tampered.unseal(k_rx),
             Err(MpcError::InvalidCoverFrame("Carter-Wegman MAC mismatch"))
         );
+    }
+
+    #[test]
+    fn test_canonical_field_validation_overflow_protection_and_redacted_debug() {
+        // M-1: Canonical field validation on mpc_add, mpc_sub, mpc_add_const, mpc_sub_const.
+        let valid = vec![1u128, 2, 3, 4];
+        let bad = vec![1u128, PRIME_P, 3, 4];
+        assert_eq!(mpc_add(&valid, &bad), Err(MpcError::FieldElementOutOfRange));
+        assert_eq!(mpc_add(&bad, &valid), Err(MpcError::FieldElementOutOfRange));
+        assert_eq!(mpc_sub(&valid, &bad), Err(MpcError::FieldElementOutOfRange));
+        assert_eq!(mpc_sub(&bad, &valid), Err(MpcError::FieldElementOutOfRange));
+        assert_eq!(
+            mpc_add_const(&bad, 1),
+            Err(MpcError::FieldElementOutOfRange)
+        );
+        assert_eq!(
+            mpc_add_const(&valid, PRIME_P),
+            Err(MpcError::FieldElementOutOfRange)
+        );
+        assert_eq!(
+            mpc_sub_const(&bad, 1),
+            Err(MpcError::FieldElementOutOfRange)
+        );
+        assert_eq!(
+            mpc_sub_const(&valid, PRIME_P),
+            Err(MpcError::FieldElementOutOfRange)
+        );
+
+        // C-2: Cumulative balance overflow and safe ledger supply cap protection.
+        let mut ledger = ShardedPrivateLedger::new_default(2).unwrap();
+        ledger.mint_initial_balance(0, 40_000).unwrap();
+        assert!(ledger.mint_initial_balance(0, 30_000).is_err());
+        assert_eq!(ledger.reconstruct_balance(0).unwrap(), 40_000);
+        // Supply cap across accounts prevents transfers from ever pushing any account > 65,535.
+        assert!(ledger.mint_initial_balance(1, 30_000).is_err());
+        ledger.mint_initial_balance(1, 25_535).unwrap();
+        assert_eq!(ledger.reconstruct_balance(1).unwrap(), 25_535);
+
+        // L-1: Redacted Debug output on secret-holding types.
+        let mut pool = BeaverPool::new_3_of_4(1);
+        let triple = pool.pop().unwrap();
+        let triple_dbg = format!("{triple:?}");
+        assert!(triple_dbg.contains("<redacted>"));
+        let (k_tx, _k_rx) = CoverFrameKey::generate_pair();
+        let key_dbg = format!("{k_tx:?}");
+        assert!(key_dbg.contains("<redacted>"));
     }
 }
