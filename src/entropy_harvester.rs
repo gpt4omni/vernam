@@ -528,10 +528,10 @@ pub struct CpuJitterConfig {
 impl Default for CpuJitterConfig {
     fn default() -> Self {
         Self {
-            fold_factor: 4,
-            scratch_bytes: 4096,
-            chase_steps: 16,
-            peres_depth: 3,
+            fold_factor: 8,
+            scratch_bytes: 65_536,
+            chase_steps: 32,
+            peres_depth: 2,
             health_config: HealthMonitorConfig::default(),
             max_autocorr_z: DEFAULT_MAX_Z_SCORE,
             min_entropy_bits_per_byte: 1.5,
@@ -614,6 +614,25 @@ impl CpuJitterHarvester {
             staging: vec![0u8; MIN_STAGE_BYTES],
             gate,
         };
+
+        // Auto-calibrate `chase_steps` so coarse hardware counters (e.g. 24-50 MHz aarch64
+        // `CNTVCT_EL0`) advance by at least several ticks per measurement instead of quantizing
+        // to zero-delta runs.
+        for _ in 0..8 {
+            let mut non_zero_ticks = 0usize;
+            let mut prev = harvester.jitter_work_step();
+            for _ in 0..16 {
+                let cur = harvester.jitter_work_step();
+                if cur.wrapping_sub(prev) >= 2 {
+                    non_zero_ticks += 1;
+                }
+                prev = cur;
+            }
+            if non_zero_ticks >= 12 || harvester.config.chase_steps >= 2048 {
+                break;
+            }
+            harvester.config.chase_steps = (harvester.config.chase_steps * 2).min(2048);
+        }
 
         // Prime second-order timing delta state with two warm-up measurements.
         let t0 = harvester.jitter_work_step();
