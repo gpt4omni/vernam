@@ -186,6 +186,8 @@ pub struct TestnetState {
     pub recent_events: Vec<String>,
     /// Per-sender monotonic nonce table for Express transactions.
     sender_nonces: BTreeMap<u32, u64>,
+    /// External P2P nodes discovered via `POST /p2p/announce`: `addr -> (node_id, height, pop_score, qber)`.
+    external_peers: BTreeMap<String, (u64, u64, u64, f64)>,
 }
 
 impl TestnetState {
@@ -261,6 +263,7 @@ impl TestnetState {
             next_page_id: 1,
             recent_events: Vec::with_capacity(MAX_RECENT_EVENTS),
             sender_nonces: BTreeMap::new(),
+            external_peers: BTreeMap::new(),
         };
 
         state.push_event(format!(
@@ -1136,6 +1139,28 @@ impl TestnetServer {
         let _ = stream.flush();
     }
 
+    fn peers_json(guard: &TestnetState) -> String {
+        let height = guard.blocks_finalized;
+        let qber = guard.last_qber;
+        let adv = std::env::var("VRNM_ADVERTISE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| guard.config.bind_addr.clone());
+        let adv_esc = json_escape(&adv);
+        let mut arr = String::from("[");
+        arr.push_str(&format!(
+            "{{\"node_id\":0,\"addr\":\"{adv_esc}\",\"height\":{height},\"pop_score\":100,\"qber\":{qber:.6},\"healthy\":true}}"
+        ));
+        for (addr, &(nid, ph, ps, pq)) in &guard.external_peers {
+            let esc = json_escape(addr);
+            arr.push_str(&format!(
+                ",{{\"node_id\":{nid},\"addr\":\"{esc}\",\"height\":{ph},\"pop_score\":{ps},\"qber\":{pq:.6},\"healthy\":true}}"
+            ));
+        }
+        arr.push(']');
+        arr
+    }
+
     /// Route a parsed [`HttpRequest`] against `state` and produce an [`HttpResponse`].
     pub fn route_request(state: &Arc<Mutex<TestnetState>>, req: &HttpRequest) -> HttpResponse {
         if req.method == "OPTIONS" {
@@ -1152,20 +1177,35 @@ impl TestnetServer {
 
             ("GET", "/p2p/peers") => {
                 let guard = state.lock().expect("testnet state mutex poisoned");
-                let height = guard.blocks_finalized;
-                let qber = guard.last_qber;
-                let bind = json_escape(&guard.config.bind_addr);
-                let mut arr = String::from("[");
-                for vid in 0..4u64 {
-                    if vid > 0 {
-                        arr.push(',');
-                    }
-                    arr.push_str(&format!(
-                        "{{\"node_id\":{vid},\"addr\":\"{bind}\",\"height\":{height},\"pop_score\":100,\"qber\":{qber:.6},\"healthy\":true}}"
-                    ));
+                HttpResponse::ok_json(Self::peers_json(&guard))
+            }
+
+            ("POST", "/p2p/announce") => {
+                let Some(raw_addr) = parse_json_str(&req.body, "addr") else {
+                    return HttpResponse::err_json(400, "Bad Request", "missing string field 'addr'");
+                };
+                let trimmed = raw_addr.trim();
+                if trimmed.is_empty() || !trimmed.contains(':') || trimmed.chars().any(|c| c.is_whitespace()) {
+                    return HttpResponse::err_json(400, "Bad Request", "malformed peer 'addr'");
                 }
-                arr.push(']');
-                HttpResponse::ok_json(arr)
+                let node_id = parse_json_u64(&req.body, "node_id").unwrap_or(100);
+                let height = parse_json_u64(&req.body, "height").unwrap_or(0);
+                let pop_score = parse_json_u64(&req.body, "pop_score").unwrap_or(100);
+                let mut guard = state.lock().expect("testnet state mutex poisoned");
+                let self_adv = std::env::var("VRNM_ADVERTISE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| guard.config.bind_addr.clone());
+                if trimmed != self_adv && trimmed != guard.config.bind_addr {
+                    let is_new = !guard.external_peers.contains_key(trimmed);
+                    guard
+                        .external_peers
+                        .insert(trimmed.to_string(), (node_id, height, pop_score, 0.0));
+                    if is_new {
+                        guard.push_event(format!("P2P PEER JOINED: node #{node_id} ({trimmed})"));
+                    }
+                }
+                HttpResponse::ok_json(Self::peers_json(&guard))
             }
 
             ("POST", "/pop/mine") => {
