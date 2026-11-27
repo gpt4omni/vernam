@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{Ordering, compiler_fence};
 
 use crate::entropy_beacon::EpochBeaconOutput;
 use crate::field::{
@@ -47,6 +48,7 @@ use crate::tokenomics::{
     AuditTag, EpochContribution, EpochSettlement, SlashingOffense, SlashingReceipt,
     TokenomicsEngine, ValidatorId,
 };
+use crate::turbo_crypto::{toeplitz_hash_turbo, toeplitz_seed_words_turbo};
 
 /// Standard OTP pad page size in bytes (256 B = 2048 bits, matching Express OTP frames and
 /// `qkd.rs` Toeplitz privacy-amplification blocks).
@@ -76,6 +78,24 @@ pub const DEFAULT_CHALLENGE_SLOT_COUNT: usize = 4;
 /// Default sliding-window depth (in epochs) retained by [`PopReplayRegistry`] to detect
 /// cross-epoch pad recycling and cross-validator pad theft with bounded memory.
 pub const DEFAULT_REPLAY_WINDOW_EPOCHS: u64 = 64;
+
+/// Default lower bound for 255-df byte chi-square (catches unnaturally flat counters / 8-bit LCGs).
+pub const DEFAULT_MIN_CHI_SQUARE_255: f64 = 110.0;
+
+/// Default upper bound for 255-df byte chi-square on >= 256-byte samples (catches biased bytes).
+pub const DEFAULT_MAX_CHI_SQUARE_255: f64 = 450.0;
+
+/// Default maximum lag-1..8 bit/byte autocorrelation z-score ceiling (catches LFSRs & short-period fakes).
+pub const DEFAULT_MAX_LAG8_AUTOCORR_Z: f64 = 6.0;
+
+/// NIST SP 800-90B Repetition Count Test cutoff for identical consecutive bytes (`H=8, alpha=2^-40`).
+pub const DEFAULT_RCT_BYTE_CUTOFF: usize = 6;
+
+/// NIST SP 800-90B Repetition Count Test cutoff for identical consecutive bits (`H=1, alpha=2^-40`).
+pub const DEFAULT_RCT_BIT_CUTOFF: usize = 40;
+
+/// NIST SP 800-90B Adaptive Proportion Test window size in bytes.
+pub const DEFAULT_APT_WINDOW_BYTES: usize = 512;
 
 // ============================================================================
 // Errors & Audit Policy
@@ -140,6 +160,8 @@ pub enum PopError {
         prior_epoch: u64,
         current_epoch: u64,
     },
+    /// Simulated/devnet transport provenance was submitted under strict mainnet PoP verification.
+    SimulatedProvenanceForbidden,
     /// Tokenomics engine rejected recording a contribution or slashing.
     TokenomicsFailure(String),
     /// Non-slashable coordinator rejection (e.g., stale epoch challenge or duplicate submission).
@@ -170,7 +192,8 @@ impl PopError {
             | Self::SelfCoSignForbidden(_)
             | Self::UnauthorizedCounterparty { .. }
             | Self::InvalidPeerReceiptMac { .. }
-            | Self::CrossEpochPadReplay { .. } => Some(SlashingOffense::InconsistentMpcShare),
+            | Self::CrossEpochPadReplay { .. }
+            | Self::SimulatedProvenanceForbidden => Some(SlashingOffense::InconsistentMpcShare),
             Self::QkdQberExceeded { .. }
             | Self::QkdDecoyAnomaly { .. }
             | Self::EmptyBatch(_) => Some(SlashingOffense::ExtendedDowntime),
@@ -258,6 +281,10 @@ impl fmt::Display for PopError {
             } => write!(
                 f,
                 "cross-epoch/cross-validator pad replay detected for validator {validator_id} in epoch {current_epoch} (already used by validator {prior_validator_id} in epoch {prior_epoch})"
+            ),
+            Self::SimulatedProvenanceForbidden => write!(
+                f,
+                "simulated/devnet transport provenance is forbidden on mainnet (weight = 0 bps)"
             ),
             Self::TokenomicsFailure(msg) => write!(f, "tokenomics integration error: {msg}"),
             Self::CoordinatorRejected(msg) => write!(f, "PoP coordinator rejected submission: {msg}"),
@@ -472,6 +499,295 @@ pub fn audit_pad_entropy_with_policy(
     }
 
     Ok(stats)
+}
+
+// ============================================================================
+// PoP v2.0: Extended Statistical Audit, Transport Provenance & Freshness Salt
+// ============================================================================
+
+/// Extended PoP v2.0 statistical entropy audit metrics catching LFSRs, LCGs, biased byte
+/// alphabets, short-period generators, and stuck consecutive repeats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExtendedEntropyAuditStats {
+    /// Base PoP v1 statistical metrics (monobit, runs, uniqueness, non-zero).
+    pub base: EntropyAuditStats,
+    /// Pearson byte-frequency chi-square statistic (`df = 255`).
+    pub chi_square_255: f64,
+    /// Maximum absolute autocorrelation z-score across bit lags `1..=8` and byte lags `1..=8`.
+    pub max_lag8_autocorr_z: f64,
+    /// Number of distinct overlapping 16-bit bigrams `(sample[i], sample[i+1])`.
+    pub distinct_16bit_bigrams: usize,
+    /// NIST SP 800-90B Repetition Count Test pass flag (byte & bit consecutive repeat limits).
+    pub rct_passed: bool,
+    /// NIST SP 800-90B Adaptive Proportion Test pass flag (windowed symbol frequency limit).
+    pub apt_passed: bool,
+}
+
+/// Evaluate extended PoP v2.0 statistical entropy checks on `sample` against `policy`.
+///
+/// Runs the full base audit (`audit_pad_entropy_with_policy`), then additionally verifies:
+/// 1. **255-df Byte Chi-Square (`chi_square_255`)**: rejects both biased byte distributions
+///    (excessively high chi-square) and unnaturally flat deterministic permutations / full-period
+///    8-bit LCGs / counters (excessively low chi-square on samples >= 128 B).
+/// 2. **Lag-1..8 Bit & Byte Autocorrelation (`max_lag8_autocorr_z`)**: checks bit lags `1..=8`
+///    and byte lags `1..=8` (bit lags `8, 16, ..., 64`), catching 2/4/8-byte periodic fakes,
+///    low-order LCG bit cycles, and short-tap LFSRs.
+/// 3. **16-bit Bigram Diversity (`distinct_16bit_bigrams`)**: counts distinct overlapping byte
+///    pairs and rejects short-period or low-state-space generators.
+/// 4. **NIST SP 800-90B Repetition Count Test (`rct_passed`)**: catches consecutive stuck bytes
+///    (`>= 6`) or consecutive stuck bits (`>= 40`).
+/// 5. **NIST SP 800-90B Adaptive Proportion Test (`apt_passed`)**: catches localized byte bias
+///    within 512-byte sliding/chunked windows.
+pub fn audit_pad_entropy_extended(
+    sample: &[u8],
+    policy: &PopAuditPolicy,
+) -> Result<ExtendedEntropyAuditStats, PopError> {
+    let base = audit_pad_entropy_with_policy(sample, policy)?;
+    let n = sample.len();
+    let total_bits = base.total_bits;
+
+    // 1. 255-df Byte Chi-Square statistic.
+    let mut byte_counts = [0usize; 256];
+    for &b in sample {
+        byte_counts[b as usize] += 1;
+    }
+    let expected_per_byte = n as f64 / 256.0;
+    let mut chi_square_255 = 0.0f64;
+    for &count in &byte_counts {
+        let diff = count as f64 - expected_per_byte;
+        chi_square_255 += (diff * diff) / expected_per_byte;
+    }
+
+    // 2. Maximum absolute autocorrelation z-score over bit lags 1..=8 and byte lags 1..=8.
+    let bit_at = |idx: usize| -> u8 { (sample[idx >> 3] >> (idx & 7)) & 1 };
+    let mut max_lag8_autocorr_z = 0.0f64;
+    let lags: [usize; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 40, 48, 56, 64];
+    for &lag in &lags {
+        if lag >= total_bits {
+            continue;
+        }
+        let pairs = total_bits - lag;
+        let mut agree = 0usize;
+        if lag % 8 == 0 {
+            let byte_lag = lag / 8;
+            for i in 0..(n - byte_lag) {
+                let xnor = !(sample[i] ^ sample[i + byte_lag]);
+                agree += xnor.count_ones() as usize;
+            }
+        } else {
+            for i in 0..pairs {
+                if bit_at(i) == bit_at(i + lag) {
+                    agree += 1;
+                }
+            }
+        }
+        let z = ((2.0 * agree as f64) - (pairs as f64)).abs() / (pairs as f64).sqrt();
+        if z > max_lag8_autocorr_z {
+            max_lag8_autocorr_z = z;
+        }
+    }
+
+    // 3. Distinct overlapping 16-bit bigrams `(sample[i], sample[i+1])`.
+    let mut seen_bigrams = [0u64; 1024]; // 65,536 bits on stack, zero heap allocations.
+    let mut distinct_16bit_bigrams = 0usize;
+    for win in sample.windows(2) {
+        let bigram = ((win[0] as usize) << 8) | (win[1] as usize);
+        let word = bigram >> 6;
+        let mask = 1u64 << (bigram & 63);
+        if (seen_bigrams[word] & mask) == 0 {
+            seen_bigrams[word] |= mask;
+            distinct_16bit_bigrams += 1;
+        }
+    }
+
+    // 4. NIST SP 800-90B Repetition Count Test (consecutive identical bytes & bits).
+    let mut max_byte_run = 1usize;
+    let mut cur_byte_run = 1usize;
+    for i in 1..n {
+        if sample[i] == sample[i - 1] {
+            cur_byte_run += 1;
+            if cur_byte_run > max_byte_run {
+                max_byte_run = cur_byte_run;
+            }
+        } else {
+            cur_byte_run = 1;
+        }
+    }
+    let mut max_bit_run = 1usize;
+    let mut cur_bit_run = 1usize;
+    let mut prev_bit = bit_at(0);
+    for i in 1..total_bits {
+        let cur = bit_at(i);
+        if cur == prev_bit {
+            cur_bit_run += 1;
+            if cur_bit_run > max_bit_run {
+                max_bit_run = cur_bit_run;
+            }
+        } else {
+            cur_bit_run = 1;
+            prev_bit = cur;
+        }
+    }
+    let rct_passed = max_byte_run < DEFAULT_RCT_BYTE_CUTOFF && max_bit_run < DEFAULT_RCT_BIT_CUTOFF;
+
+    // 5. NIST SP 800-90B Adaptive Proportion Test (max byte frequency per <= 512 B window).
+    let win_len = n.min(DEFAULT_APT_WINDOW_BYTES);
+    let mut apt_passed = true;
+    let check_apt_window = |window: &[u8]| {
+        let mut counts = [0usize; 256];
+        let mut max_count = 0usize;
+        for &b in window {
+            let c = counts[b as usize] + 1;
+            counts[b as usize] = c;
+            if c > max_count {
+                max_count = c;
+            }
+        }
+        let cutoff = ((window.len() as f64 / 256.0) + 14.0).ceil() as usize;
+        max_count < cutoff
+    };
+    let mut offset = 0usize;
+    while offset + win_len <= n {
+        if !check_apt_window(&sample[offset..offset + win_len]) {
+            apt_passed = false;
+            break;
+        }
+        offset += win_len;
+    }
+    if apt_passed && offset < n {
+        // Also cover the trailing window of length `win_len` anchored at the end.
+        if !check_apt_window(&sample[n - win_len..]) {
+            apt_passed = false;
+        }
+    }
+
+    // Enforce extended v2.0 thresholds (in priority order with clear diagnostic reasons).
+    if !rct_passed {
+        return Err(PopError::EntropyAuditFailed {
+            reason: format!(
+                "NIST SP 800-90B RCT failed: max_byte_run={max_byte_run} (limit < {DEFAULT_RCT_BYTE_CUTOFF}), max_bit_run={max_bit_run} (limit < {DEFAULT_RCT_BIT_CUTOFF})"
+            ),
+            stats: Some(base),
+        });
+    }
+
+    if !apt_passed {
+        return Err(PopError::EntropyAuditFailed {
+            reason: "NIST SP 800-90B APT failed: localized byte proportion exceeded threshold"
+                .into(),
+            stats: Some(base),
+        });
+    }
+
+    let max_autocorr_z = policy.max_monobit_z_score.max(DEFAULT_MAX_LAG8_AUTOCORR_Z);
+    if !max_lag8_autocorr_z.is_finite() || max_lag8_autocorr_z > max_autocorr_z {
+        return Err(PopError::EntropyAuditFailed {
+            reason: format!(
+                "lag-1..8 autocorrelation test failed: max_z={max_lag8_autocorr_z:.2} > {max_autocorr_z:.2}"
+            ),
+            stats: Some(base),
+        });
+    }
+
+    let max_chi_sq = if n >= 256 {
+        DEFAULT_MAX_CHI_SQUARE_255
+    } else {
+        DEFAULT_MAX_CHI_SQUARE_255 + (256 - n) as f64 * 2.0
+    };
+    if !chi_square_255.is_finite() || chi_square_255 > max_chi_sq {
+        return Err(PopError::EntropyAuditFailed {
+            reason: format!(
+                "byte chi-square test failed (biased bytes): chi2={chi_square_255:.2} > {max_chi_sq:.2}"
+            ),
+            stats: Some(base),
+        });
+    }
+    if n >= 128 && chi_square_255 < DEFAULT_MIN_CHI_SQUARE_255 {
+        return Err(PopError::EntropyAuditFailed {
+            reason: format!(
+                "byte chi-square test failed (unnaturally flat / deterministic permutation): chi2={chi_square_255:.2} < {DEFAULT_MIN_CHI_SQUARE_255:.2}"
+            ),
+            stats: Some(base),
+        });
+    }
+
+    let bigram_draws = n.saturating_sub(1);
+    let expected_bigrams = 65_536.0 * (1.0 - (-(bigram_draws as f64) / 65_536.0).exp());
+    let min_bigrams = (expected_bigrams * 0.85).floor() as usize;
+    if distinct_16bit_bigrams < min_bigrams {
+        return Err(PopError::EntropyAuditFailed {
+            reason: format!(
+                "16-bit bigram diversity failed (short-period/low-state generator): observed={distinct_16bit_bigrams} < minimum={min_bigrams}"
+            ),
+            stats: Some(base),
+        });
+    }
+
+    Ok(ExtendedEntropyAuditStats {
+        base,
+        chi_square_255,
+        max_lag8_autocorr_z,
+        distinct_16bit_bigrams,
+        rct_passed,
+        apt_passed,
+    })
+}
+
+/// PoP v2.0 transport provenance class attested for a mined OTP pad batch.
+///
+/// Mainnet reward weight is scaled in basis points (`0..=10_000`) according to physical/IT
+/// transport security. [`PopTransportProvenance::SimulatedDevnet`] always carries weight `0`
+/// and is rejected on mainnet (`allow_simulated = false`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PopTransportProvenance {
+    /// Tier 1: Physical ETSI GS QKD 014 optical link (100% weight = 10,000 bps).
+    Tier1EtsiQkd,
+    /// Tier 2: Multi-path `(t, m)` Shamir split-pad over disjoint ASNs/providers (75% = 7,500 bps).
+    Tier2MultiPath,
+    /// Tier 3: Vadhan Sample-then-Extract Bounded-Storage Model expander (65% = 6,500 bps).
+    Tier3Bsm,
+    /// Tier 4: Offline split-courier XOR vault replenishment (50% = 5,000 bps).
+    Tier4CourierVault,
+    /// Local simulated QKD/devnet transport (0% weight = 0 bps; forbidden on mainnet).
+    SimulatedDevnet,
+}
+
+impl PopTransportProvenance {
+    /// Return the mainnet Proof-of-Pad reward weight in basis points (`10_000` = 100%).
+    #[inline]
+    pub const fn weight_bps(&self) -> u32 {
+        match self {
+            Self::Tier1EtsiQkd => 10_000,
+            Self::Tier2MultiPath => 7_500,
+            Self::Tier3Bsm => 6_500,
+            Self::Tier4CourierVault => 5_000,
+            Self::SimulatedDevnet => 0,
+        }
+    }
+
+    /// Enforce mainnet transport provenance policy and return the verified reward weight in bps.
+    ///
+    /// Rejects [`PopTransportProvenance::SimulatedDevnet`] with
+    /// [`PopError::SimulatedProvenanceForbidden`] whenever `allow_simulated == false`.
+    #[inline]
+    pub fn verify_mainnet_provenance(&self, allow_simulated: bool) -> Result<u32, PopError> {
+        if *self == Self::SimulatedDevnet && !allow_simulated {
+            return Err(PopError::SimulatedProvenanceForbidden);
+        }
+        Ok(self.weight_bps())
+    }
+}
+
+impl fmt::Display for PopTransportProvenance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tier1EtsiQkd => write!(f, "Tier1-ETSI-QKD (10000 bps)"),
+            Self::Tier2MultiPath => write!(f, "Tier2-MultiPath-Shamir (7500 bps)"),
+            Self::Tier3Bsm => write!(f, "Tier3-BSM-Expander (6500 bps)"),
+            Self::Tier4CourierVault => write!(f, "Tier4-Offline-Courier (5000 bps)"),
+            Self::SimulatedDevnet => write!(f, "Simulated-Devnet (0 bps)"),
+        }
+    }
 }
 
 // ============================================================================
@@ -1097,6 +1413,7 @@ const POP_DOMAIN_DERANGEMENT: u128 = 0x504F_505F_4445_5241_4E47_454D_0001;
 const POP_DOMAIN_CHALLENGE_R: u128 = 0x504F_505F_4348_414C_5F52_0000_0002;
 const POP_DOMAIN_PAD_SLOTS: u128 = 0x504F_505F_5041_445F_534C_4F54_0003;
 const POP_DOMAIN_BEAVER_SLOT: u128 = 0x504F_505F_4245_4156_4552_0000_0004;
+const POP_DOMAIN_FRESHNESS_SALT: u128 = 0x504F_505F_4652_4553_485F_5341_4C54_0005;
 
 // Distinct non-zero field mixing constants (< PRIME_P) for bijective polynomial permutation.
 const POP_MIX_K1: u128 = 0x61C8_8646_80B5_83EB_4F2D_7A91_35E7_2B19;
@@ -1212,6 +1529,96 @@ fn beacon_derive_pad_slots(
 fn beacon_derive_beaver_slot(beacon_gamma: u128, validator_id: ValidatorId, epoch: u64) -> usize {
     let domain = add_mod(POP_DOMAIN_BEAVER_SLOT, reduce(epoch as u128));
     beacon_mix_field_elem(beacon_gamma, domain, validator_id, 0) as usize
+}
+
+/// Volatile wipe for temporary `u64` buffers holding raw pad words or Toeplitz seeds.
+#[inline]
+fn zeroize_u64_slice(buf: &mut [u64]) {
+    for w in buf.iter_mut() {
+        // SAFETY: `w` is a valid mutable reference to an initialized `u64`.
+        unsafe { std::ptr::write_volatile(w, 0u64) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Bind a raw OTP pad page to the post-beacon epoch randomness `beacon_gamma` and live
+/// counterparty `peer_salt` using pure `F_(2^127 - 1)` bijective field mixing and SIMD
+/// 2-universal Toeplitz hashing (`crate::turbo_crypto::toeplitz_hash_turbo`).
+///
+/// Security properties (zero computational crypto):
+/// - **Defeats pad warehouses**: precomputed offline pad batches cannot predict `beacon_gamma`
+///   or `peer_salt`, so their salted page commitments cannot be precomputed ahead of the epoch.
+/// - **GF(2)-linear zero preservation**: an all-zero `raw_page` maps strictly to all-zero output
+///   (`T * 0 = 0`), preventing a miner from synthesizing pseudo-random entropy out of blank input.
+/// - **Deterministic bilateral agreement**: both provider and counterparty independently compute
+///   the exact same salted page from `(raw_page, beacon_gamma, peer_salt)`.
+pub fn derive_salted_pad_page(
+    raw_page: &[u8],
+    beacon_gamma: u128,
+    peer_salt: u128,
+) -> Result<Vec<u8>, PopError> {
+    if raw_page.is_empty() {
+        return Err(PopError::InvalidParameter("raw_page must not be empty"));
+    }
+    validate_beacon_gamma(beacon_gamma)?;
+    if peer_salt == 0 || peer_salt >= PRIME_P {
+        return Err(PopError::InvalidParameter(
+            "peer_salt must satisfy 0 < peer_salt < PRIME_P",
+        ));
+    }
+
+    let raw_bits = raw_page
+        .len()
+        .checked_mul(8)
+        .ok_or(PopError::InvalidParameter("raw_page bit count overflow"))?;
+    let raw_word_count = raw_bits.div_ceil(64);
+    let seed_word_count = toeplitz_seed_words_turbo(raw_bits, raw_bits);
+
+    // Pack raw_page into little-endian u64 words.
+    let mut raw_words = vec![0u64; raw_word_count];
+    for (i, chunk) in raw_page.chunks(8).enumerate() {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        raw_words[i] = u64::from_le_bytes(buf);
+        zeroize_slice(&mut buf);
+    }
+
+    // Deterministically derive a uniform Toeplitz seed over F_(2^127 - 1) bound to both
+    // `beacon_gamma` and `peer_salt` (two 64-bit chunks / folded bijective x^5 steps per word).
+    let salt_lo = peer_salt as u64;
+    let salt_hi = (peer_salt >> 64) as u64;
+    let bound_domain = add_mod(
+        POP_DOMAIN_FRESHNESS_SALT,
+        mul_mod(peer_salt, POP_MIX_K3),
+    );
+    let mut seed_words = Vec::with_capacity(seed_word_count);
+    for idx in 0..seed_word_count {
+        let mixed = beacon_mix_field_elem(
+            beacon_gamma,
+            add_mod(bound_domain, reduce(salt_hi as u128)),
+            salt_lo ^ ((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            idx as u64,
+        );
+        // Fold upper 63 bits with lower 64 bits so every bit of the field element participates.
+        let word = (mixed as u64) ^ ((mixed >> 63) as u64).rotate_left(17);
+        seed_words.push(word);
+    }
+
+    let mut out_words = toeplitz_hash_turbo(&raw_words, raw_bits, &seed_words, raw_bits);
+
+    let mut salted = Vec::with_capacity(raw_page.len());
+    for (i, &w) in out_words.iter().enumerate() {
+        let bytes = w.to_le_bytes();
+        let remaining = raw_page.len().saturating_sub(i * 8);
+        let take = remaining.min(8);
+        salted.extend_from_slice(&bytes[..take]);
+    }
+
+    zeroize_u64_slice(&mut raw_words);
+    zeroize_u64_slice(&mut seed_words);
+    zeroize_u64_slice(&mut out_words);
+
+    Ok(salted)
 }
 
 /// Deterministically derive a **fixed-point-free bijective counterparty derangement**
@@ -3988,5 +4395,186 @@ mod tests {
         assert!(clock.needs_pss_refresh());
         clock.complete_pss_refresh().unwrap();
         assert_eq!(clock.pipeline_stage(), EpochPipelineStage::Idle);
+    }
+
+    #[test]
+    fn test_v2_extended_entropy_audit_catches_lcg_periodic_biased_and_repeats_while_passing_qkd_pads() {
+        let policy = PopAuditPolicy::default();
+
+        // 1. Genuine BB84 QKD / OS pad passes extended statistical audit cleanly.
+        let honest = PopMiner::mine_pad_batch(101, 4, 4).unwrap();
+        for page in &honest.pad_pages {
+            let ext = audit_pad_entropy_extended(page, &policy).unwrap();
+            assert!(ext.rct_passed);
+            assert!(ext.apt_passed);
+            assert!(ext.chi_square_255 >= DEFAULT_MIN_CHI_SQUARE_255);
+            assert!(ext.chi_square_255 <= DEFAULT_MAX_CHI_SQUARE_255);
+            assert!(ext.max_lag8_autocorr_z <= DEFAULT_MAX_LAG8_AUTOCORR_Z);
+            assert!(ext.distinct_16bit_bigrams >= 216);
+        }
+
+        // 2. Full-period 8-bit LCG (`x_{n+1} = (5*x_n + 1) mod 256`) passes monobit & uniqueness
+        //    on 256 bytes, yet is caught by extended audit (unnaturally flat chi2 == 0.0 & autocorr)!
+        let mut lcg8 = Vec::with_capacity(PAD_PAGE_BYTES);
+        let mut state8 = 13u8;
+        for _ in 0..PAD_PAGE_BYTES {
+            state8 = state8.wrapping_mul(5).wrapping_add(1);
+            lcg8.push(state8);
+        }
+        assert!(
+            audit_pad_entropy_extended(&lcg8, &policy).is_err(),
+            "8-bit LCG must be rejected by extended PoP v2.0 audit"
+        );
+
+        // 3. Low-byte 32-bit LCG (`s = 1664525*s + 1013904223`, low byte) has short bit cycles in
+        //    LSBs -> caught by lag-1..8 autocorrelation (lag 64 bits ~ 16 sigma)!
+        let mut lcg32 = Vec::with_capacity(512);
+        let mut s32 = 0x1234_5678u32;
+        for _ in 0..512 {
+            s32 = s32.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            lcg32.push((s32 & 0xFF) as u8);
+        }
+        let lcg32_err = audit_pad_entropy_extended(&lcg32, &policy).unwrap_err();
+        assert!(
+            matches!(lcg32_err, PopError::EntropyAuditFailed { .. }),
+            "low-byte 32-bit LCG must fail extended audit, got {lcg32_err:?}"
+        );
+
+        // 4. 2-byte periodic repeating fake (`[0x5A, 0xC3, ...]`) and 4-byte periodic fake
+        //    are rejected (lag-1..8 autocorrelation & bigram diversity).
+        let mut periodic2 = Vec::with_capacity(PAD_PAGE_BYTES);
+        for i in 0..PAD_PAGE_BYTES {
+            periodic2.push(if i % 2 == 0 { 0x5Au8 } else { 0xC3u8 });
+        }
+        assert!(audit_pad_entropy_extended(&periodic2, &policy).is_err());
+
+        // 4-byte periodic with balanced bits inside each period:
+        let seed_period = [0x3Cu8, 0xA5, 0x69, 0x96, 0xD2, 0x4B, 0x1E, 0xE1];
+        let mut periodic8 = Vec::with_capacity(PAD_PAGE_BYTES);
+        for i in 0..PAD_PAGE_BYTES {
+            periodic8.push(seed_period[i % 8]);
+        }
+        assert!(audit_pad_entropy_extended(&periodic8, &policy).is_err());
+
+        // 5. Biased byte distribution (high-entropy OS pad with 40 bytes forced to 0x42 -> fails APT & chi2).
+        let mut biased = honest.pad_pages[0].clone();
+        for i in (0..PAD_PAGE_BYTES).step_by(6) {
+            biased[i] = 0x42;
+        }
+        let biased_err = audit_pad_entropy_extended(&biased, &policy).unwrap_err();
+        assert!(matches!(biased_err, PopError::EntropyAuditFailed { .. }));
+
+        // 6. Consecutive repeated byte run (6 identical bytes -> caught by NIST SP 800-90B RCT!).
+        let mut stuck_rct = honest.pad_pages[1].clone();
+        for b in &mut stuck_rct[100..106] {
+            *b = 0x77;
+        }
+        let rct_err = audit_pad_entropy_extended(&stuck_rct, &policy).unwrap_err();
+        match rct_err {
+            PopError::EntropyAuditFailed { ref reason, .. } => {
+                assert!(
+                    reason.contains("RCT failed"),
+                    "expected RCT failure reason, got: {reason}"
+                );
+            }
+            other => panic!("expected EntropyAuditFailed (RCT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_v2_transport_provenance_weights_and_mainnet_rejection_of_simulated() {
+        assert_eq!(PopTransportProvenance::Tier1EtsiQkd.weight_bps(), 10_000);
+        assert_eq!(PopTransportProvenance::Tier2MultiPath.weight_bps(), 7_500);
+        assert_eq!(PopTransportProvenance::Tier3Bsm.weight_bps(), 6_500);
+        assert_eq!(PopTransportProvenance::Tier4CourierVault.weight_bps(), 5_000);
+        assert_eq!(PopTransportProvenance::SimulatedDevnet.weight_bps(), 0);
+
+        // Mainnet accepts Tiers 1..=4 with exact weights.
+        assert_eq!(
+            PopTransportProvenance::Tier1EtsiQkd
+                .verify_mainnet_provenance(false)
+                .unwrap(),
+            10_000
+        );
+        assert_eq!(
+            PopTransportProvenance::Tier2MultiPath
+                .verify_mainnet_provenance(false)
+                .unwrap(),
+            7_500
+        );
+        assert_eq!(
+            PopTransportProvenance::Tier3Bsm
+                .verify_mainnet_provenance(false)
+                .unwrap(),
+            6_500
+        );
+        assert_eq!(
+            PopTransportProvenance::Tier4CourierVault
+                .verify_mainnet_provenance(false)
+                .unwrap(),
+            5_000
+        );
+
+        // Mainnet MUST reject SimulatedDevnet and map it to a slashable offense!
+        let err = PopTransportProvenance::SimulatedDevnet
+            .verify_mainnet_provenance(false)
+            .unwrap_err();
+        assert_eq!(err, PopError::SimulatedProvenanceForbidden);
+        assert_eq!(
+            err.slashing_offense(),
+            Some(SlashingOffense::InconsistentMpcShare)
+        );
+
+        // Devnet flag permits SimulatedDevnet (still with 0 mainnet bps weight).
+        assert_eq!(
+            PopTransportProvenance::SimulatedDevnet
+                .verify_mainnet_provenance(true)
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_v2_post_beacon_freshness_salt_binding_defeats_pad_warehouse_precomputation() {
+        let policy = PopAuditPolicy::default();
+        let batch = PopMiner::mine_pad_batch(77, 2, 2).unwrap();
+        let raw_page = &batch.pad_pages[0];
+
+        let gamma_epoch_1 = 0x3A7B_91C4_5E2D_8F16_4C3A_7B19_E2D5_6F41u128;
+        let gamma_epoch_2 = 0x51C9_2E84_7A3B_6D1F_9E47_2A83_5C1B_8D63u128;
+        let peer_salt_a = 0x19F4_8C2E_73A1_5D6B_4E82_90C7_3B5A_1F29u128;
+        let peer_salt_b = 0x62D1_4A89_3E5F_7B12_8C40_1D93_6A7E_2B55u128;
+
+        // Invalid inputs rejected.
+        assert!(derive_salted_pad_page(&[], gamma_epoch_1, peer_salt_a).is_err());
+        assert!(derive_salted_pad_page(raw_page, 0, peer_salt_a).is_err());
+        assert!(derive_salted_pad_page(raw_page, PRIME_P, peer_salt_a).is_err());
+        assert!(derive_salted_pad_page(raw_page, gamma_epoch_1, 0).is_err());
+        assert!(derive_salted_pad_page(raw_page, gamma_epoch_1, PRIME_P).is_err());
+
+        // Deterministic agreement between provider & counterparty for identical inputs.
+        let salted_1a = derive_salted_pad_page(raw_page, gamma_epoch_1, peer_salt_a).unwrap();
+        let salted_1a_peer = derive_salted_pad_page(raw_page, gamma_epoch_1, peer_salt_a).unwrap();
+        assert_eq!(salted_1a, salted_1a_peer);
+        assert_eq!(salted_1a.len(), raw_page.len());
+        assert_ne!(salted_1a.as_slice(), raw_page.as_slice());
+
+        // Salted honest pad retains full statistical entropy under extended v2.0 audit!
+        let ext = audit_pad_entropy_extended(&salted_1a, &policy).unwrap();
+        assert!(ext.rct_passed && ext.apt_passed);
+
+        // Changing beacon_gamma OR peer_salt produces completely different salted pages
+        // (defeating precomputed pad warehouses!).
+        let salted_2a = derive_salted_pad_page(raw_page, gamma_epoch_2, peer_salt_a).unwrap();
+        let salted_1b = derive_salted_pad_page(raw_page, gamma_epoch_1, peer_salt_b).unwrap();
+        assert_ne!(salted_1a, salted_2a);
+        assert_ne!(salted_1a, salted_1b);
+        assert_ne!(salted_2a, salted_1b);
+
+        // GF(2)-linear zero-preservation: all-zero raw page MUST stay all-zero (cannot forge entropy!).
+        let zeros = vec![0u8; PAD_PAGE_BYTES];
+        let salted_zeros = derive_salted_pad_page(&zeros, gamma_epoch_1, peer_salt_a).unwrap();
+        assert_eq!(salted_zeros, zeros);
+        assert!(audit_pad_entropy_extended(&salted_zeros, &policy).is_err());
     }
 }

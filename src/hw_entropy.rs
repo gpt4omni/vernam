@@ -29,7 +29,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -1331,6 +1331,107 @@ fn validate_etsi_identifier(label: &str, value: &str) -> Result<(), HwEntropyErr
     Ok(())
 }
 
+/// Network locality policy enforced on plaintext HTTP/1.1 ETSI GS QKD 014 KME endpoints.
+///
+/// Because Vernam strictly forbids computational cryptography (including TLS, RSA, and ECDSA),
+/// plaintext HTTP KME links MUST stay on loopback or physically isolated private links unless
+/// explicitly relaxed for isolated testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Etsi014LinkPolicy {
+    /// Allow only loopback addresses (`127.0.0.0/8`, `::1`, or literal `localhost:<port>`).
+    /// This is the fail-closed default.
+    #[default]
+    LoopbackOnly,
+    /// Allow loopback, RFC 1918 private IPv4 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`),
+    /// IPv4 link-local (`169.254.0.0/16`), IPv6 unique-local (`fc00::/7`), and IPv6 link-local
+    /// (`fe80::/10`).
+    PrivateOrLoopback,
+    /// Allow any routable endpoint (intended ONLY for isolated tests or air-gapped networks).
+    AllowAnyForTesting,
+}
+
+fn is_ip_allowed_by_policy(ip: IpAddr, policy: Etsi014LinkPolicy) -> bool {
+    match policy {
+        Etsi014LinkPolicy::AllowAnyForTesting => true,
+        Etsi014LinkPolicy::LoopbackOnly => match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        },
+        Etsi014LinkPolicy::PrivateOrLoopback => match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                let seg0 = v6.segments()[0];
+                v6.is_loopback()
+                    || (seg0 & 0xfe00) == 0xfc00
+                    || (seg0 & 0xffc0) == 0xfe80
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                    })
+            }
+        },
+    }
+}
+
+fn validate_kme_addr_policy(
+    kme_addr: &str,
+    policy: Etsi014LinkPolicy,
+) -> Result<(), HwEntropyError> {
+    if policy == Etsi014LinkPolicy::AllowAnyForTesting {
+        return Ok(());
+    }
+
+    if let Ok(sock_addr) = kme_addr.parse::<SocketAddr>() {
+        if !is_ip_allowed_by_policy(sock_addr.ip(), policy) {
+            return Err(HwEntropyError::InvalidResponse(format!(
+                "ETSI 014 KME endpoint '{kme_addr}' rejected by link policy {policy:?} \
+                 (plaintext HTTP KME links cannot target public/disallowed endpoints)"
+            )));
+        }
+        return Ok(());
+    }
+
+    let (raw_host, port_str) = kme_addr.rsplit_once(':').ok_or_else(|| {
+        HwEntropyError::InvalidResponse(format!(
+            "invalid kme_addr '{kme_addr}': expected host:port"
+        ))
+    })?;
+    if port_str.parse::<u16>().is_err() || raw_host.is_empty() {
+        return Err(HwEntropyError::InvalidResponse(format!(
+            "invalid kme_addr '{kme_addr}': invalid host or port"
+        )));
+    }
+
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(raw_host);
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_ip_allowed_by_policy(ip, policy) {
+            return Err(HwEntropyError::InvalidResponse(format!(
+                "ETSI 014 KME endpoint '{kme_addr}' rejected by link policy {policy:?} \
+                 (plaintext HTTP KME links cannot target public/disallowed endpoints)"
+            )));
+        }
+        return Ok(());
+    }
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(());
+    }
+
+    if policy == Etsi014LinkPolicy::LoopbackOnly {
+        return Err(HwEntropyError::InvalidResponse(format!(
+            "ETSI 014 KME hostname '{kme_addr}' rejected by link policy LoopbackOnly \
+             (use 127.0.0.1:<port>, [::1]:<port>, or localhost:<port>)"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Configuration for [`Etsi014QkdClient`].
 #[derive(Debug, Clone)]
 pub struct Etsi014Config {
@@ -1352,6 +1453,8 @@ pub struct Etsi014Config {
     pub max_response_bytes: usize,
     /// NIST SP 800-90B continuous health gate configuration applied to every received QKD key.
     pub health_config: HealthMonitorConfig,
+    /// Network locality policy for plaintext HTTP KME links (default: [`Etsi014LinkPolicy::LoopbackOnly`]).
+    pub link_policy: Etsi014LinkPolicy,
 }
 
 impl Etsi014Config {
@@ -1371,10 +1474,17 @@ impl Etsi014Config {
             write_timeout: Duration::from_secs(5),
             max_response_bytes: MAX_ETSI_RESPONSE_BYTES,
             health_config: HealthMonitorConfig::default(),
+            link_policy: Etsi014LinkPolicy::LoopbackOnly,
         }
     }
 
-    /// Validate identifiers and timeout/size bounds.
+    /// Override the plaintext HTTP link locality policy.
+    pub fn with_link_policy(mut self, policy: Etsi014LinkPolicy) -> Self {
+        self.link_policy = policy;
+        self
+    }
+
+    /// Validate identifiers, link locality policy, and timeout/size bounds.
     pub fn validate(&self) -> Result<(), HwEntropyError> {
         if self.kme_addr.trim().is_empty()
             || self.kme_addr.contains('\r')
@@ -1384,6 +1494,7 @@ impl Etsi014Config {
                 "invalid kme_addr configuration".into(),
             ));
         }
+        validate_kme_addr_policy(&self.kme_addr, self.link_policy)?;
         if let Some(ref host) = self.host_header {
             if host.trim().is_empty() || host.contains('\r') || host.contains('\n') {
                 return Err(HwEntropyError::InvalidResponse(
@@ -1573,6 +1684,16 @@ impl Etsi014QkdClient {
         self.request_enc_keys_for_sae(&self.config.slave_sae_id, number, size_bits)
     }
 
+    /// Master-SAE coordination helper: request a single encryption key of `size_bits` bits from
+    /// the KME, returning the health-gated [`Etsi014Key`] carrying both its public `key_id()` (to
+    /// send to the Slave SAE over the classical channel) and the secret OTP key bytes.
+    pub fn request_enc_key_with_id(&self, size_bits: usize) -> Result<Etsi014Key, HwEntropyError> {
+        let mut keys = self.request_enc_keys(1, size_bits)?;
+        keys.pop().ok_or_else(|| {
+            HwEntropyError::InvalidResponse("KME returned no encryption key".into())
+        })
+    }
+
     /// Request encryption keys for an explicit `slave_sae_id`.
     pub fn request_enc_keys_for_sae(
         &self,
@@ -1609,6 +1730,24 @@ impl Etsi014QkdClient {
     /// `POST /api/v1/keys/{master_sae_id}/dec_keys`.
     pub fn request_dec_keys(&self, key_ids: &[&str]) -> Result<Vec<Etsi014Key>, HwEntropyError> {
         self.request_dec_keys_for_sae(&self.config.master_sae_id, key_ids)
+    }
+
+    /// Slave-SAE coordination helper: retrieve the matching decryption key for a single public
+    /// `key_id` received from the Master SAE via `POST /api/v1/keys/{master_sae_id}/dec_keys`.
+    pub fn request_dec_key_by_id(&self, key_id: &str) -> Result<Etsi014Key, HwEntropyError> {
+        let mut keys = self.request_dec_keys(&[key_id])?;
+        let key = keys.pop().ok_or_else(|| {
+            HwEntropyError::InvalidResponse(format!(
+                "KME returned no decryption key for key_ID '{key_id}'"
+            ))
+        })?;
+        if key.key_id() != key_id {
+            return Err(HwEntropyError::InvalidResponse(format!(
+                "KME returned mismatched key_ID '{}' (expected '{key_id}')",
+                key.key_id()
+            )));
+        }
+        Ok(key)
     }
 
     /// Retrieve decryption keys for an explicit `master_sae_id`.
@@ -1755,6 +1894,12 @@ impl Etsi014QkdClient {
         let mut stream = None;
         let mut last_err = None;
         for addr in std::iter::once(first_addr).chain(addrs) {
+            if !is_ip_allowed_by_policy(addr.ip(), self.config.link_policy) {
+                return Err(HwEntropyError::InvalidResponse(format!(
+                    "resolved ETSI 014 KME address '{addr}' rejected by link policy {:?}",
+                    self.config.link_policy
+                )));
+            }
             match TcpStream::connect_timeout(&addr, self.config.connect_timeout) {
                 Ok(s) => {
                     stream = Some(s);
@@ -2844,5 +2989,193 @@ mod tests {
             fail_buf.iter().all(|&b| b == 0),
             "XOR mixer must volatile-zeroize output buffer if either source fails"
         );
+    }
+
+    #[test]
+    fn test_etsi014_link_policy_and_master_slave_key_id_handshake() {
+        // 1. Verify Etsi014LinkPolicy::LoopbackOnly (default) rejects public IP 1.1.1.1:8443,
+        //    private IPs, and non-localhost hostnames.
+        let pub_err = Etsi014Config::new("1.1.1.1:8443", "slave-sae-01", "master-sae-01")
+            .validate()
+            .expect_err("LoopbackOnly must reject public IP 1.1.1.1:8443");
+        assert!(matches!(pub_err, HwEntropyError::InvalidResponse(_)));
+
+        let priv_err = Etsi014Config::new("10.0.0.5:8443", "slave-sae-01", "master-sae-01")
+            .validate()
+            .expect_err("LoopbackOnly must reject private IP 10.0.0.5:8443");
+        assert!(matches!(priv_err, HwEntropyError::InvalidResponse(_)));
+
+        let host_err = Etsi014Config::new("kme.example.com:8443", "slave-sae-01", "master-sae-01")
+            .validate()
+            .expect_err("LoopbackOnly must reject non-localhost hostname");
+        assert!(matches!(host_err, HwEntropyError::InvalidResponse(_)));
+
+        // Loopback addresses are accepted under LoopbackOnly.
+        assert!(
+            Etsi014Config::new("127.0.0.1:8443", "slave-sae-01", "master-sae-01")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Etsi014Config::new("[::1]:8443", "slave-sae-01", "master-sae-01")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Etsi014Config::new("localhost:8443", "slave-sae-01", "master-sae-01")
+                .validate()
+                .is_ok()
+        );
+
+        // PrivateOrLoopback accepts RFC 1918 / ULA / link-local, still rejects 1.1.1.1:8443.
+        assert!(
+            Etsi014Config::new("10.0.0.5:8443", "slave-sae-01", "master-sae-01")
+                .with_link_policy(Etsi014LinkPolicy::PrivateOrLoopback)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Etsi014Config::new("[fc00::1]:8443", "slave-sae-01", "master-sae-01")
+                .with_link_policy(Etsi014LinkPolicy::PrivateOrLoopback)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Etsi014Config::new("1.1.1.1:8443", "slave-sae-01", "master-sae-01")
+                .with_link_policy(Etsi014LinkPolicy::PrivateOrLoopback)
+                .validate()
+                .is_err()
+        );
+
+        // AllowAnyForTesting allows any endpoint in validate().
+        assert!(
+            Etsi014Config::new("1.1.1.1:8443", "slave-sae-01", "master-sae-01")
+                .with_link_policy(Etsi014LinkPolicy::AllowAnyForTesting)
+                .validate()
+                .is_ok()
+        );
+
+        // 2. Full Master enc_key -> transmit public key_id -> Slave dec_key handshake over live
+        //    local mock KME TCP server.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock KME TCP listener");
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let key_store: Arc<Mutex<HashMap<String, Vec<u8>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let store_srv = Arc::clone(&key_store);
+
+        let server = thread::spawn(move || {
+            let mut os = OsEntropySource::new();
+            for seq in 0..2u64 {
+                let (mut stream, _) = listener.accept().expect("accept KME client");
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut req_body = vec![0u8; content_len];
+                if content_len > 0 {
+                    reader.read_exact(&mut req_body).unwrap();
+                }
+
+                let (status_line, resp_body) = if method == "GET"
+                    && target == "/api/v1/keys/bob-slave-sae/enc_keys?number=1&size=256"
+                {
+                    let key_id = format!("etsi-handshake-key-{seq:04}");
+                    let mut raw = vec![0u8; 32];
+                    os.fill_random(&mut raw).unwrap();
+                    let b64 = encode_base64(&raw);
+                    store_srv.lock().unwrap().insert(key_id.clone(), raw);
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!("{{\"keys\":[{{\"key_ID\":\"{key_id}\",\"key\":\"{b64}\"}}]}}"),
+                    )
+                } else if method == "POST" && target == "/api/v1/keys/alice-master-sae/dec_keys" {
+                    let parsed = JsonParser::parse(std::str::from_utf8(&req_body).unwrap()).unwrap();
+                    let id = parsed
+                        .get("key_IDs")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()[0]
+                        .get("key_ID")
+                        .unwrap()
+                        .as_str()
+                        .unwrap();
+                    let guard = store_srv.lock().unwrap();
+                    if let Some(raw) = guard.get(id) {
+                        let b64 = encode_base64(raw);
+                        (
+                            "HTTP/1.1 200 OK",
+                            format!("{{\"keys\":[{{\"key_ID\":\"{id}\",\"key\":\"{b64}\"}}]}}"),
+                        )
+                    } else {
+                        ("HTTP/1.1 404 Not Found", "unknown key_ID".to_string())
+                    }
+                } else {
+                    (
+                        "HTTP/1.1 400 Bad Request",
+                        format!("unexpected request: {method} {target}"),
+                    )
+                };
+
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        // Master SAE (Alice) requests an encryption key + public key_ID for Slave SAE (Bob).
+        let alice_master =
+            Etsi014QkdClient::new(&addr, "bob-slave-sae", "alice-master-sae").unwrap();
+        let enc_key = alice_master
+            .request_enc_key_with_id(256)
+            .expect("master request_enc_key_with_id must succeed");
+        assert_eq!(enc_key.len(), 32);
+
+        // Public classical transmission of `key_id` + OTP-encrypted payload from Alice to Bob.
+        let public_key_id = enc_key.key_id().to_string();
+        let plaintext = b"VERNAM-ETSI014-OTP-HANDSHAKE-32B";
+        assert_eq!(plaintext.len(), 32);
+        let ciphertext: Vec<u8> = plaintext
+            .iter()
+            .zip(enc_key.as_bytes().iter())
+            .map(|(&p, &k)| p ^ k)
+            .collect();
+
+        // Slave SAE (Bob) resolves the identical OTP key via the public key_ID.
+        let bob_slave = Etsi014QkdClient::new(&addr, "bob-slave-sae", "alice-master-sae").unwrap();
+        let dec_key = bob_slave
+            .request_dec_key_by_id(&public_key_id)
+            .expect("slave request_dec_key_by_id must succeed");
+        assert_eq!(dec_key.key_id(), public_key_id);
+        assert_eq!(dec_key.as_bytes(), enc_key.as_bytes());
+
+        let recovered: Vec<u8> = ciphertext
+            .iter()
+            .zip(dec_key.as_bytes().iter())
+            .map(|(&c, &k)| c ^ k)
+            .collect();
+        assert_eq!(recovered.as_slice(), plaintext);
+
+        server.join().expect("mock KME server thread exited cleanly");
     }
 }

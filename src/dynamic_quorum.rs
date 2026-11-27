@@ -139,6 +139,13 @@ pub enum DynamicQuorumError {
     },
     /// Non-canonical field element (`>= PRIME_P`) injected into a share, secret, or envelope.
     NonCanonicalFieldElement(u128),
+    /// Committee 4D diversity policy violated (OS, CPU ISA, compiler lineage, ASN, or geo cell).
+    DiversityPolicyViolation {
+        dimension: &'static str,
+        value: u32,
+        count: usize,
+        max_allowed: usize,
+    },
 }
 
 impl fmt::Display for DynamicQuorumError {
@@ -225,6 +232,15 @@ impl fmt::Display for DynamicQuorumError {
             Self::NonCanonicalFieldElement(val) => {
                 write!(f, "non-canonical field element {val} (>= PRIME_P)")
             }
+            Self::DiversityPolicyViolation {
+                dimension,
+                value,
+                count,
+                max_allowed,
+            } => write!(
+                f,
+                "4D diversity policy violated on {dimension}={value}: count {count} exceeds max allowed {max_allowed}"
+            ),
         }
     }
 }
@@ -1558,6 +1574,369 @@ pub const fn max_churn_per_epoch(bft: BftParams) -> usize {
         bft.max_faults
     } else {
         1
+    }
+}
+
+// ============================================================================
+// 2b. 4D Diversity Matrix, Slow Churn, Probation & Demand-Scaled Core Bond
+// ============================================================================
+
+/// Reference OS kernel family tags for [`QuorumDiversityProfile::os_family`].
+pub const OS_FAMILY_LINUX: u8 = 1;
+pub const OS_FAMILY_FREEBSD: u8 = 2;
+pub const OS_FAMILY_OPENBSD: u8 = 3;
+pub const OS_FAMILY_MACOS: u8 = 4;
+
+/// Reference CPU ISA tags for [`QuorumDiversityProfile::cpu_isa`].
+pub const CPU_ISA_X86_64: u8 = 1;
+pub const CPU_ISA_AARCH64: u8 = 2;
+pub const CPU_ISA_RISCV64: u8 = 3;
+pub const CPU_ISA_POWERPC64: u8 = 4;
+
+/// Reference compiler lineage tags for [`QuorumDiversityProfile::compiler_lineage`].
+pub const COMPILER_RUSTC_LLVM: u8 = 1;
+pub const COMPILER_RUSTC_CRANELIFT: u8 = 2;
+pub const COMPILER_GCCRS: u8 = 3;
+pub const COMPILER_MRUSTC: u8 = 4;
+
+/// Default target share of circulating supply bonded across Core seats (`2,000 bps = 20%`).
+pub const DEFAULT_TARGET_BONDED_BPS: u16 = 2_000;
+
+/// Basis-point denominator (`10,000 bps = 100%`).
+pub const CORE_BOND_BPS_DENOMINATOR: u16 = 10_000;
+
+/// Default minimum flat bond floor per Core seat (`10,000 VRNM` in `vern`, `1 VRNM = 10^8 vern`).
+pub const DEFAULT_MIN_CORE_BOND: u64 = 10_000 * 100_000_000;
+
+/// Default Outer Pool probation duration required before Core seat eligibility (`30` epochs).
+pub const DEFAULT_OUTER_POOL_PROBATION_EPOCHS: u64 = 30;
+
+/// Default Core unbonding lockup duration after exiting the Core committee (`60` epochs).
+pub const DEFAULT_UNBONDING_EPOCHS: u64 = 60;
+
+/// Default sliding window duration for slow-churn Core seat rotations (`30` epochs).
+pub const DEFAULT_CORE_ROTATION_WINDOW_EPOCHS: u64 = 30;
+
+/// 4D hardware/software/network/geographic diversity profile of a committee validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuorumDiversityProfile {
+    pub os_family: u8,
+    pub cpu_isa: u8,
+    pub compiler_lineage: u8,
+    pub asn: u32,
+    pub geo_cell_id: u16,
+}
+
+/// 4D diversity enforcement policy for a Core BFT committee.
+///
+/// Defaults strictly enforce that:
+/// - NO single OS kernel family exceeds `f` seats (`<= bft_params.max_faults < t`),
+/// - NO single CPU ISA exceeds `f` seats (`<= bft_params.max_faults < t`),
+/// - NO single compiler lineage exceeds `f` seats (`<= bft_params.max_faults < t`),
+/// - At most `1` validator per Autonomous System Number (`ASN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuorumDiversityPolicy {
+    /// Maximum seats per OS kernel family (`None` => `bft_params.max_faults`).
+    pub max_per_os_family: Option<usize>,
+    /// Maximum seats per CPU ISA (`None` => `bft_params.max_faults`).
+    pub max_per_cpu_isa: Option<usize>,
+    /// Maximum seats per compiler lineage (`None` => `bft_params.max_faults`).
+    pub max_per_compiler_lineage: Option<usize>,
+    /// Maximum seats per BGP Autonomous System Number (default `1`).
+    pub max_per_asn: usize,
+    /// Optional cap on seats sharing a single geographic Voronoi cell (`None` => uncapped).
+    pub max_per_geo_cell: Option<usize>,
+}
+
+impl Default for QuorumDiversityPolicy {
+    fn default() -> Self {
+        Self {
+            max_per_os_family: None,
+            max_per_cpu_isa: None,
+            max_per_compiler_lineage: None,
+            max_per_asn: 1,
+            max_per_geo_cell: None,
+        }
+    }
+}
+
+impl QuorumDiversityPolicy {
+    /// Construct a policy that also caps validators per geographic Voronoi cell to `max_per_geo_cell`.
+    pub const fn with_geo_cell_cap(max_per_geo_cell: usize) -> Self {
+        Self {
+            max_per_os_family: None,
+            max_per_cpu_isa: None,
+            max_per_compiler_lineage: None,
+            max_per_asn: 1,
+            max_per_geo_cell: Some(max_per_geo_cell),
+        }
+    }
+
+    /// Validate that `profiles` satisfy all 4D diversity constraints for `bft_params`.
+    pub fn validate(
+        &self,
+        profiles: &[QuorumDiversityProfile],
+        bft_params: BftParams,
+    ) -> Result<(), DynamicQuorumError> {
+        let expected_bft = compute_bft_params(bft_params.committee_size)?;
+        if bft_params != expected_bft {
+            return Err(DynamicQuorumError::InvalidThreshold {
+                threshold: bft_params.threshold,
+                committee_size: bft_params.committee_size,
+            });
+        }
+        if profiles.len() != bft_params.committee_size {
+            return Err(DynamicQuorumError::InvalidCommitteeSize {
+                size: profiles.len(),
+                min_required: bft_params.committee_size,
+            });
+        }
+        if self.max_per_asn == 0 {
+            return Err(DynamicQuorumError::InvalidConfig("max_per_asn must be >= 1"));
+        }
+
+        // Cap software/hardware monoculture strictly at <= f (never >= t).
+        let max_os = self
+            .max_per_os_family
+            .unwrap_or(bft_params.max_faults)
+            .min(bft_params.max_faults);
+        let max_isa = self
+            .max_per_cpu_isa
+            .unwrap_or(bft_params.max_faults)
+            .min(bft_params.max_faults);
+        let max_compiler = self
+            .max_per_compiler_lineage
+            .unwrap_or(bft_params.max_faults)
+            .min(bft_params.max_faults);
+
+        let mut os_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        let mut isa_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        let mut compiler_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        let mut asn_counts: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut geo_counts: BTreeMap<u16, usize> = BTreeMap::new();
+
+        for p in profiles {
+            let os_c = os_counts.entry(p.os_family).or_insert(0);
+            *os_c += 1;
+            if *os_c > max_os {
+                return Err(DynamicQuorumError::DiversityPolicyViolation {
+                    dimension: "os_family",
+                    value: p.os_family as u32,
+                    count: *os_c,
+                    max_allowed: max_os,
+                });
+            }
+
+            let isa_c = isa_counts.entry(p.cpu_isa).or_insert(0);
+            *isa_c += 1;
+            if *isa_c > max_isa {
+                return Err(DynamicQuorumError::DiversityPolicyViolation {
+                    dimension: "cpu_isa",
+                    value: p.cpu_isa as u32,
+                    count: *isa_c,
+                    max_allowed: max_isa,
+                });
+            }
+
+            let comp_c = compiler_counts.entry(p.compiler_lineage).or_insert(0);
+            *comp_c += 1;
+            if *comp_c > max_compiler {
+                return Err(DynamicQuorumError::DiversityPolicyViolation {
+                    dimension: "compiler_lineage",
+                    value: p.compiler_lineage as u32,
+                    count: *comp_c,
+                    max_allowed: max_compiler,
+                });
+            }
+
+            let asn_c = asn_counts.entry(p.asn).or_insert(0);
+            *asn_c += 1;
+            if *asn_c > self.max_per_asn {
+                return Err(DynamicQuorumError::DiversityPolicyViolation {
+                    dimension: "asn",
+                    value: p.asn,
+                    count: *asn_c,
+                    max_allowed: self.max_per_asn,
+                });
+            }
+
+            if let Some(max_geo) = self.max_per_geo_cell {
+                let geo_c = geo_counts.entry(p.geo_cell_id).or_insert(0);
+                *geo_c += 1;
+                if *geo_c > max_geo {
+                    return Err(DynamicQuorumError::DiversityPolicyViolation {
+                        dimension: "geo_cell_id",
+                        value: p.geo_cell_id as u32,
+                        count: *geo_c,
+                        max_allowed: max_geo,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Validate a committee's 4D diversity profiles against the default strict [`QuorumDiversityPolicy`]:
+/// no OS kernel family, CPU ISA, or compiler lineage may exceed `bft_params.max_faults` (`< t`),
+/// and at most `1` validator may reside in any single ASN.
+pub fn validate_committee_diversity(
+    profiles: &[QuorumDiversityProfile],
+    bft_params: BftParams,
+) -> Result<(), DynamicQuorumError> {
+    QuorumDiversityPolicy::default().validate(profiles, bft_params)
+}
+
+/// Slow-churn Core committee rotation cap per rotation window (`bft.max_faults.max(1)`),
+/// ensuring that within any probation/unbonding window strictly fewer than 1/3 of Core seats
+/// can rotate.
+#[inline]
+pub const fn max_core_rotations_per_window(bft: BftParams) -> usize {
+    if bft.max_faults >= 1 {
+        bft.max_faults
+    } else {
+        1
+    }
+}
+
+/// Economic & slow-churn lifecycle policy for Core committee seats:
+/// - Demand-scaled flat equal Core bond targeting `20%` (`2,000 bps`) of circulating supply,
+/// - `30`-epoch Outer Pool probation prior to Core eligibility,
+/// - `60`-epoch unbonding lockup after Core exit,
+/// - Slow-churn rotation ceiling (`max_core_rotations_per_window`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreBondPolicy {
+    /// Target fraction of circulating supply locked across all Core seats, in bps (`2_000` = 20%).
+    pub target_bonded_bps: u16,
+    /// Minimum flat bond floor per Core seat (in `vern`).
+    pub min_bond_per_seat: u64,
+    /// Optional upper cap on the flat bond per Core seat (in `vern`).
+    pub max_bond_per_seat: Option<u64>,
+    /// Mandatory Outer Pool probation period before Core admission (default `30` epochs).
+    pub outer_pool_probation_epochs: u64,
+    /// Mandatory unbonding lockup after Core exit before withdrawal (default `60` epochs).
+    pub unbonding_epochs: u64,
+    /// Sliding window length in epochs for slow-churn rotation caps (default `30` epochs).
+    pub rotation_window_epochs: u64,
+}
+
+impl Default for CoreBondPolicy {
+    fn default() -> Self {
+        Self {
+            target_bonded_bps: DEFAULT_TARGET_BONDED_BPS,
+            min_bond_per_seat: DEFAULT_MIN_CORE_BOND,
+            max_bond_per_seat: None,
+            outer_pool_probation_epochs: DEFAULT_OUTER_POOL_PROBATION_EPOCHS,
+            unbonding_epochs: DEFAULT_UNBONDING_EPOCHS,
+            rotation_window_epochs: DEFAULT_CORE_ROTATION_WINDOW_EPOCHS,
+        }
+    }
+}
+
+impl CoreBondPolicy {
+    /// Validate policy parameters.
+    pub fn validate(&self) -> Result<(), DynamicQuorumError> {
+        if self.target_bonded_bps == 0 || self.target_bonded_bps > CORE_BOND_BPS_DENOMINATOR {
+            return Err(DynamicQuorumError::InvalidConfig(
+                "target_bonded_bps must be in 1..=10_000",
+            ));
+        }
+        if let Some(cap) = self.max_bond_per_seat {
+            if cap < self.min_bond_per_seat {
+                return Err(DynamicQuorumError::InvalidConfig(
+                    "max_bond_per_seat must be >= min_bond_per_seat",
+                ));
+            }
+        }
+        if self.outer_pool_probation_epochs == 0 {
+            return Err(DynamicQuorumError::InvalidConfig(
+                "outer_pool_probation_epochs must be >= 1",
+            ));
+        }
+        if self.unbonding_epochs < self.outer_pool_probation_epochs {
+            return Err(DynamicQuorumError::InvalidConfig(
+                "unbonding_epochs must be >= outer_pool_probation_epochs",
+            ));
+        }
+        if self.rotation_window_epochs == 0 {
+            return Err(DynamicQuorumError::InvalidConfig(
+                "rotation_window_epochs must be >= 1",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compute the base flat equal bond per Core seat targeting `target_bonded_bps` (default 20%)
+    /// of `circulating_supply` divided evenly across `active_core_seats` (1 seat = 1 vote).
+    pub fn required_flat_bond(
+        &self,
+        circulating_supply: u64,
+        active_core_seats: usize,
+    ) -> Result<u64, DynamicQuorumError> {
+        self.validate()?;
+        if active_core_seats < MIN_BFT_COMMITTEE_SIZE {
+            return Err(DynamicQuorumError::InvalidCommitteeSize {
+                size: active_core_seats,
+                min_required: MIN_BFT_COMMITTEE_SIZE,
+            });
+        }
+        let target_total = (circulating_supply as u128)
+            .saturating_mul(self.target_bonded_bps as u128)
+            / (CORE_BOND_BPS_DENOMINATOR as u128);
+        let raw_per_seat = (target_total / (active_core_seats as u128)).min(u64::MAX as u128) as u64;
+        let mut bond = raw_per_seat.max(self.min_bond_per_seat);
+        if let Some(cap) = self.max_bond_per_seat {
+            bond = bond.min(cap);
+        }
+        Ok(bond)
+    }
+
+    /// Compute the demand-scaled flat Core bond per seat.
+    ///
+    /// Starts from the 20%-circulating-supply base flat bond and scales proportionally when
+    /// `queued_candidates > 0` by `(active_core_seats + queued_candidates) / active_core_seats`
+    /// (clamped to `max_bond_per_seat` and `circulating_supply / active_core_seats`) so sybil
+    /// queue floods automatically increase the equal flat bond without introducing stake weights.
+    pub fn demand_scaled_bond(
+        &self,
+        circulating_supply: u64,
+        active_core_seats: usize,
+        queued_candidates: usize,
+    ) -> Result<u64, DynamicQuorumError> {
+        let base = self.required_flat_bond(circulating_supply, active_core_seats)?;
+        if queued_candidates == 0 {
+            return Ok(base);
+        }
+        let seats = active_core_seats as u128;
+        let demand_num = seats.saturating_add(queued_candidates as u128);
+        let scaled = ((base as u128).saturating_mul(demand_num) / seats).min(u64::MAX as u128) as u64;
+        let supply_per_seat_cap = (circulating_supply as u128 / seats).min(u64::MAX as u128) as u64;
+        let mut bond = scaled.min(supply_per_seat_cap.max(base));
+        if let Some(cap) = self.max_bond_per_seat {
+            bond = bond.min(cap);
+        }
+        Ok(bond)
+    }
+
+    /// Returns `true` iff a candidate that joined the Outer Pool at `joined_outer_epoch`
+    /// has completed the mandatory `outer_pool_probation_epochs` (default 30 epochs).
+    #[inline]
+    pub const fn is_probation_complete(&self, joined_outer_epoch: u64, current_epoch: u64) -> bool {
+        current_epoch.saturating_sub(joined_outer_epoch) >= self.outer_pool_probation_epochs
+    }
+
+    /// Returns `true` iff a validator that exited Core at `exited_core_epoch`
+    /// has completed the mandatory `unbonding_epochs` lockup (default 60 epochs).
+    #[inline]
+    pub const fn is_unbonding_complete(&self, exited_core_epoch: u64, current_epoch: u64) -> bool {
+        current_epoch.saturating_sub(exited_core_epoch) >= self.unbonding_epochs
+    }
+
+    /// Slow-churn maximum Core seat rotations permitted within `rotation_window_epochs`.
+    #[inline]
+    pub const fn max_core_rotations_per_window(&self, bft: BftParams) -> usize {
+        max_core_rotations_per_window(bft)
     }
 }
 
@@ -3528,5 +3907,151 @@ mod tests {
             PrunedCheckpointLedger::new(10, 1, vec![1, 2, 3, 4], bad_bal),
             Err(DynamicQuorumError::NonCanonicalFieldElement(_))
         ));
+    }
+
+    #[test]
+    fn test_4d_diversity_matrix_monoculture_rejection_and_acceptance() {
+        let bft4 = compute_bft_params(4).unwrap(); // N=4, f=1, t=3
+
+        // 1. Fully diverse 4-OS, 4-ISA, 4-compiler, 4-ASN committee -> ACCEPTED!
+        let diverse4 = vec![
+            QuorumDiversityProfile {
+                os_family: OS_FAMILY_LINUX,
+                cpu_isa: CPU_ISA_X86_64,
+                compiler_lineage: COMPILER_RUSTC_LLVM,
+                asn: 64501,
+                geo_cell_id: 10,
+            },
+            QuorumDiversityProfile {
+                os_family: OS_FAMILY_FREEBSD,
+                cpu_isa: CPU_ISA_AARCH64,
+                compiler_lineage: COMPILER_RUSTC_CRANELIFT,
+                asn: 64502,
+                geo_cell_id: 20,
+            },
+            QuorumDiversityProfile {
+                os_family: OS_FAMILY_OPENBSD,
+                cpu_isa: CPU_ISA_RISCV64,
+                compiler_lineage: COMPILER_GCCRS,
+                asn: 64503,
+                geo_cell_id: 30,
+            },
+            QuorumDiversityProfile {
+                os_family: OS_FAMILY_MACOS,
+                cpu_isa: CPU_ISA_POWERPC64,
+                compiler_lineage: COMPILER_MRUSTC,
+                asn: 64504,
+                geo_cell_id: 40,
+            },
+        ];
+        validate_committee_diversity(&diverse4, bft4)
+            .expect("diverse 4-OS/4-ISA/4-compiler/4-ASN committee must pass");
+
+        // 2. 3/4 Linux hosts on N=4, f=1 -> REJECTED!
+        let mut linux_monoculture = diverse4.clone();
+        linux_monoculture[1].os_family = OS_FAMILY_LINUX;
+        linux_monoculture[2].os_family = OS_FAMILY_LINUX;
+        assert_eq!(
+            validate_committee_diversity(&linux_monoculture, bft4),
+            Err(DynamicQuorumError::DiversityPolicyViolation {
+                dimension: "os_family",
+                value: OS_FAMILY_LINUX as u32,
+                count: 2,
+                max_allowed: 1,
+            })
+        );
+
+        // 3. Duplicate CPU ISA (> f=1) -> REJECTED!
+        let mut isa_dup = diverse4.clone();
+        isa_dup[3].cpu_isa = CPU_ISA_X86_64;
+        assert_eq!(
+            validate_committee_diversity(&isa_dup, bft4),
+            Err(DynamicQuorumError::DiversityPolicyViolation {
+                dimension: "cpu_isa",
+                value: CPU_ISA_X86_64 as u32,
+                count: 2,
+                max_allowed: 1,
+            })
+        );
+
+        // 4. Duplicate compiler lineage (> f=1) -> REJECTED!
+        let mut comp_dup = diverse4.clone();
+        comp_dup[2].compiler_lineage = COMPILER_RUSTC_LLVM;
+        assert_eq!(
+            validate_committee_diversity(&comp_dup, bft4),
+            Err(DynamicQuorumError::DiversityPolicyViolation {
+                dimension: "compiler_lineage",
+                value: COMPILER_RUSTC_LLVM as u32,
+                count: 2,
+                max_allowed: 1,
+            })
+        );
+
+        // 5. Duplicate ASN (> 1) -> REJECTED!
+        let mut asn_dup = diverse4.clone();
+        asn_dup[1].asn = 64501;
+        assert_eq!(
+            validate_committee_diversity(&asn_dup, bft4),
+            Err(DynamicQuorumError::DiversityPolicyViolation {
+                dimension: "asn",
+                value: 64501,
+                count: 2,
+                max_allowed: 1,
+            })
+        );
+
+        // 6. On N=7, f=2, t=5: up to 2 per OS/ISA/compiler is allowed, max 1 per ASN.
+        let bft7 = compute_bft_params(7).unwrap();
+        let diverse7 = vec![
+            QuorumDiversityProfile { os_family: 1, cpu_isa: 1, compiler_lineage: 1, asn: 1001, geo_cell_id: 1 },
+            QuorumDiversityProfile { os_family: 1, cpu_isa: 2, compiler_lineage: 2, asn: 1002, geo_cell_id: 2 },
+            QuorumDiversityProfile { os_family: 2, cpu_isa: 1, compiler_lineage: 3, asn: 1003, geo_cell_id: 3 },
+            QuorumDiversityProfile { os_family: 2, cpu_isa: 2, compiler_lineage: 4, asn: 1004, geo_cell_id: 4 },
+            QuorumDiversityProfile { os_family: 3, cpu_isa: 3, compiler_lineage: 1, asn: 1005, geo_cell_id: 5 },
+            QuorumDiversityProfile { os_family: 3, cpu_isa: 3, compiler_lineage: 2, asn: 1006, geo_cell_id: 6 },
+            QuorumDiversityProfile { os_family: 4, cpu_isa: 4, compiler_lineage: 3, asn: 1007, geo_cell_id: 7 },
+        ];
+        validate_committee_diversity(&diverse7, bft7)
+            .expect("diverse N=7 committee with <= 2 per OS/ISA/compiler and 1 per ASN must pass");
+    }
+
+    #[test]
+    fn test_core_bond_policy_demand_scaling_probation_unbonding_and_slow_churn() {
+        let policy = CoreBondPolicy::default();
+        assert_eq!(policy.target_bonded_bps, 2_000);
+        assert_eq!(policy.outer_pool_probation_epochs, 30);
+        assert_eq!(policy.unbonding_epochs, 60);
+
+        // Circulating supply = 10,000,000 VRNM (in vern), N = 10 Core seats.
+        // 20% target bonded = 2,000,000 VRNM total -> 200,000 VRNM flat bond per seat!
+        let vern: u64 = 100_000_000;
+        let circulating = 10_000_000 * vern;
+        let flat_bond = policy.required_flat_bond(circulating, 10).unwrap();
+        assert_eq!(flat_bond, 200_000 * vern);
+
+        // Zero queued candidates -> demand_scaled_bond equals base flat bond.
+        assert_eq!(policy.demand_scaled_bond(circulating, 10, 0).unwrap(), flat_bond);
+
+        // 10 queued candidates competing for 10 seats -> 2x demand scaling = 400,000 VRNM per seat!
+        let scaled = policy.demand_scaled_bond(circulating, 10, 10).unwrap();
+        assert_eq!(scaled, 400_000 * vern);
+
+        // Early low-supply launch respects min_bond_per_seat floor (10,000 VRNM).
+        let floor_bond = policy.required_flat_bond(50_000 * vern, 10).unwrap();
+        assert_eq!(floor_bond, DEFAULT_MIN_CORE_BOND);
+
+        // Probation (30 epochs) and unbonding (60 epochs) checks.
+        assert!(!policy.is_probation_complete(10, 39));
+        assert!(policy.is_probation_complete(10, 40));
+        assert!(!policy.is_unbonding_complete(100, 159));
+        assert!(policy.is_unbonding_complete(100, 160));
+
+        // Slow-churn rotation caps per window.
+        let p4 = compute_bft_params(4).unwrap();
+        let p7 = compute_bft_params(7).unwrap();
+        let p10 = compute_bft_params(10).unwrap();
+        assert_eq!(max_core_rotations_per_window(p4), 1);
+        assert_eq!(policy.max_core_rotations_per_window(p7), 2);
+        assert_eq!(max_core_rotations_per_window(p10), 3);
     }
 }

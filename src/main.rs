@@ -11,17 +11,27 @@ use std::time::Instant;
 use vernam_rs::bft::{BftCluster, BftConfig, BinaryTx};
 use vernam_rs::distributed_mpc::run_distributed_mpc_bench;
 use vernam_rs::dynamic_quorum::{
-    redistribute_ledger_accounts, reconstruct_secret, split_secret, verify_committee_shares,
+    CoreBondPolicy, QuorumDiversityProfile, compute_bft_params, reconstruct_secret,
+    redistribute_ledger_accounts, split_secret, validate_committee_diversity,
+    verify_committee_shares,
 };
 use vernam_rs::entropy_beacon::{AutonomousEpochClock, BeaconConfig, OtpChannelKey, VernamBeacon};
+use vernam_rs::entropy_harvester::default_commodity_extractor;
 use vernam_rs::fast_engine::run_speed_benchmarks;
 use vernam_rs::field::random_field_elem;
+use vernam_rs::geo_triangulation::{
+    DistanceProbeKey, respond_probe, verify_probe_response,
+};
 use vernam_rs::hw_entropy::{ContinuousHealthMonitor, discover_best_entropy_source};
+use vernam_rs::oblivious_shuffle::{
+    AuthenticatedLedgerState, DealerShuffleSecret, ObliviousEpochMixer, ShuffleMaskCorrelation,
+};
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
 use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
 use vernam_rs::pop_mining::{
     BeaconPairingSchedule, BilateralPopSubmission, DEFAULT_CHALLENGE_SLOT_COUNT, PeerReceiptKey,
-    PopAuditor, PopEpochCoordinator, PopMiner, PopReplayRegistry,
+    PopAuditPolicy, PopAuditor, PopEpochCoordinator, PopMiner, PopReplayRegistry,
+    audit_pad_entropy_extended,
 };
 use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
 use vernam_rs::qkd::{
@@ -34,9 +44,14 @@ use vernam_rs::tokenomics::{
 };
 use vernam_rs::turbo_crypto::run_turbo_crypto_bench;
 use vernam_rs::turbo_express::run_turbo_express_bench;
-use vernam_rs::turbo_shielded::run_turbo_shielded_bench;
+use vernam_rs::turbo_shielded::{
+    TurboBeaverBank, run_symmetric_shielded_bench, run_turbo_shielded_bench,
+};
 use vernam_rs::validator_daemon::{
     ValidatorDaemonConfig, run_standalone_daemon_cli_with_max_epochs,
+};
+use vernam_rs::vault_recovery::{
+    compute_blinded_helper_share, prepare_recovery_blinding, recover_single_share_at_x,
 };
 use vernam_rs::wallet::{DEFAULT_NODE_URL, VernamWallet, WalletRpcClient, validate_wallet_name};
 
@@ -46,7 +61,7 @@ fn fmt_vrnm(verns: u64) -> String {
 
 fn print_help() {
     println!(
-        r#"Vernam (VRNM) v1.2 — Zero-Admin, Information-Theoretically Secure OTP Coin
+        r#"Vernam (VRNM) v2.0 — Zero-Admin, Information-Theoretically Secure OTP Coin
 
 USAGE:
   vrnm [COMMAND] [OPTIONS]
@@ -54,6 +69,7 @@ USAGE:
 COMMANDS:
   demo                                  Run full 5-pillar showcase + speed benchmarks (default)
   v1-demo                               Run v1.0 zero-admin beacon, 4-daemon TCP MPC & 4->7 resharing demo
+  v2-demo                               Run v2.0 multi-source entropy, global oblivious shuffle, Herzberg recovery & geo-triangulation demo
   bench                                 Run high-throughput Express, Shielded & real-TCP TPS benchmarks
   testnet [--bind 0.0.0.0:8080] [--data-dir <path>]
                                         Start all-in-one 4-validator HTTP testnet + web explorer
@@ -860,6 +876,140 @@ fn cmd_bench() {
     println!("{report}");
 }
 
+fn cmd_v2_demo() -> Result<(), String> {
+    println!("========================================================================");
+    println!("  VERNAM (VRNM) v2.0 — FULL ANTI-ASI INFORMATION-THEORETIC SUITE");
+    println!("  Multi-Source Extractor | Global Oblivious Shuffle | Herzberg Recovery");
+    println!("========================================================================\n");
+
+    // 1. Multi-Source Physical Entropy Extractor (CPU jitter + IRQ jitter + OS defense-in-depth)
+    println!("[1/5] Hybrid Additive + Bilinear-Toeplitz Multi-Source Physical Extractor");
+    let mut extractor = default_commodity_extractor();
+    let page = extractor
+        .extract_page_256()
+        .map_err(|e| format!("multi-source extractor failed: {e}"))?;
+    let ext = audit_pad_entropy_extended(&page, &PopAuditPolicy::default())
+        .map_err(|e| format!("extended entropy audit failed: {e}"))?;
+    let snap = extractor.health_snapshot();
+    println!(
+        "  Active sources         : {} total ({} physical) | 256B page PASS",
+        snap.sources.len(),
+        snap.healthy_physical_sources
+    );
+    println!(
+        "  Extended stats         : monobit_z={:.3} runs_z={:.3} chi2={:.1} lag8_z={:.2} bigrams={}\n",
+        ext.base.monobit_z_score,
+        ext.base.runs_z_score,
+        ext.chi_square_255,
+        ext.max_lag8_autocorr_z,
+        ext.distinct_16bit_bigrams
+    );
+
+    // 2. Symmetric Blinded Sender+Recipient IT-MPC (132 openings, 67 RLC checks, 2 RTTs)
+    println!("[2/5] Symmetric Blinded Sender+Recipient IT-MPC (BeaverStar32, 2 RTTs)");
+    let sym = run_symmetric_shielded_bench();
+    println!(
+        "  Symmetric blinded TPS  : {:.0} tx/s ({} cross-bucket txs in {:.4} s; {} openings, 67 RLC checks)\n",
+        sym.symmetric_tps, sym.total_txs, sym.elapsed_secs, sym.openings_per_tx
+    );
+
+    // 3. Malicious-Secure 3-Hop Waksman-Benes Global Oblivious Shuffle (64 slots)
+    println!("[3/5] Malicious-Secure 3-Hop Waksman-Benes Global Oblivious Shuffle (N=64)");
+    let n = 64usize;
+    let init_bals: Vec<u128> = (0..n).map(|i| (i as u128 + 1) * 100).collect();
+    let mut auth_state = AuthenticatedLedgerState::new_from_plaintext(&init_bals)
+        .map_err(|e| format!("init auth state: {e}"))?;
+    let dealers: Vec<DealerShuffleSecret> = (0..3)
+        .map(|d| DealerShuffleSecret::random(d, n).map_err(|e| format!("{e}")))
+        .collect::<Result<_, _>>()?;
+    let mut fwd_corrs = Vec::with_capacity(3);
+    let mut inv_corrs = Vec::with_capacity(3);
+    for d in &dealers {
+        let corr = ShuffleMaskCorrelation::generate(d).map_err(|e| format!("{e}"))?;
+        let (f, inv) = corr.into_parts();
+        fwd_corrs.push(f);
+        inv_corrs.push(inv);
+    }
+    let mixer = ObliviousEpochMixer::new(n, 3).map_err(|e| format!("{e}"))?;
+    let mut bank = TurboBeaverBank::new_for_txs(16);
+    mixer
+        .execute_shuffle(&mut auth_state, fwd_corrs, &dealers, &mut bank)
+        .map_err(|e| format!("oblivious shuffle failed: {e}"))?;
+    let slot_map = mixer
+        .compose_client_slot_map(inv_corrs, &dealers, auth_state.mac_key(), &mut bank)
+        .map_err(|e| format!("slot map composition failed: {e}"))?;
+    let new_slot_0 = slot_map
+        .reconstruct_slot_for_user(0)
+        .map_err(|e| format!("{e}"))?;
+    let recovered_bal_0 = auth_state
+        .reconstruct_balance(new_slot_0)
+        .map_err(|e| format!("{e}"))?;
+    assert_eq!(recovered_bal_0, 100);
+    println!(
+        "  Global shuffle (N=64)  : 3-hop Benes + SPDZ-IT MAC PASS | User #0 moved to slot #{new_slot_0} (bal={recovered_bal_0})\n"
+    );
+
+    // 4. Herzberg Zero-Reconstruction Share Recovery (delta_i(x_r) = 0)
+    println!("[4/5] Herzberg Zero-Reconstruction Share Recovery (0 Bits of Balance Leaked)");
+    let secret = 42_000u128;
+    let shares = split_secret(secret, 3, &[1, 2, 3, 4]).map_err(|e| format!("{e}"))?;
+    let target_x = 4u64; // Validator 4 crashed!
+    let helper_xs = [1u64, 2, 3];
+    let mut incoming: [Vec<u128>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for _ in 0..3 {
+        let blinds = prepare_recovery_blinding(target_x, &helper_xs, 3)
+            .map_err(|e| format!("{e}"))?;
+        for (idx, &(_, b)) in blinds.iter().enumerate() {
+            incoming[idx].push(b);
+        }
+    }
+    let mut blinded_helpers = Vec::with_capacity(3);
+    for (idx, &hx) in helper_xs.iter().enumerate() {
+        let bs = compute_blinded_helper_share(shares[idx].y(), &incoming[idx])
+            .map_err(|e| format!("{e}"))?;
+        blinded_helpers.push((hx, bs));
+    }
+    let recovered_share4 = recover_single_share_at_x(target_x, &blinded_helpers, 3)
+        .map_err(|e| format!("{e}"))?;
+    assert_eq!(recovered_share4, shares[3].y());
+    println!(
+        "  Crashed V4 recovered   : exact share P(4)=0x{:032x} restored without ever reconstructing P(0)!\n",
+        recovered_share4
+    );
+
+    // 5. Speed-of-Light Distance Bounding + 4D Quorum Diversity Policy
+    println!("[5/5] Speed-of-Light RTT Distance Bounding + 4D OS/ISA/Compiler/ASN Diversity");
+    let (anchor_key, cand_key) = DistanceProbeKey::generate_pair();
+    let challenge_x = random_field_elem();
+    let resp_y = respond_probe(challenge_x, cand_key);
+    verify_probe_response(1, challenge_x, resp_y, anchor_key)
+        .map_err(|e| format!("probe verify failed: {e}"))?;
+    let bft4 = compute_bft_params(4).map_err(|e| format!("{e}"))?;
+    let diverse_4 = vec![
+        QuorumDiversityProfile { os_family: 1, cpu_isa: 1, compiler_lineage: 1, asn: 1001, geo_cell_id: 1 },
+        QuorumDiversityProfile { os_family: 2, cpu_isa: 2, compiler_lineage: 2, asn: 2002, geo_cell_id: 2 },
+        QuorumDiversityProfile { os_family: 3, cpu_isa: 3, compiler_lineage: 3, asn: 3003, geo_cell_id: 3 },
+        QuorumDiversityProfile { os_family: 4, cpu_isa: 4, compiler_lineage: 4, asn: 4004, geo_cell_id: 4 },
+    ];
+    validate_committee_diversity(&diverse_4, bft4)
+        .map_err(|e| format!("diversity check: {e}"))?;
+    let bond_pol = CoreBondPolicy::default();
+    let core_bond = bond_pol
+        .demand_scaled_bond(1_000_000 * VERN_PER_VRNM, 7, 0)
+        .map_err(|e| format!("core bond: {e}"))?;
+    println!(
+        "  1-instruction probe    : y = (x*r + s) mod P verified in constant time (0 hashes)"
+    );
+    println!(
+        "  4D diversity + bond    : 4-OS/4-ISA/4-Compiler/4-ASN quorum PASS | 7-node 20% Core bond = {}",
+        fmt_vrnm(core_bond)
+    );
+    println!("\n========================================================================");
+    println!("  VERNAM (VRNM) v2.0 ANTI-ASI ARCHITECTURE VERIFIED.");
+    println!("========================================================================");
+    Ok(())
+}
+
 fn cmd_v1_demo() -> Result<(), String> {
     println!("========================================================================");
     println!("  VERNAM (VRNM) v1.0 — ZERO-ADMIN 100% DECENTRALIZED ARCHITECTURE DEMO");
@@ -1144,6 +1294,7 @@ fn main() {
             Ok(())
         }
         "v1-demo" => cmd_v1_demo(),
+        "v2-demo" => cmd_v2_demo(),
         "bench" => {
             cmd_bench();
             Ok(())

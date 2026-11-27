@@ -1,0 +1,8 @@
+[package]
+name = "vernam-kernel"
+version = "1.0.0"
+edition = "2024"
+description = "Minimal formally-verifiable no_std, forbid(unsafe_code) information-theoretic cryptographic kernel for Vernam (VRNM)"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

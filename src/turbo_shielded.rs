@@ -96,6 +96,37 @@ pub const OPENINGS_PER_TURBO_TX: usize =
 /// Baseline openings per transfer in standard Beaver-triple IT-MPC (`64*2 + 48 + 1 + 1 = 178`).
 pub const BASELINE_OPENINGS_PER_TX: usize = 178;
 
+/// Total fanout width of [`BeaverStar32`] (`16` blinded sender debits + `16` blinded recipient
+/// credits = `32` products sharing a single `beta = v - b_v` opening).
+pub const TURBO_SYMMETRIC_STAR_SLOTS: usize = 2 * TURBO_BUCKET_SIZE;
+
+/// Exact number of Beaver Square Pairs consumed per symmetric blinded transfer:
+/// `16` amount bits + `16` remainder bits + `16` sender selector bits + `16` recipient selector bits = `64`.
+pub const SQUARES_PER_SYMMETRIC_TX: usize = 2 * TURBO_RANGE_BITS + 2 * TURBO_BUCKET_SIZE;
+
+/// Exact number of invariant checks batched into a single blinded Schwartz–Zippel RLC opening
+/// per symmetric blinded transfer:
+/// `64` bit checks + `1` blinded balance equation (`B_sender - v - r == 0`) + `1` sender selector
+/// sum (`sum(e_k) - 1 == 0`) + `1` recipient selector sum (`sum(s_k) - 1 == 0`) = `67`.
+pub const CHECKS_PER_SYMMETRIC_TX: usize = SQUARES_PER_SYMMETRIC_TX + 3;
+
+/// Exact number of [`BeaverStar32`] stars consumed per symmetric blinded transfer (`1`).
+pub const STARS32_PER_SYMMETRIC_TX: usize = 1;
+
+/// Exact number of [`BeaverTriple4`] triples consumed per symmetric blinded transfer:
+/// `16` sender-balance inner-product triples (`[e_k * B_k]`) + `1` RLC blinding triple (`[rho * Z]`) = `17`.
+pub const TRIPLES_PER_SYMMETRIC_TX: usize = TURBO_BUCKET_SIZE + 1;
+
+/// Exact number of `(3, 4)` openings per full symmetric blinded sender + recipient transfer:
+/// `64` square openings + `32` sender-balance inner-product openings + `33` [`BeaverStar32`]
+/// openings (`1` shared `beta` + `16` sender `alpha_e` + `16` recipient `alpha_s`) + `2`
+/// blinding-triple openings + `1` blinded RLC zero-check opening = `132` (strictly 2 RTTs).
+pub const OPENINGS_PER_SYMMETRIC_TX: usize =
+    SQUARES_PER_SYMMETRIC_TX + 2 * TURBO_BUCKET_SIZE + (1 + TURBO_SYMMETRIC_STAR_SLOTS) + 2 + 1;
+
+const _: () = assert!(CHECKS_PER_SYMMETRIC_TX == 67);
+const _: () = assert!(OPENINGS_PER_SYMMETRIC_TX == 132);
+
 /// Stack-allocated `(3, 4)` Shamir share tuple `[P(1), P(2), P(3), P(4)]` (64 bytes = 1 cache line).
 pub type Share4 = [u128; TURBO_NUM_VALIDATORS];
 
@@ -693,6 +724,68 @@ impl Drop for BeaverStar16 {
     }
 }
 
+/// Strictly single-use stack-allocated `(3, 4)` **32-Element Shared-Factor Beaver Star**
+/// `([b_v], [a_0..a_31], [c_0..c_31])` where `c_k = a_k * b_v (mod PRIME_P)`.
+///
+/// Reuses a **single** `beta = v - b_v` opening across BOTH all `16` blinded sender debits
+/// `[e_k * v]` (`a[0..16]`) AND all `16` blinded recipient credits `[s_k * v]` (`a[16..32]`),
+/// saving `31` openings compared to `32` independent Beaver triples while preserving exact
+/// information-theoretic secrecy (`< 3` validators learn 0 bits).
+/// Move-only (no `Copy`/`Clone`) and volatile-zeroized on `Drop`.
+#[repr(C, align(64))]
+pub struct BeaverStar32 {
+    b_v: Share4,
+    a: [Share4; TURBO_SYMMETRIC_STAR_SLOTS],
+    c: [Share4; TURBO_SYMMETRIC_STAR_SLOTS],
+}
+
+impl fmt::Debug for BeaverStar32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BeaverStar32")
+            .field("slots", &TURBO_SYMMETRIC_STAR_SLOTS)
+            .field("shares", &"<redacted>")
+            .finish()
+    }
+}
+
+impl BeaverStar32 {
+    /// Shares of the single shared amount mask `b_v`.
+    #[inline(always)]
+    pub fn b_v(&self) -> &Share4 {
+        &self.b_v
+    }
+
+    /// Shares of the 32 independent selector masks (`a[0..16]` sender, `a[16..32]` recipient).
+    #[inline(always)]
+    pub fn a(&self) -> &[Share4; TURBO_SYMMETRIC_STAR_SLOTS] {
+        &self.a
+    }
+
+    /// Shares of the 32 correlated products `c_k = a_k * b_v (mod PRIME_P)`.
+    #[inline(always)]
+    pub fn c(&self) -> &[Share4; TURBO_SYMMETRIC_STAR_SLOTS] {
+        &self.c
+    }
+
+    #[inline(always)]
+    fn wipe_in_place_nofence(&mut self) {
+        zeroize_share4_nofence(&mut self.b_v);
+        for s in self.a.iter_mut() {
+            zeroize_share4_nofence(s);
+        }
+        for s in self.c.iter_mut() {
+            zeroize_share4_nofence(s);
+        }
+    }
+}
+
+impl Drop for BeaverStar32 {
+    fn drop(&mut self) {
+        self.wipe_in_place_nofence();
+        compiler_fence(Ordering::SeqCst);
+    }
+}
+
 /// Standalone single-opening Beaver squaring `[x^2] = [a^2] + 2*d*[a] + d^2 (mod PRIME_P)`.
 ///
 /// Opens ONLY `d = x - a`, enforces degree-2 consistency across all 4 validators, and
@@ -788,6 +881,8 @@ pub struct TurboBeaverBank {
     sq_pos: usize,
     stars: Vec<BeaverStar16>,
     star_pos: usize,
+    stars32: Vec<BeaverStar32>,
+    star32_pos: usize,
     triples: Vec<BeaverTriple4>,
     triple_pos: usize,
 }
@@ -797,6 +892,7 @@ impl fmt::Debug for TurboBeaverBank {
         f.debug_struct("TurboBeaverBank")
             .field("available_squares", &self.available_squares())
             .field("available_stars", &self.available_stars())
+            .field("available_stars32", &self.available_stars32())
             .field("available_triples", &self.available_triples())
             .field("material", &"<redacted>")
             .finish()
@@ -811,6 +907,8 @@ impl TurboBeaverBank {
             sq_pos: 0,
             stars: Vec::new(),
             star_pos: 0,
+            stars32: Vec::new(),
+            star32_pos: 0,
             triples: Vec::new(),
             triple_pos: 0,
         }
@@ -823,6 +921,16 @@ impl TurboBeaverBank {
     pub fn new_for_txs(tx_count: usize) -> Self {
         let mut bank = Self::empty();
         bank.refill_for_txs(tx_count);
+        bank
+    }
+
+    /// Pre-generate offline correlated randomness for `tx_count` full symmetric blinded sender +
+    /// recipient transfers (`tx_count * 64` [`BeaverSquare`]s, `tx_count` [`BeaverStar32`]s, and
+    /// `tx_count * 17` [`BeaverTriple4`]s), parallelized across available hardware threads using
+    /// pure OS `/dev/urandom` entropy.
+    pub fn new_for_symmetric_txs(tx_count: usize) -> Self {
+        let mut bank = Self::empty();
+        bank.refill_for_symmetric_txs(tx_count);
         bank
     }
 
@@ -853,6 +961,15 @@ impl TurboBeaverBank {
         }
     }
 
+    /// Compact consumed prefix `0..star32_pos`.
+    #[inline]
+    fn compact_stars32(&mut self) {
+        if self.star32_pos > 0 {
+            self.stars32.drain(..self.star32_pos);
+            self.star32_pos = 0;
+        }
+    }
+
     /// Compact consumed prefix `0..triple_pos`.
     #[inline]
     fn compact_triples(&mut self) {
@@ -870,6 +987,9 @@ impl TurboBeaverBank {
         }
         if self.star_pos > 0 && self.star_pos.saturating_mul(2) >= self.stars.capacity() {
             self.compact_stars();
+        }
+        if self.star32_pos > 0 && self.star32_pos.saturating_mul(2) >= self.stars32.capacity() {
+            self.compact_stars32();
         }
         if self.triple_pos > 0 && self.triple_pos.saturating_mul(2) >= self.triples.capacity() {
             self.compact_triples();
@@ -889,6 +1009,22 @@ impl TurboBeaverBank {
             .expect("tx_count overflow for Beaver triples");
         self.refill_squares(need_sq);
         self.refill_stars(need_stars);
+        self.refill_triples(need_triples);
+    }
+
+    /// Refill correlated randomness for `tx_count` additional symmetric blinded transfers.
+    pub fn refill_for_symmetric_txs(&mut self, tx_count: usize) {
+        let need_sq = tx_count
+            .checked_mul(SQUARES_PER_SYMMETRIC_TX)
+            .expect("tx_count overflow for symmetric Beaver squares");
+        let need_stars32 = tx_count
+            .checked_mul(STARS32_PER_SYMMETRIC_TX)
+            .expect("tx_count overflow for BeaverStar32");
+        let need_triples = tx_count
+            .checked_mul(TRIPLES_PER_SYMMETRIC_TX)
+            .expect("tx_count overflow for symmetric Beaver triples");
+        self.refill_squares(need_sq);
+        self.refill_stars32(need_stars32);
         self.refill_triples(need_triples);
     }
 
@@ -974,6 +1110,47 @@ impl TurboBeaverBank {
         }
     }
 
+    /// Pre-generate `count` fresh single-use [`BeaverStar32`] stars in parallel.
+    pub fn refill_stars32(&mut self, count: usize) {
+        self.compact_stars32();
+        if count == 0 {
+            return;
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        if count < 128 || cores <= 1 {
+            self.stars32.reserve(count);
+            generate_stars32_into(&mut self.stars32, count);
+            return;
+        }
+
+        let threads = cores.min(count / 64).max(1);
+        let base = count / threads;
+        let rem = count % threads;
+
+        let chunks: Vec<Vec<BeaverStar32>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for t in 0..threads {
+                let n = base + usize::from(t < rem);
+                handles.push(scope.spawn(move || {
+                    let mut v = Vec::with_capacity(n);
+                    generate_stars32_into(&mut v, n);
+                    v
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("beaver star32 generator thread panicked"))
+                .collect()
+        });
+
+        self.stars32.reserve(count);
+        for mut c in chunks {
+            self.stars32.append(&mut c);
+        }
+    }
+
     /// Pre-generate `count` fresh single-use general [`BeaverTriple4`] triples in parallel.
     pub fn refill_triples(&mut self, count: usize) {
         self.compact_triples();
@@ -1027,6 +1204,12 @@ impl TurboBeaverBank {
         self.stars.len() - self.star_pos
     }
 
+    /// Number of unused [`BeaverStar32`] stars remaining.
+    #[inline]
+    pub fn available_stars32(&self) -> usize {
+        self.stars32.len() - self.star32_pos
+    }
+
     /// Number of unused [`BeaverTriple4`] triples remaining.
     #[inline]
     pub fn available_triples(&self) -> usize {
@@ -1039,6 +1222,14 @@ impl TurboBeaverBank {
         (self.available_squares() / SQUARES_PER_TURBO_TX)
             .min(self.available_stars() / STARS_PER_TURBO_TX)
             .min(self.available_triples() / TRIPLES_PER_TURBO_TX)
+    }
+
+    /// Maximum number of full symmetric blinded transfers currently supported by this bank.
+    #[inline]
+    pub fn available_symmetric_txs(&self) -> usize {
+        (self.available_squares() / SQUARES_PER_SYMMETRIC_TX)
+            .min(self.available_stars32() / STARS32_PER_SYMMETRIC_TX)
+            .min(self.available_triples() / TRIPLES_PER_SYMMETRIC_TX)
     }
 
     /// Pop one single-use [`BeaverSquare`] from the back of the bank.
@@ -1063,6 +1254,18 @@ impl TurboBeaverBank {
             });
         }
         Ok(self.stars.pop().expect("available_stars > 0"))
+    }
+
+    /// Pop one single-use [`BeaverStar32`] from the back of the bank.
+    pub fn pop_star32(&mut self) -> Result<BeaverStar32, TurboShieldedError> {
+        self.compact_if_half_consumed();
+        if self.available_stars32() == 0 {
+            return Err(TurboShieldedError::BeaverStarsExhausted {
+                needed: 1,
+                available: 0,
+            });
+        }
+        Ok(self.stars32.pop().expect("available_stars32 > 0"))
     }
 
     /// Pop one single-use [`BeaverTriple4`] from the back of the bank.
@@ -1127,6 +1330,59 @@ impl TurboBeaverBank {
             &mut self.triples[triple_start..triple_start + need_triples],
         ))
     }
+
+    /// Reserve and return contiguous mutable slices for `tx_count` symmetric blinded transfers,
+    /// immediately advancing the single-use cursors so the returned material can NEVER be reused.
+    fn reserve_for_symmetric_txs(
+        &mut self,
+        tx_count: usize,
+    ) -> Result<
+        (&mut [BeaverSquare], &mut [BeaverStar32], &mut [BeaverTriple4]),
+        TurboShieldedError,
+    > {
+        self.compact_if_half_consumed();
+        let need_sq = tx_count
+            .checked_mul(SQUARES_PER_SYMMETRIC_TX)
+            .ok_or(TurboShieldedError::InvalidParameters("tx_count overflow"))?;
+        let avail_sq = self.available_squares();
+        if avail_sq < need_sq {
+            return Err(TurboShieldedError::BeaverSquaresExhausted {
+                needed: need_sq,
+                available: avail_sq,
+            });
+        }
+        let need_stars = tx_count
+            .checked_mul(STARS32_PER_SYMMETRIC_TX)
+            .ok_or(TurboShieldedError::InvalidParameters("tx_count overflow"))?;
+        let avail_stars = self.available_stars32();
+        if avail_stars < need_stars {
+            return Err(TurboShieldedError::BeaverStarsExhausted {
+                needed: need_stars,
+                available: avail_stars,
+            });
+        }
+        let need_triples = tx_count
+            .checked_mul(TRIPLES_PER_SYMMETRIC_TX)
+            .ok_or(TurboShieldedError::InvalidParameters("tx_count overflow"))?;
+        let avail_triples = self.available_triples();
+        if avail_triples < need_triples {
+            return Err(TurboShieldedError::BeaverTriplesExhausted {
+                needed: need_triples,
+                available: avail_triples,
+            });
+        }
+        let sq_start = self.sq_pos;
+        self.sq_pos += need_sq;
+        let star_start = self.star32_pos;
+        self.star32_pos += need_stars;
+        let triple_start = self.triple_pos;
+        self.triple_pos += need_triples;
+        Ok((
+            &mut self.squares[sq_start..sq_start + need_sq],
+            &mut self.stars32[star_start..star_start + need_stars],
+            &mut self.triples[triple_start..triple_start + need_triples],
+        ))
+    }
 }
 
 /// Generate `count` fresh [`BeaverTriple4`] triples into `out` using batched OS entropy.
@@ -1164,6 +1420,9 @@ impl Drop for TurboBeaverBank {
         }
         for st in &mut self.stars[self.star_pos..] {
             st.wipe_in_place_nofence();
+        }
+        for st32 in &mut self.stars32[self.star32_pos..] {
+            st32.wipe_in_place_nofence();
         }
         for tr in &mut self.triples[self.triple_pos..] {
             tr.wipe_in_place_nofence();
@@ -1224,6 +1483,40 @@ fn generate_stars_into(out: &mut Vec<BeaverStar16>, count: usize) {
             }
             zeroize_u128(&mut bv0);
             out.push(BeaverStar16 { b_v, a, c });
+        }
+        remaining -= take;
+    }
+    zeroize_u128_slice(&mut entropy);
+}
+
+/// Generate `count` fresh [`BeaverStar32`] stars into `out` using batched OS entropy.
+fn generate_stars32_into(out: &mut Vec<BeaverStar32>, count: usize) {
+    // Per star32: 3 elems for b_v (bv0, bv1, bv2) + 32 * 5 elems (a0, a1, a2, c1, c2) = 163 elems.
+    const ELEMS_PER_STAR32: usize = 3 + TURBO_SYMMETRIC_STAR_SLOTS * 5;
+    const BATCH: usize = 16;
+    let mut entropy = [0u128; BATCH * ELEMS_PER_STAR32];
+    let mut remaining = count;
+    while remaining > 0 {
+        let take = remaining.min(BATCH);
+        let slice = &mut entropy[..take * ELEMS_PER_STAR32];
+        fill_random_field_elems(slice);
+        for chunk in slice.chunks_exact(ELEMS_PER_STAR32) {
+            let mut bv0 = chunk[0];
+            let b_v = TurboLagrange3Of4::eval_poly(bv0, chunk[1], chunk[2]);
+            let mut a = [[0u128; 4]; TURBO_SYMMETRIC_STAR_SLOTS];
+            let mut c = [[0u128; 4]; TURBO_SYMMETRIC_STAR_SLOTS];
+            let mut off = 3usize;
+            for k in 0..TURBO_SYMMETRIC_STAR_SLOTS {
+                let mut ak0 = chunk[off];
+                let mut ck0 = mul_mod_fast(ak0, bv0);
+                a[k] = TurboLagrange3Of4::eval_poly(ak0, chunk[off + 1], chunk[off + 2]);
+                c[k] = TurboLagrange3Of4::eval_poly(ck0, chunk[off + 3], chunk[off + 4]);
+                zeroize_u128(&mut ak0);
+                zeroize_u128(&mut ck0);
+                off += 5;
+            }
+            zeroize_u128(&mut bv0);
+            out.push(BeaverStar32 { b_v, a, c });
         }
         remaining -= take;
     }
@@ -1712,6 +2005,652 @@ fn wipe_remaining_tx_beaver(
     star.wipe_in_place_nofence();
     blind_triple.wipe_in_place_nofence();
     compiler_fence(Ordering::SeqCst);
+}
+
+// ============================================================================
+// 3b. Symmetric Blinded Sender + Recipient Transfer (`SymmetricShieldedTxRequest`)
+// ============================================================================
+
+/// Zero-heap-allocation **Symmetric Blinded** confidential transfer request hiding **BOTH** the
+/// sender slot inside `sender_bucket` AND the recipient slot inside `recipient_bucket`.
+///
+/// Carries stack-allocated `(3, 4)` Shamir shares of:
+/// - `16` blinded one-hot sender selector bits `e_k in {0, 1}` with `sum(e_k) == 1`,
+/// - `16` blinded one-hot recipient selector bits `s_k in {0, 1}` with `sum(s_k) == 1`,
+/// - secret-shared amount `[v]` (consistent with `sum_{j=0}^{15} 2^j * [v_j]`),
+/// - `16` amount range bits `v_j in {0, 1}`,
+/// - `16` remainder range bits `r_j in {0, 1}` (`r = B_sender - v`).
+pub struct SymmetricShieldedTxRequest {
+    pub sender_bucket: usize,
+    pub recipient_bucket: usize,
+    pub sender_selector: [Share4; TURBO_BUCKET_SIZE],
+    pub recipient_selector: [Share4; TURBO_BUCKET_SIZE],
+    pub amount_share: Share4,
+    pub v_bits: [Share4; TURBO_RANGE_BITS],
+    pub r_bits: [Share4; TURBO_RANGE_BITS],
+}
+
+impl fmt::Debug for SymmetricShieldedTxRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SymmetricShieldedTxRequest")
+            .field("sender_bucket", &self.sender_bucket)
+            .field("recipient_bucket", &self.recipient_bucket)
+            .field("shares", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SymmetricShieldedTxRequest {
+    /// Construct a valid symmetric blinded transfer from `(sender_bucket, sender_slot)` (with known
+    /// `sender_balance`) sending `amount` to `(recipient_bucket, recipient_slot)` in one batched
+    /// OS entropy read. Supports BOTH cross-bucket and intra-bucket (`sender_bucket == recipient_bucket`)
+    /// transfers.
+    pub fn new(
+        sender_bucket: usize,
+        recipient_bucket: usize,
+        sender_slot: usize,
+        sender_balance: u128,
+        recipient_slot: usize,
+        amount: u128,
+    ) -> Result<Self, TurboShieldedError> {
+        if sender_slot >= TURBO_BUCKET_SIZE {
+            return Err(TurboShieldedError::InvalidSlot { slot: sender_slot });
+        }
+        if recipient_slot >= TURBO_BUCKET_SIZE {
+            return Err(TurboShieldedError::InvalidSlot {
+                slot: recipient_slot,
+            });
+        }
+        let max_val = (1u128 << TURBO_RANGE_BITS) - 1;
+        if amount > max_val || sender_balance < amount || (sender_balance - amount) > max_val {
+            return Err(TurboShieldedError::InvalidParameters(
+                "amount or remainder outside [0, 2^16)",
+            ));
+        }
+
+        let mut remainder = sender_balance - amount;
+        const TOTAL_POLYS: usize = SQUARES_PER_SYMMETRIC_TX;
+        let mut rands = [0u128; TOTAL_POLYS * 2];
+        fill_random_field_elems(&mut rands);
+
+        let mut v_bits = [[0u128; 4]; TURBO_RANGE_BITS];
+        let mut r_bits = [[0u128; 4]; TURBO_RANGE_BITS];
+        let mut sender_selector = [[0u128; 4]; TURBO_BUCKET_SIZE];
+        let mut recipient_selector = [[0u128; 4]; TURBO_BUCKET_SIZE];
+
+        let mut idx = 0usize;
+        for j in 0..TURBO_RANGE_BITS {
+            let vb = (amount >> j) & 1;
+            v_bits[j] = TurboLagrange3Of4::eval_poly(vb, rands[idx], rands[idx + 1]);
+            idx += 2;
+        }
+        for j in 0..TURBO_RANGE_BITS {
+            let rb = (remainder >> j) & 1;
+            r_bits[j] = TurboLagrange3Of4::eval_poly(rb, rands[idx], rands[idx + 1]);
+            idx += 2;
+        }
+        for k in 0..TURBO_BUCKET_SIZE {
+            let ek = if k == sender_slot { 1u128 } else { 0u128 };
+            sender_selector[k] = TurboLagrange3Of4::eval_poly(ek, rands[idx], rands[idx + 1]);
+            idx += 2;
+        }
+        for k in 0..TURBO_BUCKET_SIZE {
+            let sk = if k == recipient_slot { 1u128 } else { 0u128 };
+            recipient_selector[k] = TurboLagrange3Of4::eval_poly(sk, rands[idx], rands[idx + 1]);
+            idx += 2;
+        }
+
+        let amount_share = compose_bits_16(&v_bits);
+        zeroize_u128(&mut remainder);
+        zeroize_u128_slice(&mut rands);
+        Ok(Self {
+            sender_bucket,
+            recipient_bucket,
+            sender_selector,
+            recipient_selector,
+            amount_share,
+            v_bits,
+            r_bits,
+        })
+    }
+
+    /// Construct a symmetric blinded request from raw share arrays (for distributed clients and
+    /// adversarial security tests); derives `amount_share = compose_bits_16(&v_bits)`.
+    pub fn new_raw(
+        sender_bucket: usize,
+        recipient_bucket: usize,
+        sender_selector: [Share4; TURBO_BUCKET_SIZE],
+        recipient_selector: [Share4; TURBO_BUCKET_SIZE],
+        v_bits: [Share4; TURBO_RANGE_BITS],
+        r_bits: [Share4; TURBO_RANGE_BITS],
+    ) -> Self {
+        let amount_share = compose_bits_16(&v_bits);
+        Self {
+            sender_bucket,
+            recipient_bucket,
+            sender_selector,
+            recipient_selector,
+            amount_share,
+            v_bits,
+            r_bits,
+        }
+    }
+
+    /// Construct from raw share arrays including an explicit `amount_share` (for adversarial tests).
+    pub fn new_raw_with_amount(
+        sender_bucket: usize,
+        recipient_bucket: usize,
+        sender_selector: [Share4; TURBO_BUCKET_SIZE],
+        recipient_selector: [Share4; TURBO_BUCKET_SIZE],
+        amount_share: Share4,
+        v_bits: [Share4; TURBO_RANGE_BITS],
+        r_bits: [Share4; TURBO_RANGE_BITS],
+    ) -> Self {
+        Self {
+            sender_bucket,
+            recipient_bucket,
+            sender_selector,
+            recipient_selector,
+            amount_share,
+            v_bits,
+            r_bits,
+        }
+    }
+}
+
+impl Drop for SymmetricShieldedTxRequest {
+    fn drop(&mut self) {
+        zeroize_share4_slice(&mut self.sender_selector);
+        zeroize_share4_slice(&mut self.recipient_selector);
+        zeroize_share4(&mut self.amount_share);
+        zeroize_share4_slice(&mut self.v_bits);
+        zeroize_share4_slice(&mut self.r_bits);
+    }
+}
+
+/// Wipe any unconsumed squares, `BeaverStar32`, and triples on an early error exit.
+#[inline]
+fn wipe_remaining_symmetric_beaver(
+    squares: &mut [BeaverSquare],
+    from_sq: usize,
+    star32: &mut BeaverStar32,
+    triples: &mut [BeaverTriple4],
+    from_tr: usize,
+) {
+    let sq_end = squares.len().min(SQUARES_PER_SYMMETRIC_TX);
+    if from_sq < sq_end {
+        for sq in &mut squares[from_sq..sq_end] {
+            sq.wipe_in_place_nofence();
+        }
+    }
+    let tr_end = triples.len().min(TRIPLES_PER_SYMMETRIC_TX);
+    if from_tr < tr_end {
+        for tr in &mut triples[from_tr..tr_end] {
+            tr.wipe_in_place_nofence();
+        }
+    }
+    star32.wipe_in_place_nofence();
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Execute and verify a single **Symmetric Blinded** confidential transfer (**132 openings**,
+/// **67-check single blinded Schwartz–Zippel RLC**, **strictly 2 RTTs**, zero heap allocations),
+/// hiding BOTH the sender slot inside `sender_balances` AND the recipient slot inside
+/// `recipient_balances` (`None` means intra-bucket `sender_bucket == recipient_bucket`).
+///
+/// Protocol breakdown:
+/// - **RTT 1 (`129` parallel openings)**:
+///   1. `64` [`BeaverSquare`] Boolean checks (`16 v_bits + 16 r_bits + 16 e_bits + 16 s_bits`).
+///   2. `32` [`BeaverTriple4`] openings across `triples[0..16]` computing blinded sender balance
+///      `[B_sender] = sum_{k=0}^{15} [e_k * B_k]`.
+///   3. `33` [`BeaverStar32`] openings (`1` shared `beta = v - b_v` + `16` sender `alpha_e` + `16`
+///      recipient `alpha_s`) preparing all 16 blinded debits `[e_k * v]` and 16 blinded credits
+///      `[s_k * v]`.
+///   4. Local Horner folding of all `67` checks (`64` Boolean + `B_sender - v - r` + `sum(e_k) - 1`
+///      + `sum(s_k) - 1`) into `[Z]`.
+/// - **RTT 2 (`3` openings)**:
+///   5. Multiplicative blinding `[Z_blind] = [rho] * [Z]` via `triples[16]` (`2` openings) +
+///      degree-2 verified opening of `[Z_blind]` (`1` opening) -> MUST equal `0` (soundness
+///      `<= 66 / (2^127 - 2) < 2^-120`, 0 bits leaked on failure).
+/// - **Atomic Update**:
+///   6. Only after all checks succeed, apply `-[e_k * v]` to all 16 sender slots and `+[s_k * v]`
+///      to all 16 recipient slots in place (re-randomizing EVERY slot in both buckets).
+#[inline]
+pub fn execute_symmetric_blinded_transfer_in_buckets(
+    sender_balances: &mut [Share4; TURBO_BUCKET_SIZE],
+    mut recipient_balances: Option<&mut [Share4; TURBO_BUCKET_SIZE]>,
+    req: &SymmetricShieldedTxRequest,
+    squares: &mut [BeaverSquare],
+    star32: &mut BeaverStar32,
+    triples: &mut [BeaverTriple4],
+    gamma: u128,
+) -> Result<(), TurboShieldedError> {
+    if gamma == 0 || gamma >= PRIME_P {
+        wipe_remaining_symmetric_beaver(squares, 0, star32, triples, 0);
+        return Err(TurboShieldedError::InvalidParameters(
+            "RLC challenge gamma must be in [1, PRIME_P)",
+        ));
+    }
+    if squares.len() < SQUARES_PER_SYMMETRIC_TX {
+        wipe_remaining_symmetric_beaver(squares, 0, star32, triples, 0);
+        return Err(TurboShieldedError::BeaverSquaresExhausted {
+            needed: SQUARES_PER_SYMMETRIC_TX,
+            available: squares.len(),
+        });
+    }
+    if triples.len() < TRIPLES_PER_SYMMETRIC_TX {
+        wipe_remaining_symmetric_beaver(squares, 0, star32, triples, 0);
+        return Err(TurboShieldedError::BeaverTriplesExhausted {
+            needed: TRIPLES_PER_SYMMETRIC_TX,
+            available: triples.len(),
+        });
+    }
+
+    // Validate canonical `< PRIME_P` on all sender & recipient bucket slots upfront.
+    for slot in sender_balances.iter() {
+        if slot[0] >= PRIME_P || slot[1] >= PRIME_P || slot[2] >= PRIME_P || slot[3] >= PRIME_P {
+            wipe_remaining_symmetric_beaver(squares, 0, star32, triples, 0);
+            return Err(TurboShieldedError::FieldElementOutOfRange);
+        }
+    }
+    if let Some(ref dst) = recipient_balances {
+        for slot in dst.iter() {
+            if slot[0] >= PRIME_P || slot[1] >= PRIME_P || slot[2] >= PRIME_P || slot[3] >= PRIME_P
+            {
+                wipe_remaining_symmetric_beaver(squares, 0, star32, triples, 0);
+                return Err(TurboShieldedError::FieldElementOutOfRange);
+            }
+        }
+    }
+
+    let mut z: Share4 = [0u128; 4];
+    let mut z_const: u128 = 0u128;
+    let mut sq_idx = 0usize;
+
+    // 1. 16 amount bits: v_j * (v_j - 1) == 0 (16 openings).
+    for j in 0..TURBO_RANGE_BITS {
+        if let Err(e) = accumulate_bool_square_rlc(
+            &req.v_bits[j],
+            &mut squares[sq_idx],
+            gamma,
+            &mut z,
+            &mut z_const,
+        ) {
+            wipe_remaining_symmetric_beaver(squares, sq_idx, star32, triples, 0);
+            zeroize_u128(&mut z_const);
+            zeroize_share4(&mut z);
+            return Err(e);
+        }
+        sq_idx += 1;
+    }
+
+    // 2. 16 remainder bits: r_j * (r_j - 1) == 0 (16 openings).
+    for j in 0..TURBO_RANGE_BITS {
+        if let Err(e) = accumulate_bool_square_rlc(
+            &req.r_bits[j],
+            &mut squares[sq_idx],
+            gamma,
+            &mut z,
+            &mut z_const,
+        ) {
+            wipe_remaining_symmetric_beaver(squares, sq_idx, star32, triples, 0);
+            zeroize_u128(&mut z_const);
+            zeroize_share4(&mut z);
+            return Err(e);
+        }
+        sq_idx += 1;
+    }
+
+    // 3. 16 sender one-hot selector bits: e_k * (e_k - 1) == 0 (16 openings) + sum(e_k).
+    let mut sum_e: Share4 = [0u128; 4];
+    for k in 0..TURBO_BUCKET_SIZE {
+        let e_k = &req.sender_selector[k];
+        if let Err(e) =
+            accumulate_bool_square_rlc(e_k, &mut squares[sq_idx], gamma, &mut z, &mut z_const)
+        {
+            wipe_remaining_symmetric_beaver(squares, sq_idx, star32, triples, 0);
+            zeroize_u128(&mut z_const);
+            zeroize_share4(&mut z);
+            zeroize_share4(&mut sum_e);
+            return Err(e);
+        }
+        sq_idx += 1;
+        sum_e[0] = add_unreduced(sum_e[0], e_k[0]);
+        sum_e[1] = add_unreduced(sum_e[1], e_k[1]);
+        sum_e[2] = add_unreduced(sum_e[2], e_k[2]);
+        sum_e[3] = add_unreduced(sum_e[3], e_k[3]);
+    }
+
+    // 4. 16 recipient one-hot selector bits: s_k * (s_k - 1) == 0 (16 openings) + sum(s_k).
+    let mut sum_s: Share4 = [0u128; 4];
+    for k in 0..TURBO_BUCKET_SIZE {
+        let s_k = &req.recipient_selector[k];
+        if let Err(e) =
+            accumulate_bool_square_rlc(s_k, &mut squares[sq_idx], gamma, &mut z, &mut z_const)
+        {
+            wipe_remaining_symmetric_beaver(squares, sq_idx, star32, triples, 0);
+            zeroize_u128(&mut z_const);
+            zeroize_share4(&mut z);
+            zeroize_share4(&mut sum_e);
+            zeroize_share4(&mut sum_s);
+            return Err(e);
+        }
+        sq_idx += 1;
+        sum_s[0] = add_unreduced(sum_s[0], s_k[0]);
+        sum_s[1] = add_unreduced(sum_s[1], s_k[1]);
+        sum_s[2] = add_unreduced(sum_s[2], s_k[2]);
+        sum_s[3] = add_unreduced(sum_s[3], s_k[3]);
+    }
+
+    // 5. Blinded sender balance inner product `[B_sender] = sum_{k=0}^{15} [e_k * B_k]`
+    //    using `triples[0..16]` (32 openings, all parallel in RTT 1).
+    let mut b_sender: Share4 = [0u128; 4];
+    for k in 0..TURBO_BUCKET_SIZE {
+        let tr = &mut triples[k];
+        let d_k = match TurboLagrange3Of4::open_diff(&req.sender_selector[k], &tr.a) {
+            Ok(v) => v,
+            Err(e) => {
+                wipe_remaining_symmetric_beaver(squares, sq_idx, star32, triples, k);
+                zeroize_u128(&mut z_const);
+                zeroize_share4_nofence(&mut z);
+                zeroize_share4_nofence(&mut sum_e);
+                zeroize_share4_nofence(&mut sum_s);
+                zeroize_share4(&mut b_sender);
+                return Err(e);
+            }
+        };
+        let f_k = match TurboLagrange3Of4::open_diff(&sender_balances[k], &tr.b) {
+            Ok(v) => v,
+            Err(e) => {
+                wipe_remaining_symmetric_beaver(squares, sq_idx, star32, triples, k);
+                zeroize_u128(&mut z_const);
+                zeroize_share4_nofence(&mut z);
+                zeroize_share4_nofence(&mut sum_e);
+                zeroize_share4_nofence(&mut sum_s);
+                zeroize_share4(&mut b_sender);
+                return Err(e);
+            }
+        };
+        let df = mul_mod_fast(d_k, f_k);
+        let p0 = add_unreduced(
+            add_unreduced(tr.c[0], mul_unreduced(d_k, tr.b[0])),
+            add_unreduced(mul_unreduced(f_k, tr.a[0]), df),
+        );
+        let p1 = add_unreduced(
+            add_unreduced(tr.c[1], mul_unreduced(d_k, tr.b[1])),
+            add_unreduced(mul_unreduced(f_k, tr.a[1]), df),
+        );
+        let p2 = add_unreduced(
+            add_unreduced(tr.c[2], mul_unreduced(d_k, tr.b[2])),
+            add_unreduced(mul_unreduced(f_k, tr.a[2]), df),
+        );
+        let p3 = add_unreduced(
+            add_unreduced(tr.c[3], mul_unreduced(d_k, tr.b[3])),
+            add_unreduced(mul_unreduced(f_k, tr.a[3]), df),
+        );
+        b_sender[0] = add_unreduced(b_sender[0], p0);
+        b_sender[1] = add_unreduced(b_sender[1], p1);
+        b_sender[2] = add_unreduced(b_sender[2], p2);
+        b_sender[3] = add_unreduced(b_sender[3], p3);
+        tr.wipe_in_place_nofence();
+    }
+    b_sender[0] = canon_le_p(b_sender[0]);
+    b_sender[1] = canon_le_p(b_sender[1]);
+    b_sender[2] = canon_le_p(b_sender[2]);
+    b_sender[3] = canon_le_p(b_sender[3]);
+
+    // 6. Recompose [v] and [r] with zero `mul_mod`, then fold Checks #65, #66, #67 into [Z]:
+    //    - Check #65: B_sender - v - r == 0
+    //    - Check #66: sum(e_k) - 1 == 0
+    //    - Check #67: sum(s_k) - 1 == 0
+    let mut v_shares = compose_bits_16(&req.v_bits);
+    let mut r_shares = compose_bits_16(&req.r_bits);
+
+    z[0] = add_unreduced(
+        mul_unreduced(z[0], gamma),
+        sub_mod(sub_mod(b_sender[0], v_shares[0]), r_shares[0]),
+    );
+    z[1] = add_unreduced(
+        mul_unreduced(z[1], gamma),
+        sub_mod(sub_mod(b_sender[1], v_shares[1]), r_shares[1]),
+    );
+    z[2] = add_unreduced(
+        mul_unreduced(z[2], gamma),
+        sub_mod(sub_mod(b_sender[2], v_shares[2]), r_shares[2]),
+    );
+    z[3] = add_unreduced(
+        mul_unreduced(z[3], gamma),
+        sub_mod(sub_mod(b_sender[3], v_shares[3]), r_shares[3]),
+    );
+    zeroize_share4_nofence(&mut b_sender);
+    zeroize_share4_nofence(&mut r_shares);
+    z_const = mul_unreduced(z_const, gamma);
+
+    // Check #66: sum(e_k) - 1.
+    z[0] = add_unreduced(mul_unreduced(z[0], gamma), sum_e[0]);
+    z[1] = add_unreduced(mul_unreduced(z[1], gamma), sum_e[1]);
+    z[2] = add_unreduced(mul_unreduced(z[2], gamma), sum_e[2]);
+    z[3] = add_unreduced(mul_unreduced(z[3], gamma), sum_e[3]);
+    z_const = add_unreduced(mul_unreduced(z_const, gamma), PRIME_P - 1);
+    zeroize_share4_nofence(&mut sum_e);
+
+    // Check #67: sum(s_k) - 1.
+    z[0] = add_unreduced(mul_unreduced(z[0], gamma), sum_s[0]);
+    z[1] = add_unreduced(mul_unreduced(z[1], gamma), sum_s[1]);
+    z[2] = add_unreduced(mul_unreduced(z[2], gamma), sum_s[2]);
+    z[3] = add_unreduced(mul_unreduced(z[3], gamma), sum_s[3]);
+    z_const = add_unreduced(mul_unreduced(z_const, gamma), PRIME_P - 1);
+    zeroize_share4_nofence(&mut sum_s);
+
+    let mut z_final: Share4 = [
+        canon_le_p(add_unreduced(z[0], z_const)),
+        canon_le_p(add_unreduced(z[1], z_const)),
+        canon_le_p(add_unreduced(z[2], z_const)),
+        canon_le_p(add_unreduced(z[3], z_const)),
+    ];
+    zeroize_u128(&mut z_const);
+    zeroize_share4_nofence(&mut z);
+
+    // 7. Blinded Schwartz–Zippel RLC verification via `triples[16]` (3 openings: d_r, e_z, Z_blind).
+    let blind_triple = &mut triples[TURBO_BUCKET_SIZE];
+    let mut rho = random_nonzero_share4_fast();
+    let mut d_r = match TurboLagrange3Of4::open_diff(&rho, &blind_triple.a) {
+        Ok(v) => v,
+        Err(e) => {
+            star32.wipe_in_place_nofence();
+            blind_triple.wipe_in_place_nofence();
+            zeroize_share4_nofence(&mut rho);
+            zeroize_share4_nofence(&mut z_final);
+            zeroize_share4(&mut v_shares);
+            return Err(e);
+        }
+    };
+    let mut e_z = match TurboLagrange3Of4::open_diff(&z_final, &blind_triple.b) {
+        Ok(v) => v,
+        Err(e) => {
+            star32.wipe_in_place_nofence();
+            blind_triple.wipe_in_place_nofence();
+            zeroize_u128(&mut d_r);
+            zeroize_share4_nofence(&mut rho);
+            zeroize_share4_nofence(&mut z_final);
+            zeroize_share4(&mut v_shares);
+            return Err(e);
+        }
+    };
+    let mut de = mul_mod_fast(d_r, e_z);
+    let mut z_blind: Share4 = [
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[0], mul_unreduced(d_r, blind_triple.b[0])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[0]), de),
+        )),
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[1], mul_unreduced(d_r, blind_triple.b[1])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[1]), de),
+        )),
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[2], mul_unreduced(d_r, blind_triple.b[2])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[2]), de),
+        )),
+        canon_le_p(add_unreduced(
+            add_unreduced(blind_triple.c[3], mul_unreduced(d_r, blind_triple.b[3])),
+            add_unreduced(mul_unreduced(e_z, blind_triple.a[3]), de),
+        )),
+    ];
+    blind_triple.wipe_in_place_nofence();
+    zeroize_u128(&mut d_r);
+    zeroize_u128(&mut e_z);
+    zeroize_u128(&mut de);
+    zeroize_share4_nofence(&mut rho);
+    zeroize_share4_nofence(&mut z_final);
+
+    let opened_z = TurboLagrange3Of4::reconstruct_and_verify(&z_blind);
+    zeroize_share4_nofence(&mut z_blind);
+
+    match opened_z {
+        Ok(0) => {}
+        Ok(_) => {
+            star32.wipe_in_place_nofence();
+            zeroize_share4(&mut v_shares);
+            return Err(TurboShieldedError::RlcCheckFailed);
+        }
+        Err(e) => {
+            star32.wipe_in_place_nofence();
+            zeroize_share4(&mut v_shares);
+            return Err(e);
+        }
+    }
+
+    // Verify `req.amount_share` is degree-2 consistent and matches the proven bit decomposition.
+    if let Err(e) = TurboLagrange3Of4::verify_degree2(&req.amount_share) {
+        star32.wipe_in_place_nofence();
+        zeroize_share4(&mut v_shares);
+        return Err(e);
+    }
+    if req.amount_share != v_shares {
+        star32.wipe_in_place_nofence();
+        zeroize_share4(&mut v_shares);
+        return Err(TurboShieldedError::RlcCheckFailed);
+    }
+
+    // 8. 32-Slot Shared-Factor BeaverStar32 update (1 shared `beta` + 16 `alpha_e` + 16 `alpha_s` = 33 openings):
+    //    Reuses a SINGLE `beta = v - b_v` opening across BOTH 16-slot sender debit and 16-slot recipient credit!
+    let mut beta = match TurboLagrange3Of4::open_diff(&v_shares, &star32.b_v) {
+        Ok(b) => b,
+        Err(e) => {
+            star32.wipe_in_place_nofence();
+            zeroize_share4(&mut v_shares);
+            return Err(e);
+        }
+    };
+
+    let mut alpha_e = [0u128; TURBO_BUCKET_SIZE];
+    for k in 0..TURBO_BUCKET_SIZE {
+        match TurboLagrange3Of4::open_diff(&req.sender_selector[k], &star32.a[k]) {
+            Ok(ak) => alpha_e[k] = ak,
+            Err(e) => {
+                star32.wipe_in_place_nofence();
+                zeroize_u128(&mut beta);
+                zeroize_share4_nofence(&mut v_shares);
+                zeroize_u128_slice(&mut alpha_e);
+                return Err(e);
+            }
+        }
+    }
+
+    let mut alpha_s = [0u128; TURBO_BUCKET_SIZE];
+    for k in 0..TURBO_BUCKET_SIZE {
+        match TurboLagrange3Of4::open_diff(
+            &req.recipient_selector[k],
+            &star32.a[TURBO_BUCKET_SIZE + k],
+        ) {
+            Ok(ak) => alpha_s[k] = ak,
+            Err(e) => {
+                star32.wipe_in_place_nofence();
+                zeroize_u128(&mut beta);
+                zeroize_share4_nofence(&mut v_shares);
+                zeroize_u128_slice(&mut alpha_e);
+                zeroize_u128_slice(&mut alpha_s);
+                return Err(e);
+            }
+        }
+    }
+
+    // Apply all 16 blinded debits `-[e_k * v]` to `sender_balances` and all 16 blinded credits
+    // `+[s_k * v]` to `recipient_balances` (or back to `sender_balances` if intra-bucket).
+    {
+        let bv = &star32.b_v;
+        for k in 0..TURBO_BUCKET_SIZE {
+            let ae = alpha_e[k];
+            let ab = mul_unreduced(ae, beta);
+            let ak = &star32.a[k];
+            let ck = &star32.c[k];
+            let bal = &mut sender_balances[k];
+
+            let d0 = canon_le_p(add_unreduced(
+                add_unreduced(mul_unreduced(ae, bv[0]), mul_unreduced(beta, ak[0])),
+                add_unreduced(ck[0], ab),
+            ));
+            let d1 = canon_le_p(add_unreduced(
+                add_unreduced(mul_unreduced(ae, bv[1]), mul_unreduced(beta, ak[1])),
+                add_unreduced(ck[1], ab),
+            ));
+            let d2 = canon_le_p(add_unreduced(
+                add_unreduced(mul_unreduced(ae, bv[2]), mul_unreduced(beta, ak[2])),
+                add_unreduced(ck[2], ab),
+            ));
+            let d3 = canon_le_p(add_unreduced(
+                add_unreduced(mul_unreduced(ae, bv[3]), mul_unreduced(beta, ak[3])),
+                add_unreduced(ck[3], ab),
+            ));
+
+            bal[0] = sub_mod(bal[0], d0);
+            bal[1] = sub_mod(bal[1], d1);
+            bal[2] = sub_mod(bal[2], d2);
+            bal[3] = sub_mod(bal[3], d3);
+        }
+
+        let dst_balances: &mut [Share4; TURBO_BUCKET_SIZE] = match recipient_balances.as_deref_mut()
+        {
+            Some(dst) => dst,
+            None => sender_balances,
+        };
+        for k in 0..TURBO_BUCKET_SIZE {
+            let a_s = alpha_s[k];
+            let ab = mul_unreduced(a_s, beta);
+            let ak = &star32.a[TURBO_BUCKET_SIZE + k];
+            let ck = &star32.c[TURBO_BUCKET_SIZE + k];
+            let bal = &mut dst_balances[k];
+
+            let c0 = add_unreduced(
+                add_unreduced(mul_unreduced(a_s, bv[0]), mul_unreduced(beta, ak[0])),
+                add_unreduced(ck[0], ab),
+            );
+            let c1 = add_unreduced(
+                add_unreduced(mul_unreduced(a_s, bv[1]), mul_unreduced(beta, ak[1])),
+                add_unreduced(ck[1], ab),
+            );
+            let c2 = add_unreduced(
+                add_unreduced(mul_unreduced(a_s, bv[2]), mul_unreduced(beta, ak[2])),
+                add_unreduced(ck[2], ab),
+            );
+            let c3 = add_unreduced(
+                add_unreduced(mul_unreduced(a_s, bv[3]), mul_unreduced(beta, ak[3])),
+                add_unreduced(ck[3], ab),
+            );
+
+            bal[0] = canon_le_p(add_unreduced(bal[0], c0));
+            bal[1] = canon_le_p(add_unreduced(bal[1], c1));
+            bal[2] = canon_le_p(add_unreduced(bal[2], c2));
+            bal[3] = canon_le_p(add_unreduced(bal[3], c3));
+        }
+    }
+
+    star32.wipe_in_place_nofence();
+    zeroize_u128(&mut beta);
+    zeroize_share4_nofence(&mut v_shares);
+    zeroize_u128_slice(&mut alpha_e);
+    zeroize_u128_slice(&mut alpha_s);
+    Ok(())
 }
 
 // ============================================================================
@@ -2212,6 +3151,357 @@ impl TurboShieldedCluster {
         }
     }
 
+    /// Execute a single **Symmetric Blinded** confidential transfer (`132` openings, `67`-check
+    /// blinded Schwartz–Zippel RLC, strictly `2` RTTs) hiding BOTH the sender slot inside
+    /// `req.sender_bucket` AND the recipient slot inside `req.recipient_bucket`, with full atomic
+    /// rollback on any failure.
+    pub fn execute_symmetric_blinded_transfer(
+        &mut self,
+        req: &SymmetricShieldedTxRequest,
+        bank: &mut TurboBeaverBank,
+    ) -> Result<(), TurboShieldedError> {
+        let num_buckets = self.buckets.len();
+        if req.sender_bucket >= num_buckets {
+            return Err(TurboShieldedError::InvalidBucket {
+                bucket_id: req.sender_bucket,
+            });
+        }
+        if req.recipient_bucket >= num_buckets {
+            return Err(TurboShieldedError::InvalidBucket {
+                bucket_id: req.recipient_bucket,
+            });
+        }
+
+        let (squares, stars32, triples) = bank.reserve_for_symmetric_txs(1)?;
+        let gamma = random_nonzero_challenge();
+
+        if req.sender_bucket == req.recipient_bucket {
+            let mut staged = self.buckets[req.sender_bucket].balances;
+            let res = execute_symmetric_blinded_transfer_in_buckets(
+                &mut staged,
+                None,
+                req,
+                squares,
+                &mut stars32[0],
+                triples,
+                gamma,
+            );
+            match res {
+                Ok(()) => {
+                    self.buckets[req.sender_bucket].balances = staged;
+                    zeroize_share4_slice(&mut staged);
+                    Ok(())
+                }
+                Err(e) => {
+                    zeroize_share4_slice(&mut staged);
+                    Err(e)
+                }
+            }
+        } else {
+            let mut staged_src = self.buckets[req.sender_bucket].balances;
+            let mut staged_dst = self.buckets[req.recipient_bucket].balances;
+            let res = execute_symmetric_blinded_transfer_in_buckets(
+                &mut staged_src,
+                Some(&mut staged_dst),
+                req,
+                squares,
+                &mut stars32[0],
+                triples,
+                gamma,
+            );
+            match res {
+                Ok(()) => {
+                    self.buckets[req.sender_bucket].balances = staged_src;
+                    self.buckets[req.recipient_bucket].balances = staged_dst;
+                    zeroize_share4_slice(&mut staged_src);
+                    zeroize_share4_slice(&mut staged_dst);
+                    Ok(())
+                }
+                Err(e) => {
+                    zeroize_share4_slice(&mut staged_src);
+                    zeroize_share4_slice(&mut staged_dst);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Execute a batch of symmetric blinded transfers with full cluster-wide atomic rollback.
+    ///
+    /// Automatically parallelizes across disjoint multi-bucket shards via `std::thread::scope`
+    /// whenever all requests stay within disjoint shards (including both intra-bucket and
+    /// paired cross-bucket transfers `(2k, 2k+1)`), and falls back to exact sequential ordering
+    /// if a request spans shard boundaries.
+    pub fn execute_symmetric_parallel_batch(
+        &mut self,
+        requests: &[SymmetricShieldedTxRequest],
+        bank: &mut TurboBeaverBank,
+    ) -> Result<usize, TurboShieldedError> {
+        if requests.is_empty() {
+            return Ok(0);
+        }
+        let num_buckets = self.buckets.len();
+        self.bucket_counts.fill(0);
+        for req in requests {
+            if req.sender_bucket >= num_buckets {
+                return Err(TurboShieldedError::InvalidBucket {
+                    bucket_id: req.sender_bucket,
+                });
+            }
+            if req.recipient_bucket >= num_buckets {
+                return Err(TurboShieldedError::InvalidBucket {
+                    bucket_id: req.recipient_bucket,
+                });
+            }
+            self.bucket_counts[req.sender_bucket] += 1;
+            self.bucket_counts[req.recipient_bucket] += 1;
+        }
+
+        // Reserve all offline Beaver material upfront.
+        let (squares, stars32, triples) = bank.reserve_for_symmetric_txs(requests.len())?;
+        let gamma = random_nonzero_challenge();
+
+        // Copy all touched buckets into `self.staged`.
+        for b in 0..num_buckets {
+            if self.bucket_counts[b] > 0 {
+                self.staged[b].balances = self.buckets[b].balances;
+            }
+        }
+
+        // Partition buckets into even-aligned shards (so paired cross-bucket `(2k, 2k+1)` txs stay
+        // shard-local) when we have multiple workers and >= 2 buckets per shard.
+        let num_shards = if num_buckets >= 2 {
+            let max_pair_shards = num_buckets / 2;
+            self.num_workers.min(max_pair_shards).max(1)
+        } else {
+            1
+        };
+        let mut shard_bounds = Vec::with_capacity(num_shards + 1);
+        shard_bounds.push(0usize);
+        if num_shards == 1 {
+            shard_bounds.push(num_buckets);
+        } else {
+            let total_pairs = num_buckets / 2;
+            let base_pairs = total_pairs / num_shards;
+            let rem_pairs = total_pairs % num_shards;
+            let mut cursor = 0usize;
+            for s in 0..num_shards {
+                let pairs = base_pairs + usize::from(s < rem_pairs);
+                cursor += pairs * 2;
+                if s + 1 == num_shards {
+                    cursor = num_buckets;
+                }
+                shard_bounds.push(cursor);
+            }
+        }
+
+        let shard_of = |b: usize| -> usize {
+            for s in 0..num_shards {
+                if b >= shard_bounds[s] && b < shard_bounds[s + 1] {
+                    return s;
+                }
+            }
+            num_shards - 1
+        };
+
+        let mut shard_reqs: Vec<Vec<usize>> = vec![Vec::new(); num_shards];
+        let mut all_shard_local = num_shards > 1;
+        if all_shard_local {
+            for (idx, req) in requests.iter().enumerate() {
+                let s_src = shard_of(req.sender_bucket);
+                let s_dst = shard_of(req.recipient_bucket);
+                if s_src != s_dst {
+                    all_shard_local = false;
+                    break;
+                }
+                shard_reqs[s_src].push(idx);
+            }
+        }
+
+        let first_err: Option<TurboShieldedError> = if all_shard_local {
+            // Split `self.staged`, `squares`, `stars32`, and `triples` into strictly disjoint
+            // mutable slices per shard (100% safe Rust, zero lock contention).
+            let mut staged_rest: &mut [TurboAnonymityBucket] = &mut self.staged[..];
+            let mut sq_rest: &mut [BeaverSquare] = squares;
+            let mut st_rest: &mut [BeaverStar32] = stars32;
+            let mut tr_rest: &mut [BeaverTriple4] = triples;
+
+            let mut shard_slices = Vec::with_capacity(num_shards);
+            for s in 0..num_shards {
+                let b_len = shard_bounds[s + 1] - shard_bounds[s];
+                let tx_n = shard_reqs[s].len();
+                let (b_slice, b_next) = staged_rest.split_at_mut(b_len);
+                let (sq_slice, sq_next) = sq_rest.split_at_mut(tx_n * SQUARES_PER_SYMMETRIC_TX);
+                let (st_slice, st_next) = st_rest.split_at_mut(tx_n * STARS32_PER_SYMMETRIC_TX);
+                let (tr_slice, tr_next) = tr_rest.split_at_mut(tx_n * TRIPLES_PER_SYMMETRIC_TX);
+                staged_rest = b_next;
+                sq_rest = sq_next;
+                st_rest = st_next;
+                tr_rest = tr_next;
+                shard_slices.push((
+                    shard_bounds[s],
+                    &shard_reqs[s],
+                    b_slice,
+                    sq_slice,
+                    st_slice,
+                    tr_slice,
+                ));
+            }
+
+            std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(num_shards);
+                for (b_base, req_idxs, b_slice, sq_slice, st_slice, tr_slice) in shard_slices {
+                    handles.push(scope.spawn(move || -> Option<TurboShieldedError> {
+                        for (local_i, &req_idx) in req_idxs.iter().enumerate() {
+                            let req = &requests[req_idx];
+                            let sq = &mut sq_slice[local_i * SQUARES_PER_SYMMETRIC_TX
+                                ..(local_i + 1) * SQUARES_PER_SYMMETRIC_TX];
+                            let st = &mut st_slice[local_i];
+                            let tr = &mut tr_slice[local_i * TRIPLES_PER_SYMMETRIC_TX
+                                ..(local_i + 1) * TRIPLES_PER_SYMMETRIC_TX];
+                            let src_local = req.sender_bucket - b_base;
+                            let dst_local = req.recipient_bucket - b_base;
+                            let res = if src_local == dst_local {
+                                execute_symmetric_blinded_transfer_in_buckets(
+                                    &mut b_slice[src_local].balances,
+                                    None,
+                                    req,
+                                    sq,
+                                    st,
+                                    tr,
+                                    gamma,
+                                )
+                            } else if src_local < dst_local {
+                                let (left, right) = b_slice.split_at_mut(dst_local);
+                                execute_symmetric_blinded_transfer_in_buckets(
+                                    &mut left[src_local].balances,
+                                    Some(&mut right[0].balances),
+                                    req,
+                                    sq,
+                                    st,
+                                    tr,
+                                    gamma,
+                                )
+                            } else {
+                                let (left, right) = b_slice.split_at_mut(src_local);
+                                execute_symmetric_blinded_transfer_in_buckets(
+                                    &mut right[0].balances,
+                                    Some(&mut left[dst_local].balances),
+                                    req,
+                                    sq,
+                                    st,
+                                    tr,
+                                    gamma,
+                                )
+                            };
+                            if let Err(e) = res {
+                                for rem_sq in
+                                    &mut sq_slice[(local_i + 1) * SQUARES_PER_SYMMETRIC_TX..]
+                                {
+                                    rem_sq.wipe_in_place_nofence();
+                                }
+                                for rem_st in &mut st_slice[(local_i + 1)..] {
+                                    rem_st.wipe_in_place_nofence();
+                                }
+                                for rem_tr in
+                                    &mut tr_slice[(local_i + 1) * TRIPLES_PER_SYMMETRIC_TX..]
+                                {
+                                    rem_tr.wipe_in_place_nofence();
+                                }
+                                compiler_fence(Ordering::SeqCst);
+                                return Some(e);
+                            }
+                        }
+                        None
+                    }));
+                }
+                let mut err = None;
+                for h in handles {
+                    if let Some(e) = h.join().expect("symmetric shielded worker panicked")
+                        && err.is_none()
+                    {
+                        err = Some(e);
+                    }
+                }
+                err
+            })
+        } else {
+            let mut err = None;
+            for (i, req) in requests.iter().enumerate() {
+                let sq = &mut squares
+                    [i * SQUARES_PER_SYMMETRIC_TX..(i + 1) * SQUARES_PER_SYMMETRIC_TX];
+                let st = &mut stars32[i];
+                let tr = &mut triples
+                    [i * TRIPLES_PER_SYMMETRIC_TX..(i + 1) * TRIPLES_PER_SYMMETRIC_TX];
+                let res = if req.sender_bucket == req.recipient_bucket {
+                    execute_symmetric_blinded_transfer_in_buckets(
+                        &mut self.staged[req.sender_bucket].balances,
+                        None,
+                        req,
+                        sq,
+                        st,
+                        tr,
+                        gamma,
+                    )
+                } else if req.sender_bucket < req.recipient_bucket {
+                    let (left, right) = self.staged.split_at_mut(req.recipient_bucket);
+                    execute_symmetric_blinded_transfer_in_buckets(
+                        &mut left[req.sender_bucket].balances,
+                        Some(&mut right[0].balances),
+                        req,
+                        sq,
+                        st,
+                        tr,
+                        gamma,
+                    )
+                } else {
+                    let (left, right) = self.staged.split_at_mut(req.sender_bucket);
+                    execute_symmetric_blinded_transfer_in_buckets(
+                        &mut right[0].balances,
+                        Some(&mut left[req.recipient_bucket].balances),
+                        req,
+                        sq,
+                        st,
+                        tr,
+                        gamma,
+                    )
+                };
+                if let Err(e) = res {
+                    for rem_sq in &mut squares[(i + 1) * SQUARES_PER_SYMMETRIC_TX..] {
+                        rem_sq.wipe_in_place_nofence();
+                    }
+                    for rem_st in &mut stars32[(i + 1)..] {
+                        rem_st.wipe_in_place_nofence();
+                    }
+                    for rem_tr in &mut triples[(i + 1) * TRIPLES_PER_SYMMETRIC_TX..] {
+                        rem_tr.wipe_in_place_nofence();
+                    }
+                    compiler_fence(Ordering::SeqCst);
+                    err = Some(e);
+                    break;
+                }
+            }
+            err
+        };
+
+        if let Some(e) = first_err {
+            for b in 0..num_buckets {
+                if self.bucket_counts[b] > 0 {
+                    zeroize_share4_slice(&mut self.staged[b].balances);
+                }
+            }
+            return Err(e);
+        }
+
+        for b in 0..num_buckets {
+            if self.bucket_counts[b] > 0 {
+                self.buckets[b].balances = self.staged[b].balances;
+                zeroize_share4_slice(&mut self.staged[b].balances);
+            }
+        }
+        Ok(requests.len())
+    }
+
     /// Execute a batch of confidential transfers across disjoint anonymity buckets on the
     /// persistent multi-core worker pool with zero lock contention and zero per-batch thread spawn.
     ///
@@ -2499,6 +3789,111 @@ pub fn run_turbo_shielded_bench() -> TurboShieldedBench {
         elapsed_secs,
         cores_used,
         openings_per_tx: OPENINGS_PER_TURBO_TX,
+        buckets_used: num_buckets,
+    }
+}
+
+/// Real measured throughput telemetry produced by [`run_symmetric_shielded_bench`].
+#[derive(Debug, Clone)]
+pub struct SymmetricShieldedBench {
+    /// Measured Symmetric Blinded `(3, 4)` IT-MPC throughput (transfers per second).
+    pub symmetric_tps: f64,
+    /// Total full symmetric blinded transfers executed in the timed window.
+    pub total_txs: usize,
+    /// Wall-clock duration in seconds.
+    pub elapsed_secs: f64,
+    /// Number of parallel workers / hardware threads used.
+    pub cores_used: usize,
+    /// Exact `(3, 4)` openings per symmetric blinded transfer (`132`).
+    pub openings_per_tx: usize,
+    /// Exact Schwartz–Zippel RLC checks per transfer (`67`).
+    pub rlc_checks_per_tx: usize,
+    /// Number of anonymity buckets used.
+    pub buckets_used: usize,
+}
+
+impl fmt::Display for SymmetricShieldedBench {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "=== Vernam (VRNM) Symmetric Blinded IT-MPC Benchmark ({} cores, {} buckets) ===",
+            self.cores_used, self.buckets_used
+        )?;
+        writeln!(
+            f,
+            "  Symmetric Blinded TPS : {:>10.0} tx/s ({} txs in {:.4}s)",
+            self.symmetric_tps, self.total_txs, self.elapsed_secs
+        )?;
+        write!(
+            f,
+            "  Openings / Checks     : {:>10} openings, {} RLC checks (2 RTTs)",
+            self.openings_per_tx, self.rlc_checks_per_tx
+        )
+    }
+}
+
+/// Run the live multi-core Symmetric Blinded Sender + Recipient IT-MPC benchmark: `4,096`
+/// cross-bucket symmetric blinded transfers across `64` buckets (`32` disjoint pairs `(2k, 2k+1)`),
+/// hiding BOTH sender and recipient slots (`132` openings, `67`-check blinded RLC, `2` RTTs).
+pub fn run_symmetric_shielded_bench() -> SymmetricShieldedBench {
+    let num_buckets = 64usize;
+    let txs_per_pair = 128usize;
+    let total_txs = (num_buckets / 2) * txs_per_pair; // 4,096 cross-bucket symmetric blinded txs
+
+    let mut cluster =
+        TurboShieldedCluster::new(num_buckets).expect("cluster init must succeed");
+    let cores_used = cluster.num_workers();
+
+    let initial_bal = 3_000u128;
+    for b in 0..num_buckets {
+        for slot in 0..TURBO_BUCKET_SIZE {
+            cluster
+                .mint_balance(b, slot, initial_bal)
+                .expect("mint must succeed");
+        }
+    }
+
+    let mut tracked_bal = vec![[initial_bal; TURBO_BUCKET_SIZE]; num_buckets];
+    let mut bank = TurboBeaverBank::new_for_symmetric_txs(total_txs);
+    let mut requests = Vec::with_capacity(total_txs);
+
+    for pair in 0..(num_buckets / 2) {
+        let b_a = pair * 2;
+        let b_b = pair * 2 + 1;
+        for i in 0..txs_per_pair {
+            let (src_b, dst_b) = if i % 2 == 0 { (b_a, b_b) } else { (b_b, b_a) };
+            let sender = (i / 2) % TURBO_BUCKET_SIZE;
+            let recipient = (sender + 3) % TURBO_BUCKET_SIZE;
+            let amount = 5u128;
+            let req = SymmetricShieldedTxRequest::new(
+                src_b,
+                dst_b,
+                sender,
+                tracked_bal[src_b][sender],
+                recipient,
+                amount,
+            )
+            .expect("valid symmetric blinded request");
+            tracked_bal[src_b][sender] -= amount;
+            tracked_bal[dst_b][recipient] += amount;
+            requests.push(req);
+        }
+    }
+
+    let start = Instant::now();
+    let committed = cluster
+        .execute_symmetric_parallel_batch(&requests, &mut bank)
+        .expect("symmetric shielded parallel batch must succeed");
+    let elapsed_secs = start.elapsed().as_secs_f64().max(1e-9);
+    let symmetric_tps = (committed as f64) / elapsed_secs;
+
+    SymmetricShieldedBench {
+        symmetric_tps,
+        total_txs: committed,
+        elapsed_secs,
+        cores_used,
+        openings_per_tx: OPENINGS_PER_SYMMETRIC_TX,
+        rlc_checks_per_tx: CHECKS_PER_SYMMETRIC_TX,
         buckets_used: num_buckets,
     }
 }
@@ -3055,5 +4450,236 @@ mod tests {
                 "total supply not conserved in bucket {b}"
             );
         }
+    }
+
+    #[test]
+    fn test_symmetric_blinded_transfer_cross_and_intra_bucket_conservation_and_it_privacy() {
+        let num_buckets = 4usize;
+        let mut cluster = TurboShieldedCluster::new(num_buckets).unwrap();
+        let mut expected = vec![[0u128; TURBO_BUCKET_SIZE]; num_buckets];
+        let mut total_supply = 0u128;
+
+        for b in 0..num_buckets {
+            for s in 0..TURBO_BUCKET_SIZE {
+                let init = 1_000 + (b as u128) * 17 + (s as u128) * 5;
+                cluster.mint_balance(b, s, init).unwrap();
+                expected[b][s] = init;
+                total_supply += init;
+            }
+        }
+
+        // Snapshot ALL 16 shares of bucket 0 (sender bucket) and bucket 1 (recipient bucket).
+        let pre_b0: Vec<Share4> = (0..TURBO_BUCKET_SIZE)
+            .map(|s| *cluster.balance_shares(0, s).unwrap())
+            .collect();
+        let pre_b1: Vec<Share4> = (0..TURBO_BUCKET_SIZE)
+            .map(|s| *cluster.balance_shares(1, s).unwrap())
+            .collect();
+
+        let mut bank = TurboBeaverBank::new_for_symmetric_txs(16);
+        assert_eq!(bank.available_symmetric_txs(), 16);
+        assert_eq!(OPENINGS_PER_SYMMETRIC_TX, 132);
+        assert_eq!(CHECKS_PER_SYMMETRIC_TX, 67);
+
+        // 1. Cross-bucket symmetric blinded transfer: (bucket 0, slot 7) -> (bucket 1, slot 12), amount 123.
+        let req1 =
+            SymmetricShieldedTxRequest::new(0, 1, 7, expected[0][7], 12, 123).unwrap();
+        assert!(format!("{req1:?}").contains("<redacted>"));
+        cluster
+            .execute_symmetric_blinded_transfer(&req1, &mut bank)
+            .unwrap();
+        expected[0][7] -= 123;
+        expected[1][12] += 123;
+
+        // Verify EVERY slot in BOTH sender_bucket 0 AND recipient_bucket 1 re-randomized!
+        for s in 0..TURBO_BUCKET_SIZE {
+            assert_ne!(
+                *cluster.balance_shares(0, s).unwrap(),
+                pre_b0[s],
+                "sender bucket slot {s} must re-randomize to hide sender identity"
+            );
+            assert_ne!(
+                *cluster.balance_shares(1, s).unwrap(),
+                pre_b1[s],
+                "recipient bucket slot {s} must re-randomize to hide recipient identity"
+            );
+        }
+
+        // 2. Intra-bucket symmetric blinded transfer: (bucket 2, slot 3) -> (bucket 2, slot 14), amount 250.
+        let req2 =
+            SymmetricShieldedTxRequest::new(2, 2, 3, expected[2][3], 14, 250).unwrap();
+        cluster
+            .execute_symmetric_blinded_transfer(&req2, &mut bank)
+            .unwrap();
+        expected[2][3] -= 250;
+        expected[2][14] += 250;
+
+        // 3. Self-transfer inside same bucket: (bucket 3, slot 5) -> (bucket 3, slot 5), amount 77.
+        let req3 =
+            SymmetricShieldedTxRequest::new(3, 3, 5, expected[3][5], 5, 77).unwrap();
+        cluster
+            .execute_symmetric_blinded_transfer(&req3, &mut bank)
+            .unwrap();
+
+        // 4. Reverse cross-bucket transfer: (bucket 3, slot 15) -> (bucket 0, slot 0), amount 400.
+        let req4 =
+            SymmetricShieldedTxRequest::new(3, 0, 15, expected[3][15], 0, 400).unwrap();
+        cluster
+            .execute_symmetric_blinded_transfer(&req4, &mut bank)
+            .unwrap();
+        expected[3][15] -= 400;
+        expected[0][0] += 400;
+
+        // Verify exact balance conservation across ALL buckets and slots!
+        let mut actual_supply = 0u128;
+        for b in 0..num_buckets {
+            for s in 0..TURBO_BUCKET_SIZE {
+                let bal = cluster.reconstruct_balance(b, s).unwrap();
+                assert_eq!(
+                    bal, expected[b][s],
+                    "symmetric blinded balance mismatch at bucket {b}, slot {s}"
+                );
+                actual_supply += bal;
+            }
+        }
+        assert_eq!(actual_supply, total_supply);
+    }
+
+    #[test]
+    fn test_symmetric_blinded_forged_sender_selector_and_overdraft_rejected_and_rolled_back() {
+        let num_buckets = 4usize;
+        let mut cluster = TurboShieldedCluster::new(num_buckets).unwrap();
+        let init_bal = 500u128;
+        for b in 0..num_buckets {
+            for s in 0..TURBO_BUCKET_SIZE {
+                cluster.mint_balance(b, s, init_bal).unwrap();
+            }
+        }
+
+        let mut bank = TurboBeaverBank::new_for_symmetric_txs(32);
+
+        let make_bits = |val: u128| -> [Share4; TURBO_RANGE_BITS] {
+            let mut out = [[0u128; 4]; TURBO_RANGE_BITS];
+            for j in 0..TURBO_RANGE_BITS {
+                out[j] = TurboLagrange3Of4::split_secret((val >> j) & 1).unwrap();
+            }
+            out
+        };
+        let make_one_hot = |target: usize| -> [Share4; TURBO_BUCKET_SIZE] {
+            let mut out = [[0u128; 4]; TURBO_BUCKET_SIZE];
+            for k in 0..TURBO_BUCKET_SIZE {
+                out[k] = TurboLagrange3Of4::split_secret(if k == target { 1 } else { 0 }).unwrap();
+            }
+            out
+        };
+
+        // Attack 1: Forged non-binary sender selector (e_0 = 2, e_1 = -1 => sum = 1, but e_k not binary!).
+        let mut nonbin_sender = make_one_hot(0);
+        nonbin_sender[0] = TurboLagrange3Of4::split_secret(2).unwrap();
+        nonbin_sender[1] = TurboLagrange3Of4::split_secret(PRIME_P - 1).unwrap();
+        let req_nonbin = SymmetricShieldedTxRequest::new_raw(
+            0,
+            1,
+            nonbin_sender,
+            make_one_hot(2),
+            make_bits(50),
+            make_bits(init_bal - 50),
+        );
+        assert_eq!(
+            cluster.execute_symmetric_blinded_transfer(&req_nonbin, &mut bank),
+            Err(TurboShieldedError::RlcCheckFailed)
+        );
+
+        // Attack 2: Double-one sender selector (e_0 = 1 AND e_1 = 1 => B_sender = 1000, sum = 2 != 1!).
+        let mut dbl_sender = make_one_hot(0);
+        dbl_sender[1] = TurboLagrange3Of4::split_secret(1).unwrap();
+        let req_dbl = SymmetricShieldedTxRequest::new_raw(
+            0,
+            1,
+            dbl_sender,
+            make_one_hot(2),
+            make_bits(700),
+            make_bits(300),
+        );
+        assert_eq!(
+            cluster.execute_symmetric_blinded_transfer(&req_dbl, &mut bank),
+            Err(TurboShieldedError::RlcCheckFailed)
+        );
+
+        // Attack 3: Zero sender selector (all e_k = 0 => sum = 0 != 1, tries to mint from thin air).
+        let zero_sender = [[0u128; 4]; TURBO_BUCKET_SIZE];
+        let req_zero_sender = SymmetricShieldedTxRequest::new_raw(
+            0,
+            1,
+            zero_sender,
+            make_one_hot(2),
+            make_bits(0),
+            make_bits(0),
+        );
+        assert_eq!(
+            cluster.execute_symmetric_blinded_transfer(&req_zero_sender, &mut bank),
+            Err(TurboShieldedError::RlcCheckFailed)
+        );
+
+        // Attack 4: Overdraft (amount = init_bal + 1 = 501, remainder = 0).
+        let req_overdraft = SymmetricShieldedTxRequest::new_raw(
+            0,
+            1,
+            make_one_hot(3),
+            make_one_hot(4),
+            make_bits(init_bal + 1),
+            make_bits(0),
+        );
+        assert_eq!(
+            cluster.execute_symmetric_blinded_transfer(&req_overdraft, &mut bank),
+            Err(TurboShieldedError::RlcCheckFailed)
+        );
+
+        // Attack 5: Forged `amount_share` inconsistent with proven `v_bits`.
+        let mut req_bad_amt =
+            SymmetricShieldedTxRequest::new(0, 1, 0, init_bal, 1, 10).unwrap();
+        req_bad_amt.amount_share = TurboLagrange3Of4::split_secret(999).unwrap();
+        assert_eq!(
+            cluster.execute_symmetric_blinded_transfer(&req_bad_amt, &mut bank),
+            Err(TurboShieldedError::RlcCheckFailed)
+        );
+
+        // Attack 6: Atomic parallel batch rollback — valid cross-bucket tx in (0 -> 1) MUST roll
+        // back when paired tx in (2 -> 3) has an overdraft!
+        let valid_tx = SymmetricShieldedTxRequest::new(0, 1, 0, init_bal, 1, 100).unwrap();
+        let bad_tx = SymmetricShieldedTxRequest::new_raw(
+            2,
+            3,
+            make_one_hot(0),
+            make_one_hot(1),
+            make_bits(init_bal + 5),
+            make_bits(0),
+        );
+        assert_eq!(
+            cluster.execute_symmetric_parallel_batch(&[valid_tx, bad_tx], &mut bank),
+            Err(TurboShieldedError::RlcCheckFailed)
+        );
+
+        // Verify ZERO balances changed across ANY bucket or slot!
+        for b in 0..num_buckets {
+            for s in 0..TURBO_BUCKET_SIZE {
+                assert_eq!(
+                    cluster.reconstruct_balance(b, s).unwrap(),
+                    init_bal,
+                    "bucket {b} slot {s} mutated after failed symmetric transfer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_symmetric_shielded_bench_live_tps() {
+        let report = run_symmetric_shielded_bench();
+        println!("\n{report}\n");
+        assert_eq!(report.total_txs, 4_096);
+        assert_eq!(report.openings_per_tx, 132);
+        assert_eq!(report.rlc_checks_per_tx, 67);
+        assert_eq!(report.buckets_used, 64);
+        assert!(report.symmetric_tps > 0.0);
     }
 }

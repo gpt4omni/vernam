@@ -1,0 +1,1 @@
+{"rustc":1625334936438085654,"features":"[]","declared_features":"[]","target":10712612791333474739,"profile":1242402958922567795,"path":10763286916239946207,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release/.fingerprint/vernam-kernel-29e60f811bc175ea/dep-lib-vernam_kernel","checksum":false}}],"rustflags":["-D","warnings"],"config":9396254390672932401,"compile_kind":0}

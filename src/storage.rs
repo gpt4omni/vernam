@@ -5,17 +5,30 @@
 //! with a prefix-collision-free 128-bit Carter-Wegman MAC over the Mersenne prime field
 //! `F_(2^127 - 1)` using `crate::field`, verified in constant time via `ct_eq_16`.
 //!
+//! # Rotating One-Time Carter-Wegman MAC Security
+//! - Every snapshot save, WAL header write, and WAL record append consumes a **fresh,
+//!   never-reused 128-bit additive pad `s_seq`** (`< PRIME_P`), indexed by
+//!   `(domain, snapshot_epoch, seq)` in a crash-safe `0600` pad tape (`mac_pads.tape`)
+//!   that is `fsync`ed BEFORE writing the authenticated record.
+//! - Every snapshot compaction rotates the polynomial evaluation scalar `r` to a fresh
+//!   non-zero scalar in `F_(2^127 - 1)`.
+//! - Because NO two MAC tags ever reuse `(r, s)`, on-disk forgery resistance remains
+//!   unconditionally bounded by `<= d / (2^127 - 1)` regardless of how many snapshots
+//!   or WAL records an adversary observes.
+//!
 //! # Crash-Safety Guarantees
 //! - All directory and file permissions are restricted to owner-only (`0700` dir, `0600` files) on Unix.
-//! - Snapshots and keyfiles are written atomically via temp file -> `sync_all()` -> `rename()` -> parent-dir `fsync`.
+//! - Snapshots, keyfiles, and fresh WAL headers are written atomically via temp file ->
+//!   `sync_all()` -> `rename()` -> parent-dir `fsync`.
 //! - Each snapshot carries a strictly monotonic `snapshot_epoch`; companion WAL files are cryptographically
 //!   bound to the active `snapshot_epoch` so a crash between snapshot rename and WAL reset safely discards
 //!   the already-snapshotted stale WAL on recovery.
 //! - WAL delta records are strictly sequenced (`0, 1, 2, ...`), protected by a framing guard and 128-bit
 //!   Carter-Wegman MAC bound to `(wal_epoch, seq, payload_len, payload)`, and `sync_all()`ed before return.
-//! - On recovery (`CrashSafeChainStore::open`), incomplete torn trailing WAL writes are zeroed on disk and
-//!   truncated cleanly, whereas any mid-WAL corruption, bit-flip, or sequence reordering is rejected.
+//! - On recovery (`CrashSafeChainStore::open`), incomplete torn trailing WAL or pad-tape writes are zeroed
+//!   on disk and truncated cleanly, whereas any mid-WAL corruption, bit-flip, or sequence reordering is rejected.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -26,7 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::field::{
-    PRIME_P, add_mod, ct_eq_16, mul_mod, random_field_elem, reduce, zeroize_slice, zeroize_u128,
+    PRIME_P, add_mod, ct_eq_16, mul_mod, random_field_elem, random_nonzero_field_elem, reduce,
+    zeroize_slice, zeroize_u128,
 };
 
 /// Snapshot binary file magic header.
@@ -41,8 +55,14 @@ pub const WAL_MAGIC: &[u8; 8] = b"VRNMWL01";
 /// Integrity keyfile binary magic header.
 pub const KEYFILE_MAGIC: &[u8; 8] = b"VRNMKEY1";
 
+/// Rotating CW-MAC one-time additive pad tape binary magic header.
+pub const MAC_PADS_MAGIC: &[u8; 8] = b"VRNMMP01";
+
 /// Carter-Wegman MAC tag length in bytes (128-bit big-endian canonical `F_(2^127 - 1)` element).
 pub const MAC_TAG_BYTES: usize = 16;
+
+/// Maximum number of rotating CW-MAC pad records permitted in a single pad tape.
+pub const MAX_MAC_PAD_RECORDS: usize = 4_000_000;
 
 /// Maximum number of recent events allowed in a snapshot.
 pub const MAX_RECENT_EVENTS: usize = 64;
@@ -97,8 +117,15 @@ const WAL_TAG_EPOCH_SETTLED: u8 = 0x04;
 
 // Filenames inside `data_dir`.
 const KEY_FILENAME: &str = "integrity.key";
+const MAC_PADS_FILENAME: &str = "mac_pads.tape";
 const SNAPSHOT_FILENAME: &str = "chain.snap";
 const WAL_FILENAME: &str = "chain.wal";
+
+// Rotating CW-MAC pad tape layout constants.
+const MAC_PADS_VERSION: u32 = 1;
+const MAC_PADS_HEADER_GUARD: u32 = 0x5652_4D50; // "VRMP"
+const MAC_PADS_HEADER_LEN: usize = 8 + 4 + 4; // magic(8) + version(4) + guard(4) = 16 bytes
+const MAC_PADS_RECORD_LEN: usize = 8 + 4 + 8 + 8 + 16 + 16 + 8; // pad_id + domain + epoch + seq + r + s + guard = 68 bytes
 
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -270,34 +297,7 @@ impl StorageIntegrityKey {
     ///   dependence on `r` even for empty data), then masks with `(acc + s) mod PRIME_P`.
     #[inline]
     pub fn compute_mac(&self, domain: u32, context: u64, data: &[u8]) -> [u8; MAC_TAG_BYTES] {
-        let r = reduce(self.r);
-        let s = reduce(self.s);
-
-        let mut acc: u128 = 0;
-
-        // Header block binding domain tag and 64-bit context (snapshot epoch or WAL epoch).
-        let hdr_block: u128 = (1u128 << 120) | ((domain as u128) << 64) | (context as u128);
-        acc = mul_mod(add_mod(acc, hdr_block), r);
-
-        // Injective 15-byte chunking with trailing 0x01 sentinel per chunk.
-        let mut buf = [0u8; 16];
-        for chunk in data.chunks(15) {
-            buf = [0u8; 16];
-            buf[..chunk.len()].copy_from_slice(chunk);
-            buf[chunk.len()] = 0x01;
-            let block = u128::from_le_bytes(buf);
-            acc = mul_mod(add_mod(acc, block), r);
-        }
-        zeroize_slice(&mut buf);
-
-        // Explicit length trailer prevents prefix/extension collisions across all byte lengths.
-        let len_block: u128 = (1u128 << 120) | (data.len() as u64 as u128);
-        acc = mul_mod(add_mod(acc, len_block), r);
-
-        let tag_val = add_mod(acc, s);
-        zeroize_u128(&mut acc);
-        debug_assert!(tag_val < PRIME_P);
-        tag_val.to_be_bytes()
+        compute_cw_mac_raw(self.r, self.s, domain, context, data)
     }
 
     /// Verify a 128-bit Carter-Wegman MAC in constant time using `ct_eq_16`.
@@ -309,10 +309,7 @@ impl StorageIntegrityKey {
         data: &[u8],
         tag: &[u8; MAC_TAG_BYTES],
     ) -> bool {
-        let mut expected = self.compute_mac(domain, context, data);
-        let ok = ct_eq_16(&expected, tag);
-        zeroize_slice(&mut expected);
-        ok
+        verify_cw_mac_raw(self.r, self.s, domain, context, data, tag)
     }
 
     /// Immediately wipe both secret scalars in RAM using volatile writes.
@@ -334,6 +331,447 @@ impl fmt::Debug for StorageIntegrityKey {
         f.debug_struct("StorageIntegrityKey")
             .field("r", &"[REDACTED]")
             .field("s", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Pure prefix-collision-free 128-bit Carter-Wegman MAC over `F_(2^127 - 1)` for a specific `(r, s)`.
+#[inline]
+fn compute_cw_mac_raw(
+    r: u128,
+    s: u128,
+    domain: u32,
+    context: u64,
+    data: &[u8],
+) -> [u8; MAC_TAG_BYTES] {
+    let r = reduce(r);
+    let s = reduce(s);
+
+    let mut acc: u128 = 0;
+
+    // Header block binding domain tag and 64-bit context (snapshot epoch or WAL epoch).
+    let hdr_block: u128 = (1u128 << 120) | ((domain as u128) << 64) | (context as u128);
+    acc = mul_mod(add_mod(acc, hdr_block), r);
+
+    // Injective 15-byte chunking with trailing 0x01 sentinel per chunk.
+    let mut buf = [0u8; 16];
+    for chunk in data.chunks(15) {
+        buf = [0u8; 16];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        buf[chunk.len()] = 0x01;
+        let block = u128::from_le_bytes(buf);
+        acc = mul_mod(add_mod(acc, block), r);
+    }
+    zeroize_slice(&mut buf);
+
+    // Explicit length trailer prevents prefix/extension collisions across all byte lengths.
+    let len_block: u128 = (1u128 << 120) | (data.len() as u64 as u128);
+    acc = mul_mod(add_mod(acc, len_block), r);
+
+    let tag_val = add_mod(acc, s);
+    zeroize_u128(&mut acc);
+    debug_assert!(tag_val < PRIME_P);
+    tag_val.to_be_bytes()
+}
+
+/// Constant-time Carter-Wegman MAC verification for a specific `(r, s)` using `ct_eq_16`.
+#[inline]
+fn verify_cw_mac_raw(
+    r: u128,
+    s: u128,
+    domain: u32,
+    context: u64,
+    data: &[u8],
+    tag: &[u8; MAC_TAG_BYTES],
+) -> bool {
+    let mut expected = compute_cw_mac_raw(r, s, domain, context, data);
+    let ok = ct_eq_16(&expected, tag);
+    zeroize_slice(&mut expected);
+    ok
+}
+
+/// Deterministic 64-bit framing guard for `mac_pads.tape` records (torn-write / corruption detection).
+#[inline]
+fn compute_pad_record_guard(
+    pad_id: u64,
+    domain: u32,
+    epoch: u64,
+    seq: u64,
+    r: u128,
+    s: u128,
+) -> u64 {
+    let mut h: u64 = 0x5652_4E4D_5041_4431;
+    for word in [
+        pad_id,
+        ((domain as u64) << 32) ^ (domain as u64).rotate_left(13),
+        epoch,
+        seq,
+        r as u64,
+        (r >> 64) as u64,
+        s as u64,
+        (s >> 64) as u64,
+    ] {
+        h = h.rotate_left(17) ^ word.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    h ^ 0xA55A_C33C_5A5A_3C3C
+}
+
+/// Rotating one-time-pad Carter-Wegman MAC key manager backed by a crash-safe `0600` pad tape
+/// (`mac_pads.tape`).
+///
+/// Guarantees:
+/// - Every snapshot save, WAL header write, and WAL record append allocates a fresh, never-reused
+///   128-bit additive pad `s_seq < PRIME_P` indexed by `(domain, snapshot_epoch, seq)`.
+/// - Every allocated pad is appended and `fsync`ed to `mac_pads.tape` BEFORE the authenticated
+///   snapshot or WAL record is written.
+/// - Every snapshot compaction rotates the polynomial evaluation scalar `r` to a fresh non-zero
+///   element of `F_(2^127 - 1)`.
+/// - All secret scalars are volatile-zeroized on `Drop` and redacted in `Debug`.
+pub struct RotatingCwStorageKey {
+    tape_path: PathBuf,
+    tape_file: File,
+    current_epoch: u64,
+    current_r: u128,
+    next_pad_id: u64,
+    epoch_r: HashMap<u64, u128>,
+    active_pads: HashMap<(u32, u64, u64), (u128, u128)>,
+    used_s: HashSet<u128>,
+}
+
+impl RotatingCwStorageKey {
+    /// Open an existing `0600` `mac_pads.tape` in `data_dir` or atomically initialize a fresh one.
+    pub fn open_or_create(data_dir: impl AsRef<Path>, initial_r: u128) -> Result<Self, StorageError> {
+        if initial_r >= PRIME_P {
+            return Err(StorageError::NonCanonicalFieldElement);
+        }
+        if initial_r == 0 {
+            return Err(StorageError::CorruptFormat(
+                "rotating CW-MAC initial evaluation scalar r must be non-zero".into(),
+            ));
+        }
+
+        let tape_path = data_dir.as_ref().join(MAC_PADS_FILENAME);
+        let mut epoch_r: HashMap<u64, u128> = HashMap::new();
+        let mut active_pads: HashMap<(u32, u64, u64), (u128, u128)> = HashMap::new();
+        let mut used_s: HashSet<u128> = HashSet::new();
+
+        if !tape_path.exists() {
+            let mut hdr = [0u8; MAC_PADS_HEADER_LEN];
+            hdr[0..8].copy_from_slice(MAC_PADS_MAGIC);
+            hdr[8..12].copy_from_slice(&MAC_PADS_VERSION.to_be_bytes());
+            hdr[12..16].copy_from_slice(&MAC_PADS_HEADER_GUARD.to_be_bytes());
+            write_file_atomic_0600(&tape_path, &hdr)?;
+
+            let mut tape_file = open_secret_file(&tape_path, false)?;
+            tape_file.seek(SeekFrom::End(0))?;
+            epoch_r.insert(0, initial_r);
+            return Ok(Self {
+                tape_path,
+                tape_file,
+                current_epoch: 0,
+                current_r: initial_r,
+                next_pad_id: 0,
+                epoch_r,
+                active_pads,
+                used_s,
+            });
+        }
+
+        let mut tape_file = open_secret_file(&tape_path, false)?;
+        let file_len = tape_file.metadata()?.len();
+        if file_len < MAC_PADS_HEADER_LEN as u64 {
+            let mut partial = vec![0u8; file_len as usize];
+            tape_file.seek(SeekFrom::Start(0))?;
+            tape_file.read_exact(&mut partial)?;
+            if partial.len() >= 8 && &partial[0..8] != MAC_PADS_MAGIC {
+                return Err(StorageError::CorruptMagic);
+            }
+            return Err(StorageError::TruncatedRecord);
+        }
+
+        let mut hdr = [0u8; MAC_PADS_HEADER_LEN];
+        tape_file.seek(SeekFrom::Start(0))?;
+        tape_file.read_exact(&mut hdr)?;
+        if &hdr[0..8] != MAC_PADS_MAGIC {
+            return Err(StorageError::CorruptMagic);
+        }
+        let version = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+        if version != MAC_PADS_VERSION {
+            return Err(StorageError::CorruptFormat(format!(
+                "unsupported mac_pads.tape version {version}"
+            )));
+        }
+        let hdr_guard = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
+        if hdr_guard != MAC_PADS_HEADER_GUARD {
+            return Err(StorageError::CorruptFormat(
+                "corrupt mac_pads.tape header guard".into(),
+            ));
+        }
+
+        let mut offset = MAC_PADS_HEADER_LEN as u64;
+        let mut expected_pad_id: u64 = 0;
+        let mut current_epoch: u64 = 0;
+        let mut current_r: u128 = initial_r;
+        let mut torn_tail_offset: Option<u64> = None;
+        let mut rec = [0u8; MAC_PADS_RECORD_LEN];
+
+        while offset < file_len {
+            let rem = file_len - offset;
+            if rem < MAC_PADS_RECORD_LEN as u64 {
+                // Incomplete trailing pad record from a crash prior to fsync.
+                torn_tail_offset = Some(offset);
+                break;
+            }
+            tape_file.seek(SeekFrom::Start(offset))?;
+            tape_file.read_exact(&mut rec)?;
+
+            if rec.iter().all(|&b| b == 0) && is_all_zero_tail(&mut tape_file, offset, file_len)? {
+                torn_tail_offset = Some(offset);
+                break;
+            }
+
+            let pad_id = u64::from_be_bytes(rec[0..8].try_into().unwrap());
+            let domain = u32::from_be_bytes(rec[8..12].try_into().unwrap());
+            let epoch = u64::from_be_bytes(rec[12..20].try_into().unwrap());
+            let seq = u64::from_be_bytes(rec[20..28].try_into().unwrap());
+            let r = u128::from_be_bytes(rec[28..44].try_into().unwrap());
+            let s = u128::from_be_bytes(rec[44..60].try_into().unwrap());
+            let stored_guard = u64::from_be_bytes(rec[60..68].try_into().unwrap());
+            zeroize_slice(&mut rec);
+
+            if pad_id != expected_pad_id {
+                return Err(StorageError::CorruptFormat(format!(
+                    "mac_pads.tape pad_id mismatch: got {pad_id}, expected {expected_pad_id}"
+                )));
+            }
+            if stored_guard != compute_pad_record_guard(pad_id, domain, epoch, seq, r, s) {
+                return Err(StorageError::CorruptFormat(format!(
+                    "mac_pads.tape record {pad_id} failed integrity guard"
+                )));
+            }
+            if r >= PRIME_P || s >= PRIME_P {
+                return Err(StorageError::NonCanonicalFieldElement);
+            }
+            if r == 0 {
+                return Err(StorageError::CorruptFormat(format!(
+                    "mac_pads.tape record {pad_id} has zero evaluation scalar r"
+                )));
+            }
+
+            epoch_r.insert(epoch, r);
+            active_pads.insert((domain, epoch, seq), (r, s));
+            used_s.insert(s);
+            if epoch >= current_epoch {
+                current_epoch = epoch;
+                current_r = r;
+            }
+
+            offset += MAC_PADS_RECORD_LEN as u64;
+            expected_pad_id = expected_pad_id
+                .checked_add(1)
+                .ok_or_else(|| StorageError::CorruptFormat("pad_id overflow".into()))?;
+            if (expected_pad_id as usize) > MAX_MAC_PAD_RECORDS {
+                return Err(StorageError::SizeLimitExceeded {
+                    actual: expected_pad_id as usize,
+                    max: MAX_MAC_PAD_RECORDS,
+                });
+            }
+        }
+        zeroize_slice(&mut rec);
+
+        if let Some(valid_end) = torn_tail_offset {
+            zero_and_truncate_tail(&mut tape_file, valid_end, file_len)?;
+        }
+
+        if epoch_r.is_empty() {
+            epoch_r.insert(0, initial_r);
+        }
+
+        tape_file.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            tape_path,
+            tape_file,
+            current_epoch,
+            current_r,
+            next_pad_id: expected_pad_id,
+            epoch_r,
+            active_pads,
+            used_s,
+        })
+    }
+
+    /// Path to the `0600` pad tape file (`mac_pads.tape`).
+    #[inline]
+    pub fn tape_path(&self) -> &Path {
+        &self.tape_path
+    }
+
+    /// Total number of one-time additive pads allocated and persisted so far.
+    #[inline]
+    pub fn allocated_pad_count(&self) -> u64 {
+        self.next_pad_id
+    }
+
+    /// Current highest snapshot epoch tracked by this key manager.
+    #[inline]
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch
+    }
+
+    /// Rotate the polynomial evaluation key `r` to a fresh non-zero element of `F_(2^127 - 1)`
+    /// for `new_epoch` (called on every snapshot save / compaction).
+    pub fn rotate_epoch_r(&mut self, new_epoch: u64) {
+        let fresh_r = loop {
+            let candidate = random_nonzero_field_elem();
+            if candidate != self.current_r && !self.epoch_r.values().any(|&old| old == candidate) {
+                break candidate;
+            }
+        };
+        self.epoch_r.insert(new_epoch, fresh_r);
+        self.current_epoch = new_epoch;
+        self.current_r = fresh_r;
+    }
+
+    /// Allocate a fresh, never-reused 128-bit additive pad `s_seq < PRIME_P` for
+    /// `(domain, epoch, seq)`, persist and `fsync` it to `mac_pads.tape` BEFORE returning,
+    /// and compute the 128-bit Carter-Wegman MAC over `(domain, context, data)`.
+    pub fn allocate_and_compute_mac(
+        &mut self,
+        domain: u32,
+        epoch: u64,
+        seq: u64,
+        context: u64,
+        data: &[u8],
+    ) -> Result<[u8; MAC_TAG_BYTES], StorageError> {
+        if (self.next_pad_id as usize) >= MAX_MAC_PAD_RECORDS {
+            return Err(StorageError::SizeLimitExceeded {
+                actual: (self.next_pad_id as usize).saturating_add(1),
+                max: MAX_MAC_PAD_RECORDS,
+            });
+        }
+
+        let r = *self.epoch_r.get(&epoch).unwrap_or(&self.current_r);
+        debug_assert!(r > 0 && r < PRIME_P);
+
+        // Rejection-sample a strictly fresh canonical 128-bit additive pad `s < PRIME_P`.
+        let s = loop {
+            let candidate = random_field_elem();
+            if !self.used_s.contains(&candidate) {
+                break candidate;
+            }
+        };
+
+        let pad_id = self.next_pad_id;
+        let guard = compute_pad_record_guard(pad_id, domain, epoch, seq, r, s);
+
+        let mut rec = [0u8; MAC_PADS_RECORD_LEN];
+        rec[0..8].copy_from_slice(&pad_id.to_be_bytes());
+        rec[8..12].copy_from_slice(&domain.to_be_bytes());
+        rec[12..20].copy_from_slice(&epoch.to_be_bytes());
+        rec[20..28].copy_from_slice(&seq.to_be_bytes());
+        rec[28..44].copy_from_slice(&r.to_be_bytes());
+        rec[44..60].copy_from_slice(&s.to_be_bytes());
+        rec[60..68].copy_from_slice(&guard.to_be_bytes());
+
+        let prior_len = self.tape_file.seek(SeekFrom::End(0))?;
+        let write_res = (|| -> io::Result<()> {
+            self.tape_file.write_all(&rec)?;
+            self.tape_file.sync_all()?;
+            Ok(())
+        })();
+        zeroize_slice(&mut rec);
+
+        if let Err(err) = write_res {
+            let _ = self.tape_file.set_len(prior_len);
+            let _ = self.tape_file.sync_all();
+            return Err(err.into());
+        }
+
+        self.epoch_r.insert(epoch, r);
+        self.active_pads.insert((domain, epoch, seq), (r, s));
+        self.used_s.insert(s);
+        self.next_pad_id += 1;
+
+        Ok(compute_cw_mac_raw(r, s, domain, context, data))
+    }
+
+    /// Verify a 128-bit Carter-Wegman MAC in constant time (`ct_eq_16`) using the dedicated
+    /// one-time additive pad indexed by `(domain, epoch, seq)`.
+    #[inline]
+    pub fn verify_mac(
+        &self,
+        domain: u32,
+        epoch: u64,
+        seq: u64,
+        context: u64,
+        data: &[u8],
+        tag: &[u8; MAC_TAG_BYTES],
+    ) -> bool {
+        let Some(&(r, s)) = self.active_pads.get(&(domain, epoch, seq)) else {
+            return false;
+        };
+        verify_cw_mac_raw(r, s, domain, context, data, tag)
+    }
+
+    /// Immediately volatile-zeroize all secret scalars held in RAM.
+    pub fn zeroize(&mut self) {
+        zeroize_u128(&mut self.current_r);
+        for r in self.epoch_r.values_mut() {
+            zeroize_u128(r);
+        }
+        self.epoch_r.clear();
+        for (r, s) in self.active_pads.values_mut() {
+            zeroize_u128(r);
+            zeroize_u128(s);
+        }
+        self.active_pads.clear();
+        self.used_s.clear();
+    }
+
+    #[cfg(test)]
+    fn active_pad(&self, domain: u32, epoch: u64, seq: u64) -> Option<(u128, u128)> {
+        self.active_pads.get(&(domain, epoch, seq)).copied()
+    }
+
+    #[cfg(test)]
+    fn read_all_tape_records(
+        tape_path: &Path,
+    ) -> Result<Vec<(u64, u32, u64, u64, u128, u128)>, StorageError> {
+        let raw = fs::read(tape_path)?;
+        if raw.len() < MAC_PADS_HEADER_LEN {
+            return Err(StorageError::TruncatedRecord);
+        }
+        let mut out = Vec::new();
+        let mut pos = MAC_PADS_HEADER_LEN;
+        while pos + MAC_PADS_RECORD_LEN <= raw.len() {
+            let rec = &raw[pos..pos + MAC_PADS_RECORD_LEN];
+            let pad_id = u64::from_be_bytes(rec[0..8].try_into().unwrap());
+            let domain = u32::from_be_bytes(rec[8..12].try_into().unwrap());
+            let epoch = u64::from_be_bytes(rec[12..20].try_into().unwrap());
+            let seq = u64::from_be_bytes(rec[20..28].try_into().unwrap());
+            let r = u128::from_be_bytes(rec[28..44].try_into().unwrap());
+            let s = u128::from_be_bytes(rec[44..60].try_into().unwrap());
+            out.push((pad_id, domain, epoch, seq, r, s));
+            pos += MAC_PADS_RECORD_LEN;
+        }
+        Ok(out)
+    }
+}
+
+impl Drop for RotatingCwStorageKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl fmt::Debug for RotatingCwStorageKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RotatingCwStorageKey")
+            .field("tape_path", &self.tape_path)
+            .field("current_epoch", &self.current_epoch)
+            .field("allocated_pads", &self.next_pad_id)
+            .field("current_r", &"[REDACTED]")
+            .field("active_pads", &"[REDACTED]")
             .finish()
     }
 }
@@ -444,14 +882,16 @@ pub enum WalDeltaEvent {
     },
 }
 
-/// Crash-safe, Carter-Wegman MAC-authenticated chain storage engine backed by an atomic
-/// snapshot file (`chain.snap`) and a sequenced append-only WAL (`chain.wal`).
+/// Crash-safe, rotating-CW-MAC-authenticated chain storage engine backed by an atomic
+/// snapshot file (`chain.snap`), a sequenced append-only WAL (`chain.wal`), and a crash-safe
+/// one-time additive pad tape (`mac_pads.tape`).
 pub struct CrashSafeChainStore {
     data_dir: PathBuf,
     key_path: PathBuf,
     snapshot_path: PathBuf,
     wal_path: PathBuf,
     key: StorageIntegrityKey,
+    rotating_key: RotatingCwStorageKey,
     wal_file: File,
     snapshot_epoch: u64,
     next_wal_seq: u64,
@@ -461,8 +901,9 @@ impl CrashSafeChainStore {
     /// Open or initialize a crash-safe chain store in `data_dir`.
     ///
     /// - Creates `data_dir` with `0700` permissions on Unix.
-    /// - Loads or atomically creates the `0600` `StorageIntegrityKey`.
-    /// - Verifies any existing snapshot (`chain.snap`) and companion WAL (`chain.wal`).
+    /// - Loads or atomically creates the `0600` `StorageIntegrityKey` and `0600` `mac_pads.tape`.
+    /// - Verifies any existing snapshot (`chain.snap`) and companion WAL (`chain.wal`) against
+    ///   their dedicated one-time CW-MAC additive pads.
     /// - Safely zeroes and truncates an incomplete torn trailing WAL record while rejecting
     ///   any mid-WAL corruption, bit-flip, or sequence reordering.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, StorageError> {
@@ -474,10 +915,11 @@ impl CrashSafeChainStore {
         let wal_path = data_dir.join(WAL_FILENAME);
 
         let key = StorageIntegrityKey::load_or_create(&key_path)?;
+        let mut rotating_key = RotatingCwStorageKey::open_or_create(&data_dir, key.r)?;
 
         // Verify latest snapshot if present to establish the authoritative snapshot_epoch.
         let snapshot_epoch = if snapshot_path.exists() {
-            let (epoch, _snap) = read_and_verify_snapshot(&snapshot_path, &key)?;
+            let (epoch, _snap) = read_and_verify_snapshot(&snapshot_path, &rotating_key)?;
             epoch
         } else {
             0
@@ -485,9 +927,9 @@ impl CrashSafeChainStore {
 
         // Recover or initialize companion WAL.
         let (wal_file, next_wal_seq) = if wal_path.exists() {
-            recover_wal(&wal_path, &key, snapshot_epoch)?
+            recover_wal(&wal_path, &mut rotating_key, snapshot_epoch)?
         } else {
-            let f = create_fresh_wal_atomic(&wal_path, &key, snapshot_epoch)?;
+            let f = create_fresh_wal_atomic(&wal_path, &mut rotating_key, snapshot_epoch)?;
             (f, 0)
         };
 
@@ -497,13 +939,14 @@ impl CrashSafeChainStore {
             snapshot_path,
             wal_path,
             key,
+            rotating_key,
             wal_file,
             snapshot_epoch,
             next_wal_seq,
         })
     }
 
-    /// Directory containing the store's key, snapshot, and WAL files.
+    /// Directory containing the store's key, pad tape, snapshot, and WAL files.
     #[inline]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
@@ -513,6 +956,12 @@ impl CrashSafeChainStore {
     #[inline]
     pub fn key_path(&self) -> &Path {
         &self.key_path
+    }
+
+    /// Path to the `0600` rotating CW-MAC additive pad tape (`mac_pads.tape`).
+    #[inline]
+    pub fn pad_tape_path(&self) -> &Path {
+        self.rotating_key.tape_path()
     }
 
     /// Path to the atomic snapshot file (`chain.snap`).
@@ -539,12 +988,22 @@ impl CrashSafeChainStore {
         self.next_wal_seq
     }
 
+    /// Total number of distinct one-time CW-MAC additive pads allocated across this store's lifetime.
+    #[inline]
+    pub fn mac_pad_count(&self) -> u64 {
+        self.rotating_key.allocated_pad_count()
+    }
+
     /// Atomically persist a full chain snapshot and reset the companion WAL.
     ///
     /// Order of durability operations:
-    /// 1. Validate & serialize `snapshot`, compute 128-bit CW MAC with `new_epoch = snapshot_epoch + 1`.
-    /// 2. Write temp snapshot (`0600`) -> `sync_all()` -> atomic `rename()` -> parent-dir `fsync`.
-    /// 3. Write fresh temp WAL bound to `new_epoch` (`0600`) -> `sync_all()` -> atomic `rename()` -> parent-dir `fsync`.
+    /// 1. Validate & serialize `snapshot`, rotate evaluation key `r` for `new_epoch = snapshot_epoch + 1`,
+    ///    and persist + `fsync` a fresh one-time additive pad `s` in `mac_pads.tape`.
+    /// 2. Compute 128-bit CW-MAC and write temp snapshot (`0600`) -> `sync_all()` -> atomic `rename()`
+    ///    -> parent-dir `fsync`.
+    /// 3. Persist + `fsync` a fresh one-time additive pad `s` for the new WAL header in `mac_pads.tape`,
+    ///    then write fresh temp WAL bound to `new_epoch` (`0600`) -> `sync_all()` -> atomic `rename()`
+    ///    -> parent-dir `fsync`.
     ///
     /// If power is lost between step 2 and step 3, recovery detects `wal_epoch < snapshot_epoch`
     /// and cleanly discards the stale pre-snapshot WAL.
@@ -570,20 +1029,30 @@ impl CrashSafeChainStore {
         frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
         frame.extend_from_slice(&body);
 
-        let tag = self.key.compute_mac(DOMAIN_SNAPSHOT, new_epoch, &frame);
+        // Rotate `r` on every snapshot/compaction and consume a fresh one-time additive pad `s`.
+        self.rotating_key.rotate_epoch_r(new_epoch);
+        let tag = self.rotating_key.allocate_and_compute_mac(
+            DOMAIN_SNAPSHOT,
+            new_epoch,
+            0,
+            new_epoch,
+            &frame,
+        )?;
         frame.extend_from_slice(&tag);
 
         write_file_atomic_0600(&self.snapshot_path, &frame)?;
         self.snapshot_epoch = new_epoch;
 
-        let new_wal_file = create_fresh_wal_atomic(&self.wal_path, &self.key, new_epoch)?;
+        let new_wal_file =
+            create_fresh_wal_atomic(&self.wal_path, &mut self.rotating_key, new_epoch)?;
         self.wal_file = new_wal_file;
         self.next_wal_seq = 0;
 
         Ok(())
     }
 
-    /// Append a sequenced, 128-bit Carter-Wegman MAC-authenticated delta event to `chain.wal`
+    /// Append a sequenced, rotating-CW-MAC-authenticated delta event to `chain.wal`
+    /// (`fsync`ing the fresh one-time additive pad in `mac_pads.tape` BEFORE writing the WAL record)
     /// and `sync_all()` before returning.
     pub fn append_wal(&mut self, event: &WalDeltaEvent) -> Result<(), StorageError> {
         if self.next_wal_seq >= MAX_WAL_RECORDS as u64 {
@@ -616,7 +1085,13 @@ impl CrashSafeChainStore {
         rec.extend_from_slice(&guard.to_be_bytes());
         rec.extend_from_slice(&payload);
 
-        let tag = compute_wal_record_mac(&self.key, self.snapshot_epoch, seq, payload_len, &payload);
+        let tag = allocate_wal_record_mac(
+            &mut self.rotating_key,
+            self.snapshot_epoch,
+            seq,
+            payload_len,
+            &payload,
+        )?;
         rec.extend_from_slice(&tag);
 
         let prior_len = self.wal_file.seek(SeekFrom::End(0))?;
@@ -638,21 +1113,21 @@ impl CrashSafeChainStore {
 
     /// Load and strictly verify the latest snapshot and all subsequent WAL delta events from disk.
     ///
-    /// Verifies the 128-bit Carter-Wegman MAC in constant time (`ct_eq_16`) on the snapshot,
+    /// Verifies the 128-bit rotating Carter-Wegman MAC in constant time (`ct_eq_16`) on the snapshot,
     /// WAL header, and every WAL record, rejecting any tampered bytes, sequence gaps, or
     /// reordered records.
     pub fn load_latest(
         &self,
     ) -> Result<(Option<PersistedChainSnapshot>, Vec<WalDeltaEvent>), StorageError> {
         let (snapshot, expected_epoch) = if self.snapshot_path.exists() {
-            let (epoch, snap) = read_and_verify_snapshot(&self.snapshot_path, &self.key)?;
+            let (epoch, snap) = read_and_verify_snapshot(&self.snapshot_path, &self.rotating_key)?;
             (Some(snap), epoch)
         } else {
             (None, 0)
         };
 
         let events = if self.wal_path.exists() {
-            read_and_verify_wal_strict(&self.wal_path, &self.key, expected_epoch)?
+            read_and_verify_wal_strict(&self.wal_path, &self.rotating_key, expected_epoch)?
         } else {
             Vec::new()
         };
@@ -685,6 +1160,7 @@ impl fmt::Debug for CrashSafeChainStore {
             .field("snapshot_epoch", &self.snapshot_epoch)
             .field("next_wal_seq", &self.next_wal_seq)
             .field("key", &self.key)
+            .field("rotating_key", &self.rotating_key)
             .finish()
     }
 }
@@ -776,33 +1252,42 @@ fn compute_wal_header_guard(seq: u64, payload_len: u32) -> u32 {
     (!payload_len) ^ (seq as u32) ^ ((seq >> 32) as u32) ^ 0xA55A_C33C
 }
 
-/// Compute the 128-bit Carter-Wegman MAC for a WAL record bound to `(wal_epoch, seq, payload_len, payload)`.
-fn compute_wal_record_mac(
-    key: &StorageIntegrityKey,
+/// Allocate a fresh one-time additive pad in `mac_pads.tape` (`fsync`ed) and compute the
+/// 128-bit rotating Carter-Wegman MAC for a WAL record bound to `(wal_epoch, seq, payload_len, payload)`.
+fn allocate_wal_record_mac(
+    key: &mut RotatingCwStorageKey,
     wal_epoch: u64,
     seq: u64,
     payload_len: u32,
     payload: &[u8],
-) -> [u8; MAC_TAG_BYTES] {
+) -> Result<[u8; MAC_TAG_BYTES], StorageError> {
     let mut mac_input = Vec::with_capacity(8 + 4 + payload.len());
     mac_input.extend_from_slice(&seq.to_be_bytes());
     mac_input.extend_from_slice(&payload_len.to_be_bytes());
     mac_input.extend_from_slice(payload);
-    key.compute_mac(DOMAIN_WAL_RECORD, wal_epoch, &mac_input)
+    key.allocate_and_compute_mac(DOMAIN_WAL_RECORD, wal_epoch, seq, wal_epoch, &mac_input)
 }
 
 fn verify_wal_record_mac(
-    key: &StorageIntegrityKey,
+    key: &RotatingCwStorageKey,
     wal_epoch: u64,
     expected_seq: u64,
     payload_len: u32,
     payload: &[u8],
     stored_tag: &[u8; MAC_TAG_BYTES],
 ) -> bool {
-    let mut expected = compute_wal_record_mac(key, wal_epoch, expected_seq, payload_len, payload);
-    let ok = ct_eq_16(&expected, stored_tag);
-    zeroize_slice(&mut expected);
-    ok
+    let mut mac_input = Vec::with_capacity(8 + 4 + payload.len());
+    mac_input.extend_from_slice(&expected_seq.to_be_bytes());
+    mac_input.extend_from_slice(&payload_len.to_be_bytes());
+    mac_input.extend_from_slice(payload);
+    key.verify_mac(
+        DOMAIN_WAL_RECORD,
+        wal_epoch,
+        expected_seq,
+        wal_epoch,
+        &mac_input,
+        stored_tag,
+    )
 }
 
 fn encode_shielded_slot(out: &mut Vec<u8>, slot: &PersistedShieldedSlot) -> Result<(), StorageError> {
@@ -1247,7 +1732,7 @@ fn decode_wal_event(bytes: &[u8]) -> Result<WalDeltaEvent, StorageError> {
 
 fn read_and_verify_snapshot(
     path: &Path,
-    key: &StorageIntegrityKey,
+    key: &RotatingCwStorageKey,
 ) -> Result<(u64, PersistedChainSnapshot), StorageError> {
     let meta = fs::metadata(path)?;
     let max_file_len = (MAX_SNAPSHOT_BYTES + SNAPSHOT_MIN_FILE_LEN) as u64;
@@ -1270,8 +1755,15 @@ fn read_and_verify_snapshot(
     let snapshot_epoch = u64::from_be_bytes(bytes[12..20].try_into().unwrap());
     let stored_tag: [u8; MAC_TAG_BYTES] = bytes[signed_len..].try_into().unwrap();
 
-    // Verify 128-bit Carter-Wegman MAC in constant time BEFORE trusting version/lengths/body.
-    if !key.verify_mac(DOMAIN_SNAPSHOT, snapshot_epoch, &bytes[..signed_len], &stored_tag) {
+    // Verify 128-bit rotating Carter-Wegman MAC in constant time BEFORE trusting version/lengths/body.
+    if !key.verify_mac(
+        DOMAIN_SNAPSHOT,
+        snapshot_epoch,
+        0,
+        snapshot_epoch,
+        &bytes[..signed_len],
+        &stored_tag,
+    ) {
         return Err(StorageError::CorruptIntegrityMac);
     }
 
@@ -1300,17 +1792,26 @@ fn read_and_verify_snapshot(
     Ok((snapshot_epoch, snapshot))
 }
 
-fn encode_wal_header(key: &StorageIntegrityKey, wal_epoch: u64) -> [u8; WAL_HEADER_LEN] {
+fn encode_wal_header(
+    key: &mut RotatingCwStorageKey,
+    wal_epoch: u64,
+) -> Result<[u8; WAL_HEADER_LEN], StorageError> {
     let mut hdr = [0u8; WAL_HEADER_LEN];
     hdr[0..8].copy_from_slice(WAL_MAGIC);
     hdr[8..12].copy_from_slice(&WAL_VERSION.to_be_bytes());
     hdr[12..20].copy_from_slice(&wal_epoch.to_be_bytes());
-    let tag = key.compute_mac(DOMAIN_WAL_HEADER, wal_epoch, &hdr[0..20]);
+    let tag = key.allocate_and_compute_mac(
+        DOMAIN_WAL_HEADER,
+        wal_epoch,
+        0,
+        wal_epoch,
+        &hdr[0..20],
+    )?;
     hdr[20..36].copy_from_slice(&tag);
-    hdr
+    Ok(hdr)
 }
 
-fn verify_wal_header(bytes: &[u8], key: &StorageIntegrityKey) -> Result<u64, StorageError> {
+fn verify_wal_header(bytes: &[u8], key: &RotatingCwStorageKey) -> Result<u64, StorageError> {
     if bytes.len() >= 8 && &bytes[0..8] != WAL_MAGIC {
         return Err(StorageError::CorruptMagic);
     }
@@ -1319,7 +1820,14 @@ fn verify_wal_header(bytes: &[u8], key: &StorageIntegrityKey) -> Result<u64, Sto
     }
     let wal_epoch = u64::from_be_bytes(bytes[12..20].try_into().unwrap());
     let stored_tag: [u8; MAC_TAG_BYTES] = bytes[20..36].try_into().unwrap();
-    if !key.verify_mac(DOMAIN_WAL_HEADER, wal_epoch, &bytes[0..20], &stored_tag) {
+    if !key.verify_mac(
+        DOMAIN_WAL_HEADER,
+        wal_epoch,
+        0,
+        wal_epoch,
+        &bytes[0..20],
+        &stored_tag,
+    ) {
         return Err(StorageError::CorruptIntegrityMac);
     }
     let version = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
@@ -1333,10 +1841,10 @@ fn verify_wal_header(bytes: &[u8], key: &StorageIntegrityKey) -> Result<u64, Sto
 
 fn create_fresh_wal_atomic(
     wal_path: &Path,
-    key: &StorageIntegrityKey,
+    key: &mut RotatingCwStorageKey,
     wal_epoch: u64,
 ) -> Result<File, StorageError> {
-    let hdr = encode_wal_header(key, wal_epoch);
+    let hdr = encode_wal_header(key, wal_epoch)?;
     write_file_atomic_0600(wal_path, &hdr)?;
     let mut f = open_secret_file(wal_path, false)?;
     f.seek(SeekFrom::End(0))?;
@@ -1350,7 +1858,7 @@ fn create_fresh_wal_atomic(
 /// - Rejects any mid-WAL corruption, bit-flip, or sequence reordering.
 fn recover_wal(
     wal_path: &Path,
-    key: &StorageIntegrityKey,
+    key: &mut RotatingCwStorageKey,
     snapshot_epoch: u64,
 ) -> Result<(File, u64), StorageError> {
     let mut file = open_secret_file(wal_path, false)?;
@@ -1481,7 +1989,7 @@ fn recover_wal(
 /// Strictly read and verify `chain.wal` without mutating the file.
 fn read_and_verify_wal_strict(
     wal_path: &Path,
-    key: &StorageIntegrityKey,
+    key: &RotatingCwStorageKey,
     expected_epoch: u64,
 ) -> Result<Vec<WalDeltaEvent>, StorageError> {
     let mut file = File::open(wal_path)?;
@@ -2194,8 +2702,9 @@ mod tests {
 
         let snap_path = dir.path().join(SNAPSHOT_FILENAME);
         let key = StorageIntegrityKey::load(store.key_path()).unwrap();
+        let rot_key = RotatingCwStorageKey::open_or_create(dir.path(), key.r).unwrap();
 
-        // Craft a snapshot body containing share == PRIME_P, sign with the real key, and write it.
+        // Craft a snapshot body containing share == PRIME_P, sign with the active rotating CW-MAC pad, and write it.
         let mut raw_body = encode_snapshot_body(&valid_snap).unwrap();
         // Locate the first PRIME_P - 1 share (big-endian) in `raw_body` and increment it to PRIME_P.
         let target = (PRIME_P - 1).to_be_bytes();
@@ -2212,7 +2721,10 @@ mod tests {
         frame.extend_from_slice(&epoch.to_be_bytes());
         frame.extend_from_slice(&(raw_body.len() as u32).to_be_bytes());
         frame.extend_from_slice(&raw_body);
-        let tag = key.compute_mac(DOMAIN_SNAPSHOT, epoch, &frame);
+        let (r, s) = rot_key
+            .active_pad(DOMAIN_SNAPSHOT, epoch, 0)
+            .expect("active rotating pad must exist for snapshot epoch 1");
+        let tag = compute_cw_mac_raw(r, s, DOMAIN_SNAPSHOT, epoch, &frame);
         frame.extend_from_slice(&tag);
 
         fs::write(&snap_path, &frame).unwrap();
@@ -2313,12 +2825,124 @@ mod tests {
 
         let dir_mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         let key_mode = fs::metadata(store.key_path()).unwrap().permissions().mode() & 0o777;
+        let tape_mode = fs::metadata(store.pad_tape_path()).unwrap().permissions().mode() & 0o777;
         let snap_mode = fs::metadata(store.snapshot_path()).unwrap().permissions().mode() & 0o777;
         let wal_mode = fs::metadata(store.wal_path()).unwrap().permissions().mode() & 0o777;
 
         assert_eq!(dir_mode, 0o700, "data_dir must be 0700, got {dir_mode:o}");
         assert_eq!(key_mode, 0o600, "integrity.key must be 0600, got {key_mode:o}");
+        assert_eq!(tape_mode, 0o600, "mac_pads.tape must be 0600, got {tape_mode:o}");
         assert_eq!(snap_mode, 0o600, "chain.snap must be 0600, got {snap_mode:o}");
         assert_eq!(wal_mode, 0o600, "chain.wal must be 0600, got {wal_mode:o}");
+    }
+
+    #[test]
+    fn test_rotating_cw_mac_never_reuses_additive_pad_across_writes() {
+        let dir = TempDirGuard::new("rotating_cw_mac_unique_pads");
+        let snap1 = sample_snapshot();
+        let mut snap2 = snap1.clone();
+        snap2.blocks_finalized += 10;
+
+        let ev = WalDeltaEvent::ExpressTransfer {
+            sender: 1,
+            recipient: 2,
+            amount: 500,
+            sender_nonce: 1,
+            block_height: 100,
+            next_page_id: 1,
+            fee_burned: 5,
+        };
+
+        // Perform multiple WAL appends across 3 epochs (0 -> 1 -> 2), including identical events
+        // and a crash/reopen boundary, to exercise every pad allocation path.
+        {
+            let mut store = CrashSafeChainStore::open(dir.path()).unwrap(); // pad 0: WAL hdr epoch 0
+            store.append_wal(&ev).unwrap(); // pad 1: WAL rec (0, 0)
+            store.append_wal(&ev).unwrap(); // pad 2: WAL rec (0, 1)
+            store.save_snapshot(&snap1).unwrap(); // pad 3: snap (1, 0), pad 4: WAL hdr (1, 0) [rotates r]
+            store.append_wal(&ev).unwrap(); // pad 5: WAL rec (1, 0)
+            store.append_wal(&ev).unwrap(); // pad 6: WAL rec (1, 1)
+            assert!(store.compact_if_needed(&snap2, 2).unwrap()); // pad 7: snap (2, 0), pad 8: WAL hdr (2, 0) [rotates r]
+            store.append_wal(&ev).unwrap(); // pad 9: WAL rec (2, 0)
+            assert_eq!(store.mac_pad_count(), 10);
+        }
+
+        // Reopen and append another WAL record -> pad 10: WAL rec (2, 1).
+        let mut reopened = CrashSafeChainStore::open(dir.path()).unwrap();
+        assert_eq!(reopened.mac_pad_count(), 10);
+        reopened.append_wal(&ev).unwrap();
+        assert_eq!(reopened.mac_pad_count(), 11);
+
+        // Inspect every single pad persisted in `mac_pads.tape`.
+        let records = RotatingCwStorageKey::read_all_tape_records(reopened.pad_tape_path()).unwrap();
+        assert_eq!(records.len(), 11);
+
+        let mut distinct_s: HashSet<u128> = HashSet::new();
+        let mut epoch_rs: HashMap<u64, u128> = HashMap::new();
+
+        for (idx, &(pad_id, _domain, epoch, _seq, r, s)) in records.iter().enumerate() {
+            assert_eq!(pad_id, idx as u64, "pad_id must be strictly sequential");
+            assert!(r > 0 && r < PRIME_P, "evaluation scalar r must be canonical non-zero");
+            assert!(s < PRIME_P, "additive pad s must be canonical < PRIME_P");
+            assert!(
+                distinct_s.insert(s),
+                "additive pad s was REUSED at pad_id {pad_id}!"
+            );
+            if let Some(&prev_r) = epoch_rs.get(&epoch) {
+                assert_eq!(prev_r, r, "epoch {epoch} must use a consistent evaluation scalar r");
+            } else {
+                epoch_rs.insert(epoch, r);
+            }
+        }
+        assert_eq!(distinct_s.len(), 11);
+
+        // Verify evaluation scalar `r` strictly rotated across snapshot compactions (epochs 0, 1, 2).
+        let r0 = epoch_rs[&0];
+        let r1 = epoch_rs[&1];
+        let r2 = epoch_rs[&2];
+        assert_ne!(r0, r1, "r must rotate from epoch 0 to epoch 1");
+        assert_ne!(r1, r2, "r must rotate from epoch 1 to epoch 2");
+        assert_ne!(r0, r2, "r must rotate from epoch 0 to epoch 2");
+
+        // Verify Debug redaction on RotatingCwStorageKey.
+        let dbg = format!("{:?}", reopened.rotating_key);
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains(&r2.to_string()));
+
+        // Tamper snapshot -> constant-time ct_eq_16 rejects with CorruptIntegrityMac.
+        let snap_orig = fs::read(reopened.snapshot_path()).unwrap();
+        {
+            let mut tampered = snap_orig.clone();
+            tampered[SNAPSHOT_ENVELOPE_HEADER_LEN + 3] ^= 0x04;
+            fs::write(reopened.snapshot_path(), &tampered).unwrap();
+            let err = reopened.load_latest().unwrap_err();
+            assert!(matches!(err, StorageError::CorruptIntegrityMac));
+        }
+        fs::write(reopened.snapshot_path(), &snap_orig).unwrap();
+
+        // Tamper WAL header -> constant-time ct_eq_16 rejects with CorruptIntegrityMac.
+        let wal_orig = fs::read(reopened.wal_path()).unwrap();
+        {
+            let mut tampered = wal_orig.clone();
+            tampered[WAL_HEADER_LEN - 1] ^= 0x80;
+            fs::write(reopened.wal_path(), &tampered).unwrap();
+            let err = reopened.load_latest().unwrap_err();
+            assert!(matches!(err, StorageError::CorruptIntegrityMac));
+        }
+
+        // Tamper WAL record payload -> constant-time ct_eq_16 rejects with CorruptIntegrityMac.
+        {
+            let mut tampered = wal_orig.clone();
+            tampered[WAL_HEADER_LEN + WAL_RECORD_PREFIX_LEN + 2] ^= 0x01;
+            fs::write(reopened.wal_path(), &tampered).unwrap();
+            let err = reopened.load_latest().unwrap_err();
+            assert!(matches!(err, StorageError::CorruptIntegrityMac));
+        }
+
+        // Restore original WAL and verify clean load.
+        fs::write(reopened.wal_path(), &wal_orig).unwrap();
+        let (loaded_snap, loaded_events) = reopened.load_latest().unwrap();
+        assert_eq!(loaded_snap, Some(snap2));
+        assert_eq!(loaded_events, vec![ev.clone(), ev]);
     }
 }
