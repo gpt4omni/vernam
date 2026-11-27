@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use crate::field::{PRIME_P, ct_eq_16, mul_mod, reduce, zeroize_slice, zeroize_u128};
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn zeroize_u64_slice(buf: &mut [u64]) {
     for w in buf.iter_mut() {
