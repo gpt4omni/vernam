@@ -15,14 +15,16 @@ use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
 use vernam_rs::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
 use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
 use vernam_rs::qkd::{
-    AttackProfile, Bb84Channel, BufferedQkdPool, PoolConfig, QkdKeyProvider, toeplitz_hash_u64,
-    toeplitz_seed_words,
+    AttackProfile, Bb84Channel, BufferedQkdPool, PoolConfig, QkdKeyProvider,
 };
 use vernam_rs::testnet_server::{TestnetConfig, TestnetServer, parse_json_u64};
 use vernam_rs::tokenomics::{
     EpochContribution, FeeLane, MAX_SUPPLY, OneTimeAuditKey, SlashingOffense, TokenomicsEngine,
     VERN_PER_VRNM,
 };
+use vernam_rs::turbo_crypto::run_turbo_crypto_bench;
+use vernam_rs::turbo_express::run_turbo_express_bench;
+use vernam_rs::turbo_shielded::run_turbo_shielded_bench;
 use vernam_rs::wallet::{DEFAULT_NODE_URL, VernamWallet, WalletRpcClient};
 
 fn fmt_vrnm(verns: u64) -> String {
@@ -607,50 +609,36 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
 
 fn cmd_bench() {
     println!("========================================================================");
-    println!("  VERNAM (VRNM) v0.3 — HIGH-THROUGHPUT MULTI-CORE BENCHMARKS");
-    println!("  Bitcoin Core BIP-152 Compact Relay + Flat IndexedLedger + Sealevel MPC");
+    println!("  VERNAM (VRNM) v0.5 — TURBO SIMD & ALGEBRAIC IT-MPC BENCHMARKS");
+    println!("  Zero external crates | Zero SHA-256 / RSA / ECDSA / AES / zk-SNARKs");
     println!("========================================================================\n");
 
+    let tc = run_turbo_crypto_bench();
+    println!("=== 1. Turbo SIMD Crypto Primitives ===");
+    println!("  OTP XOR ({:<10})    : {:>8.2} GB/s", tc.xor_backend, tc.xor_gb_per_sec);
+    println!(
+        "  CW MAC 4-Way (256B)    : {:>12.0} ops/s ({:.2} GB/s streaming)",
+        tc.cw_mac_ops_per_sec, tc.cw_mac_gb_per_sec
+    );
+    println!(
+        "  Toeplitz PA ({:<15}): {:>7.2} Mbps purified QKD output\n",
+        tc.toeplitz_backend, tc.toeplitz_mbps
+    );
+
+    let te = run_turbo_express_bench();
+    println!("=== 2. Turbo Express Lane (Persistent 4-Validator 2-Phase BFT) ===");
+    println!(
+        "  Express 4-Val BFT TPS  : {:>12.0} tx/s ({} txs / {} blocks in {:.4}s, {:.3} ms/block)\n",
+        te.express_tps, te.total_txs, te.blocks, te.elapsed_secs, te.ms_per_block
+    );
+
+    let ts = run_turbo_shielded_bench();
+    println!("=== 3. Turbo Shielded Lane (Beaver Squares + Star + Schwartz-Zippel RLC) ===");
+    println!("{ts}\n");
+
     let report = run_speed_benchmarks();
-    println!("{report}\n");
-
-    // Raw single-core OTP + Carter-Wegman MAC
-    let bench_ops = 200_000usize;
-    let bench_page = PadPage::generate(99, FRAME_BYTES);
-    let sample_payload = [0xABu8; 64];
-    let t0 = Instant::now();
-    let mut acc_byte = 0u8;
-    for _ in 0..bench_ops {
-        let (ct, tag) = seal_frame(&bench_page, &sample_payload).unwrap();
-        let pt = open_frame(&bench_page, &ct, &tag).unwrap();
-        acc_byte ^= pt[0];
-    }
-    let elapsed = t0.elapsed().as_secs_f64();
-    let ops_per_sec = bench_ops as f64 / elapsed;
-    let mb_per_sec = (bench_ops as f64 * (FRAME_BYTES as f64 * 2.0)) / (elapsed * 1_000_000.0);
-    println!(
-        "  Single-core OTP+MAC    : {:.0} ops/sec ({:.1} MB/s, guard={})",
-        ops_per_sec, mb_per_sec, acc_byte
-    );
-
-    // POPCNT Toeplitz PA
-    let raw_bits = 4096usize;
-    let out_bits = 2048usize;
-    let raw_words = vec![0xA5A5_5A5A_1234_5678u64; raw_bits / 64];
-    let seed_words = vec![0x9E37_79B9_7F4A_7C15u64; toeplitz_seed_words(raw_bits, out_bits)];
-    let pa_iters = 5_000usize;
-    let t3 = Instant::now();
-    let mut pa_guard = 0u64;
-    for _ in 0..pa_iters {
-        let out = toeplitz_hash_u64(&raw_words, raw_bits, &seed_words, out_bits).unwrap();
-        pa_guard ^= out[0];
-    }
-    let pa_elapsed = t3.elapsed().as_secs_f64();
-    let pa_mbps = (pa_iters as f64 * out_bits as f64) / (pa_elapsed * 1_000_000.0);
-    println!(
-        "  POPCNT Toeplitz PA     : {:.1} Mbps purified QKD output (guard={:#x})",
-        pa_mbps, pa_guard
-    );
+    println!("=== 4. Baseline Fast Engine Comparison (v0.3 BIP-152 Compact Relay) ===");
+    println!("{report}");
 }
 
 fn cmd_demo() {

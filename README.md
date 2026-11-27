@@ -6,14 +6,15 @@ Security rests solely on **Shannon information theory** and **quantum mechanics*
 
 ---
 
-## Live Release Benchmarks (`cargo run --release -- bench`)
+## Live Release Benchmarks (`cargo run --release -- bench`, Intel i9-11900)
 
-| Subsystem | Measured Speed | Notes |
+| Subsystem | v0.5 Turbo Speed | Notes |
 |---|---|---|
-| **Express Lane (`VRNM-Fast`) 2-Phase BFT** | **~4.8M – 6.6M TPS** | 4-validator 2-phase BFT + Bitcoin Core BIP-152 compact relay (3x smaller wire frames) + flat O(1) `IndexedLedger` + single-use Carter–Wegman seals |
-| **Shielded Lane (`VRNM-Private`) IT-MPC** | **~389k TPS** | Multi-core Sealevel-style sharded $K=16$ buckets, stack `[u128; 4]` zero-alloc Beaver triples, `const` `Lagrange3Of4` (0 `inv_mod`, 0 `mul_mod`), 16-bit range proofs & blinded recipients |
-| **Single-Core OTP + Carter–Wegman MAC** | **~1.36M ops/sec** (~698 MB/s) | Fixed 256-byte frames, division-free `u128` Mersenne math (`F_(2^127 - 1)`), volatile `Drop` RAM zeroization |
-| **POPCNT `u64` Toeplitz Privacy Amplification** | **~52.8 Mbps** | Hardware `POPCNT` 2-universal GF(2) hashing for BB84 + Decoy-State QKD |
+| **Turbo Express Lane (`VRNM-Fast`) 4-Val BFT** | **~85.6M TPS** (`0.117 ms/block`) | 4 persistent validator threads, 2-phase BFT + 24 real OTP/CW votes/block + 4-way pipelined CW block seals + zero-copy `Arc<[TurboTx]>` |
+| **Turbo Shielded Lane (`VRNM-Private`) IT-MPC** | **~1.65M TPS** | Beaver Square Pairs (`x^2 - x`) + Shared-Factor Beaver Stars + Schwartz–Zippel RLC (`< 2^-121` soundness, `178 → 66` openings/tx), 64 buckets, zero zk-SNARKs |
+| **AVX-512F OTP XOR** | **~51.0 GB/s** | Runtime-dispatched AVX-512F / AVX2 / portable ARM64 fallback |
+| **4-Way Fused Carter–Wegman MAC** (`F_(2^127 - 1)`) | **~15.9M ops/sec** (`6.09 GB/s`) | Fused 4-way dot-product over `F_(2^127 - 1)` with runtime BMI2/ADX dispatch |
+| **AVX-512 `VPOPCNTDQ` Toeplitz QKD PA** | **~177 Mbps** | Bit-shift-grouped 8-way SIMD 2-universal GF(2) privacy amplification |
 
 ---
 
