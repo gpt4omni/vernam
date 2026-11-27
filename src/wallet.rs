@@ -1075,6 +1075,50 @@ impl WalletRpcClient {
         self.request("POST", "/epoch/refresh", Some("{}"))
     }
 
+    /// `POST /pop/mine` — trigger a verified Proof-of-Pad (PoP) entropy & Beaver-triple audit epoch.
+    pub fn mine_pop_epoch(&self) -> Result<String, WalletError> {
+        self.request("POST", "/pop/mine", Some("{}"))
+    }
+
+    /// `GET /p2p/peers` — auto-discover all active peer node addresses from a single seed node.
+    pub fn discover_peers(&self) -> Result<Vec<String>, WalletError> {
+        let raw = self.request("GET", "/p2p/peers", None)?;
+        let mut addrs = Vec::new();
+        let needle = "\"addr\":\"";
+        let mut slice = raw.as_str();
+        while let Some(pos) = slice.find(needle) {
+            let after = &slice[pos + needle.len()..];
+            if let Some(end) = after.find('"') {
+                let addr = after[..end].trim();
+                if !addr.is_empty() && !addrs.iter().any(|a| a == addr) {
+                    addrs.push(addr.to_string());
+                }
+                slice = &after[end + 1..];
+            } else {
+                break;
+            }
+        }
+        Ok(addrs)
+    }
+
+    /// Query `GET /status` with automatic peer failover across discovered P2P nodes.
+    pub fn status_with_failover(&self) -> Result<(String, String), WalletError> {
+        if let Ok(body) = self.status() {
+            return Ok((format!("http://{}:{}", self.host, self.port), body));
+        }
+        if let Ok(peers) = self.discover_peers() {
+            for peer in peers {
+                if let Ok(client) = WalletRpcClient::with_timeout(&peer, self.timeout)
+                    && let Ok(body) = client.status()
+                {
+                    return Ok((peer, body));
+                }
+            }
+        }
+        self.status()
+            .map(|body| (format!("http://{}:{}", self.host, self.port), body))
+    }
+
     /// Perform a raw HTTP/1.1 request over `TcpStream` with `Connection: close`.
     fn request(
         &self,

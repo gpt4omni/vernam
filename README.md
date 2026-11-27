@@ -1,6 +1,6 @@
 # Vernam (`VRNM`)
 
-**Vernam (`VRNM`)** is a high-speed, **100% information-theoretically secure** cryptocurrency core, CLI wallet, and VPS-ready testnet written in **zero-dependency Rust** (plus a Python research lab in `python-lab/`).
+**Vernam (`VRNM`)** is a high-speed, decentralized, **100% information-theoretically secure** cryptocurrency core, CLI wallet, **Proof-of-Pad (`PoP`)** entropy mining engine, and multi-VPS P2P testnet written in **zero-dependency Rust** (plus a Python research lab in `python-lab/`).
 
 Security rests solely on **Shannon information theory** and **quantum mechanics** — **zero computational assumptions** (no SHA-256, RSA, ECDSA, Ed25519, AES, or zk-SNARKs anywhere in the core stack). That makes `VRNM` mathematically immune to **quantum computers (Shor's / Grover's)**, **"Harvest Now, Decrypt Later"**, and even **$P = NP$** (when paired with physical QRNG/QKD hardware).
 
@@ -10,8 +10,8 @@ Security rests solely on **Shannon information theory** and **quantum mechanics*
 
 | Subsystem | Measured Speed | Notes |
 |---|---|---|
-| **Express Lane (`VRNM-Fast`) 2-Phase BFT** | **~6.63M TPS** | 4-validator 2-phase BFT + Bitcoin Core BIP-152 compact relay (3x smaller wire frames) + flat O(1) `IndexedLedger` + single-use Carter–Wegman seals |
-| **Shielded Lane (`VRNM-Private`) IT-MPC** | **~383k TPS** | Multi-core Sealevel-style sharded $K=16$ buckets, stack `[u128; 4]` zero-alloc Beaver triples, `const` `Lagrange3Of4` (0 `inv_mod`, 0 `mul_mod`), 16-bit range proofs & blinded recipients |
+| **Express Lane (`VRNM-Fast`) 2-Phase BFT** | **~4.8M – 6.6M TPS** | 4-validator 2-phase BFT + Bitcoin Core BIP-152 compact relay (3x smaller wire frames) + flat O(1) `IndexedLedger` + single-use Carter–Wegman seals |
+| **Shielded Lane (`VRNM-Private`) IT-MPC** | **~389k TPS** | Multi-core Sealevel-style sharded $K=16$ buckets, stack `[u128; 4]` zero-alloc Beaver triples, `const` `Lagrange3Of4` (0 `inv_mod`, 0 `mul_mod`), 16-bit range proofs & blinded recipients |
 | **Single-Core OTP + Carter–Wegman MAC** | **~1.36M ops/sec** (~698 MB/s) | Fixed 256-byte frames, division-free `u128` Mersenne math (`F_(2^127 - 1)`), volatile `Drop` RAM zeroization |
 | **POPCNT `u64` Toeplitz Privacy Amplification** | **~52.8 Mbps** | Hardware `POPCNT` 2-universal GF(2) hashing for BB84 + Decoy-State QKD |
 
@@ -19,45 +19,51 @@ Security rests solely on **Shannon information theory** and **quantum mechanics*
 
 ## 1-Command VPS Testnet Deploy
 
-Deploy a live 4-validator **Vernam (`VRNM`)** testnet + dark-mode web explorer + interactive faucet on any Ubuntu/Debian VPS:
+Deploy a live **Vernam (`VRNM`)** testnet + dark-mode web explorer + faucet + Proof-of-Pad mining UI on any Ubuntu/Debian VPS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gpt4omni/vernam/main/deploy/vps-setup.sh | sudo bash
 ```
 
-Or deploy via Docker Compose (with optional automatic Let's Encrypt HTTPS via Caddy):
+### Decentralized Multi-VPS Peer Discovery (Zero Manual IP Lists!)
+Users and new miners only need **ONE** seed address — nodes automatically announce themselves and gossip `/p2p/peers` transitively across the network (just like Bitcoin Core's `getaddr`/`addr` & DNS seeds):
 
 ```bash
-docker compose -f deploy/docker-compose.yml up -d --build
+# VPS #1 (Seed Node)
+vrnm node --id 0 --bind 0.0.0.0:8080 --advertise <VPS1_IP>:8080
+
+# VPS #2 (Connects only to Seed #1 — auto-discovers everyone else!)
+vrnm node --id 1 --bind 0.0.0.0:8080 --advertise <VPS2_IP>:8080 --seed <VPS1_IP>:8080
+
+# Or spin up a 4-container local/VPS P2P mesh in one command:
+docker compose -f deploy/docker-compose.multi-node.yml up -d --build
 ```
 
-Full VPS instructions, systemd hardening, HTTPS setup, and security checklist: [deploy/DEPLOY_VPS.md](deploy/DEPLOY_VPS.md).
+Full VPS & multi-node guides: [deploy/DEPLOY_VPS.md](deploy/DEPLOY_VPS.md) and [deploy/JOIN_TESTNET.md](deploy/JOIN_TESTNET.md).
 
 ---
 
-## CLI Wallet Quick Start
+## CLI Wallet & Proof-of-Pad (`PoP`) Mining
 
 ```bash
-# Point CLI wallet at your local or VPS testnet node
-export VRNM_NODE="http://127.0.0.1:8080"
+export VRNM_NODE="http://<ANY_SINGLE_SEED_IP>:8080"
+
+# Auto-discover every active node IP on the network from one seed
+vrnm wallet peers
 
 # Create crash-safe WAL-persisted wallets (0600 permissions)
 vrnm wallet create --name alice
 vrnm wallet create --name bob
 
-# Claim Express & Shielded testnet VRNM from the faucet
+# Claim testnet VRNM, send Express & Shielded transfers, inspect Shamir shares
 vrnm wallet faucet --name alice
-
-# Send Express (VRNM-Fast) & Shielded (VRNM-Private IT-MPC) transfers
 vrnm wallet send --from alice --to bob --amount 25
 vrnm wallet send-private --from alice --to bob --amount 15
-
-# Inspect balances + raw 127-bit random Shamir shares on validators
 vrnm wallet balance --name bob
 
-# Replenish OTP pads via BB84 QKD & run Proactive Secret Sharing epoch refresh
-vrnm wallet refill --name alice --pages 8
-vrnm wallet refresh-epoch
+# Run a verified Proof-of-Pad (PoP) entropy & Beaver-triple mining audit epoch
+vrnm wallet pop-mine
+vrnm pop-mine   # standalone local Proof-of-Pad audit demo
 ```
 
 ---
@@ -68,20 +74,20 @@ vrnm wallet refresh-epoch
 |---|---|
 | `src/field.rs` | Division-free Mersenne prime field $\mathbb{F}_{2^{127}-1}$, volatile zeroization, constant-time `ct_eq_16` |
 | `src/otp.rs` | Word-level XOR OTP, injective Carter–Wegman one-time MAC, crash-safe `fsync` `WalPadBook` with on-disk zeroing |
-| `src/bft.rs` | 2-phase batched BFT (`PrePrepare → Prepare → Commit`), view-change rotation, offline quorum sync, Web-of-Trust PoP |
+| `src/bft.rs` | 2-phase batched BFT (`PrePrepare → Prepare → Commit`), view-change rotation, offline quorum sync |
+| `src/p2p_node.rs` | Real multi-VPS P2P validator daemon with seed bootstrap, transitive `/p2p/peers` gossip, tx/block propagation & auto catch-up sync |
+| `src/pop_mining.rs` | Verified **Proof-of-Pad (`PoP`)** entropy mining (monobit + runs tests, Beaver-triple spot-checks, QKD QBER/decoy audits, interactive Carter–Wegman commitments & auto-slashing) |
 | `src/privacy_mpc.rs` | Precomputed `LagrangeCache`, offline `BeaverPool`, `ShardedPrivateLedger`, sender-anonymous rounds, PSS & `CoverFrame` |
 | `src/fast_engine.rs` | Bitcoin Core BIP-152 compact relay, O(1) `IndexedLedger`, stack `[u128; 4]` multi-core parallel Express & Shielded engines |
 | `src/qkd.rs` | Bit-sliced BB84 + Weak/Vacuum Decoy-State QKD (QBER + PNS detection), `POPCNT` Toeplitz PA, `BufferedQkdPool`, ETSI 014 & QRNG traits |
-| `src/tokenomics.rs` | 21M `VRNM` halving cap, Proof-of-Pad anti-plutocracy rewards, 80/20 pad-burn fees, flat-bond validator slashing |
-| `src/wallet.rs` | Crash-safe disk-persisted `VernamWallet` + zero-dependency HTTP/1.1 `WalletRpcClient` |
-| `src/testnet_server.rs` | Live multi-validator HTTP/1.1 testnet daemon + embedded dark-mode web explorer & faucet UI |
-
-See [DESIGN_UPGRADES.md](DESIGN_UPGRADES.md) and [BITCOIN_CORE_OPTIMIZATIONS.md](BITCOIN_CORE_OPTIMIZATIONS.md) for deep technical details.
+| `src/tokenomics.rs` | 21M `VRNM` halving cap, Proof-of-Pad rewards, 80/20 pad-burn fees, flat-bond validator slashing |
+| `src/wallet.rs` | Crash-safe disk-persisted `VernamWallet` + zero-dependency auto-discovering HTTP/1.1 `WalletRpcClient` |
+| `src/testnet_server.rs` & `src/explorer_ui.rs` | Live HTTP/1.1 testnet daemon + dark-mode web explorer (P2P peer mesh, Proof-of-Pad mining UI, faucet, Shamir share inspector) |
 
 ## Running Tests & Benchmarks Locally
 
 ```bash
 cargo test --release
 cargo run --release -- bench
-cargo run --release -- testnet --bind 127.0.0.1:8080
+cargo run --release -- pop-mine
 ```

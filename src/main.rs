@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use vernam_rs::bft::{BftCluster, BftConfig, BinaryTx, WebOfTrustRegistry};
+use vernam_rs::bft::{BftCluster, BftConfig, BinaryTx};
 use vernam_rs::fast_engine::run_speed_benchmarks;
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
+use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
+use vernam_rs::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
 use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
 use vernam_rs::qkd::{
     AttackProfile, Bb84Channel, BufferedQkdPool, PoolConfig, QkdKeyProvider, toeplitz_hash_u64,
@@ -29,7 +31,7 @@ fn fmt_vrnm(verns: u64) -> String {
 
 fn print_help() {
     println!(
-        r#"Vernam (VRNM) v0.3 — 100% Information-Theoretically Secure OTP Coin
+        r#"Vernam (VRNM) v0.4 — Decentralized Pure-OTP & Proof-of-Pad Coin
 
 USAGE:
   vrnm [COMMAND] [OPTIONS]
@@ -37,23 +39,42 @@ USAGE:
 COMMANDS:
   demo                                  Run full 5-pillar showcase + speed benchmarks (default)
   bench                                 Run high-throughput Express & Shielded TPS benchmarks
-  testnet [--bind 0.0.0.0:8080]         Start live 4-validator HTTP testnet + web explorer
+  testnet [--bind 0.0.0.0:8080]         Start all-in-one 4-validator HTTP testnet + web explorer
+  node    [--id 0] [--bind 0.0.0.0:8080] [--advertise <IP:PORT>] [--seed <HOST:PORT> ...]
+                                        Start an independent decentralized P2P validator node
+                                        (auto-discovers all peers via seed gossip & syncs blocks)
+  pop-mine                              Run a standalone verified Proof-of-Pad (PoP) audit demo
   wallet create  --name <n> [--id <u32>] [--pages 16] [--node <url>] [--dir <path>]
   wallet status  [--name <n>] [--node <url>] [--dir <path>]
+  wallet peers   [--node <url>]         Auto-discover all active peer nodes from any single seed
   wallet faucet  --name <n> [--express 1000] [--shielded 500] [--node <url>]
   wallet balance --name <n> [--node <url>]
   wallet send    --from <n> --to <name|id> --amount <u64> [--node <url>]
   wallet send-private --from <n> --to <name|id> --amount <u64> [--node <url>]
   wallet refill  --name <n> [--pages 8]
+  wallet pop-mine [--node <url>]        Trigger verified Proof-of-Pad epoch mining on node
   wallet refresh-epoch [--node <url>]
   help                                  Show this help message
 
 ENVIRONMENT:
-  VRNM_BIND        Default testnet listen address (default: 0.0.0.0:8080)
-  VRNM_NODE        Default RPC node URL for wallet commands (default: http://127.0.0.1:8080)
+  VRNM_BIND        Default listen address (default: 0.0.0.0:8080)
+  VRNM_NODE        Default RPC/seed node URL for wallet commands (default: http://127.0.0.1:8080)
   VRNM_WALLET_DIR  Base directory for local wallets (default: ~/.vernam/wallets)
 "#
     );
+}
+
+fn get_all_flags(args: &[String], flag: &str) -> Vec<String> {
+    let mut vals = Vec::new();
+    let prefix = format!("{flag}=");
+    for i in 0..args.len() {
+        if args[i] == flag && i + 1 < args.len() {
+            vals.push(args[i + 1].clone());
+        } else if let Some(rest) = args[i].strip_prefix(&prefix) {
+            vals.push(rest.to_string());
+        }
+    }
+    vals
 }
 
 fn get_flag(args: &[String], flag: &str) -> Option<String> {
@@ -134,6 +155,92 @@ fn resolve_recipient(to_arg: &str) -> Result<(u32, usize, usize), String> {
     })?;
     let m = w.metadata();
     Ok((m.account_id, m.bucket_id, m.slot_in_bucket))
+}
+
+fn cmd_node(args: &[String]) -> Result<(), String> {
+    let node_id: u64 = match get_flag(args, "--id") {
+        Some(s) => s.parse::<u64>().map_err(|_| "invalid --id <u64>")?,
+        None => 0,
+    };
+    let bind_addr = get_flag(args, "--bind")
+        .or_else(|| env::var("VRNM_BIND").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "0.0.0.0:8080".to_string());
+    let advertise_addr = get_flag(args, "--advertise").unwrap_or_else(|| bind_addr.clone());
+    let mut seeds = Vec::new();
+    for raw in get_all_flags(args, "--seed") {
+        for part in raw.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                seeds.push(trimmed.to_string());
+            }
+        }
+    }
+    let gossip_interval_ms: u64 = match get_flag(args, "--gossip-ms") {
+        Some(s) => s.parse::<u64>().map_err(|_| "invalid --gossip-ms")?,
+        None => 2_000,
+    };
+
+    let cfg = P2pNodeConfig {
+        node_id,
+        bind_addr: bind_addr.clone(),
+        advertise_addr: advertise_addr.clone(),
+        seeds: seeds.clone(),
+        gossip_interval_ms,
+    };
+    let node = P2pNode::bind(cfg).map_err(|e| format!("failed to bind P2P node: {e}"))?;
+    println!("========================================================================");
+    println!("  VERNAM (VRNM) v0.4 DECENTRALIZED P2P VALIDATOR NODE RUNNING");
+    println!("  Node ID         : {node_id}");
+    println!("  Listen Address  : http://{}/", node.local_addr());
+    println!("  Advertised Addr : {}", node.advertise_addr());
+    println!(
+        "  Bootstrap Seeds : {}",
+        if seeds.is_empty() {
+            "(none — acting as seed node)".to_string()
+        } else {
+            seeds.join(", ")
+        }
+    );
+    println!("  Endpoints       : / (Explorer), /health, /status, /p2p/peers, /p2p/announce, /p2p/tx, /faucet");
+    println!("========================================================================");
+    node.serve_forever()
+        .map_err(|e| format!("P2P node server error: {e}"))
+}
+
+fn cmd_pop_mine() -> Result<(), String> {
+    println!("=== Vernam (VRNM) Verified Proof-of-Pad (PoP) Entropy Mining Audit ===");
+    let mut tok = TokenomicsEngine::with_defaults();
+    tok.mint_genesis_supply(10_000 * VERN_PER_VRNM)
+        .map_err(|e| format!("{e}"))?;
+    for vid in 0..4u64 {
+        tok.register_genesis_validator(vid)
+            .map_err(|e| format!("{e}"))?;
+    }
+    let epoch = tok.current_epoch();
+    let mut proofs = Vec::new();
+    for vid in 0..4u64 {
+        let batch = PopMiner::mine_pad_batch(vid, 8, 8).map_err(|e| format!("{e}"))?;
+        let challenge = PopAuditor::issue_challenge(vid, epoch);
+        let proof = PopMiner::answer_challenge(&batch, &challenge).with_liveness(1, 1);
+        let rcpt = PopAuditor::verify_proof(&challenge, &proof).map_err(|e| format!("{e}"))?;
+        println!(
+            "  Validator V{vid}: PASS | monobit_z={:.3} runs_z={:.3} QBER={:.2}% beaver_triple=OK",
+            rcpt.entropy_stats.monobit_z_score,
+            rcpt.entropy_stats.runs_z_score,
+            rcpt.qkd_telemetry.qber * 100.0
+        );
+        proofs.push((challenge, proof));
+    }
+    let report = PopEpochCoordinator::run_audited_epoch(&mut tok, &proofs);
+    println!(
+        "Epoch #{} settled: {}/{} passed, minted {} across {} validators!",
+        report.settlement.epoch,
+        report.accepted.len(),
+        proofs.len(),
+        fmt_vrnm(report.settlement.subsidy_minted),
+        report.settlement.payouts.len()
+    );
+    Ok(())
 }
 
 fn cmd_testnet(args: &[String]) -> Result<(), String> {
@@ -342,6 +449,37 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
+        "peers" => {
+            let node_url = resolve_node_url(rest, None);
+            let peers = discover_network_peers(&node_url)
+                .map_err(|e| format!("peer discovery via {node_url} failed: {e}"))?;
+            println!(
+                "Auto-discovered {} active Vernam (VRNM) peer(s) via {node_url}:",
+                peers.len()
+            );
+            for p in peers {
+                println!(
+                    "  node_id={:<3} addr={:<24} height={:<6} pop_score={:<5} qber={:.2}% healthy={}",
+                    p.node_id,
+                    p.addr,
+                    p.height,
+                    p.pop_score,
+                    p.qber * 100.0,
+                    p.healthy
+                );
+            }
+            Ok(())
+        }
+        "pop-mine" => {
+            let node_url = resolve_node_url(rest, None);
+            let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
+            let resp = rpc
+                .mine_pop_epoch()
+                .map_err(|e| format!("PoP mine RPC failed: {e}"))?;
+            println!("Verified Proof-of-Pad (PoP) Epoch Mined @ {node_url}:");
+            println!("{resp}");
+            Ok(())
+        }
         "refresh-epoch" => {
             let node_url = resolve_node_url(rest, None);
             let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
@@ -439,18 +577,9 @@ fn cmd_demo() {
     let _ = std::fs::remove_file(&wal_path);
     let _ = std::fs::remove_file(WalPadBook::wal_path_for(&wal_path));
 
-    // 2. BFT + Web-of-Trust PoP + Catch-up
-    println!("[2/6] Express Lane (VRNM-Fast): 2-Phase Batched BFT + Web-of-Trust PoP");
+    // 2. Express 2-Phase Batched BFT + Offline Catch-up
+    println!("[2/6] Express Lane (VRNM-Fast): 2-Phase Batched BFT + Offline Quorum Catch-Up");
     let cfg = BftConfig::default();
-    let mut wot = WebOfTrustRegistry::for_bft_config(&cfg);
-    for (idx, sponsor) in [0u32, 1, 2].into_iter().enumerate() {
-        wot.vouch_in_person(sponsor, 42, 1_700_000_000 + idx as u64)
-            .expect("vouch");
-    }
-    println!(
-        "  Web-of-Trust PoP       : candidate #42 admitted via 3 in-person vouches (flat weight={})",
-        wot.voting_weight(42)
-    );
     let mut init_bal = BTreeMap::new();
     init_bal.insert(1u32, 100_000_000u64);
     init_bal.insert(2u32, 0u64);
@@ -579,6 +708,8 @@ fn main() {
             Ok(())
         }
         "testnet" => cmd_testnet(rest),
+        "node" => cmd_node(rest),
+        "pop-mine" => cmd_pop_mine(),
         "wallet" => cmd_wallet(rest),
         "help" | "-h" | "--help" => {
             print_help();

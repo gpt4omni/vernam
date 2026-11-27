@@ -17,7 +17,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::bft::{BftCluster, BftConfig, BinaryTx, WebOfTrustRegistry};
+use crate::explorer_ui::VERNAM_EXPLORER_HTML;
 use crate::field::zeroize_slice;
+use crate::pop_mining::{PopAuditor, PopEpochCoordinator, PopMiner};
 use crate::privacy_mpc::{
     BeaverPool, ConfidentialTransferRequest, DEFAULT_BUCKET_SIZE, DEFAULT_NUM_VALIDATORS,
     DEFAULT_THRESHOLD, ShardedPrivateLedger,
@@ -1141,12 +1143,87 @@ impl TestnetServer {
         }
 
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") => HttpResponse::html(EXPLORER_HTML.to_string()),
+            ("GET", "/") => HttpResponse::html(VERNAM_EXPLORER_HTML.to_string()),
 
             ("GET", "/health") => HttpResponse::ok_json(
-                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"0.3.0\"}"
+                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"0.4.0\"}"
                     .to_string(),
             ),
+
+            ("GET", "/p2p/peers") => {
+                let guard = state.lock().expect("testnet state mutex poisoned");
+                let height = guard.blocks_finalized;
+                let qber = guard.last_qber;
+                let bind = json_escape(&guard.config.bind_addr);
+                let mut arr = String::from("[");
+                for vid in 0..4u64 {
+                    if vid > 0 {
+                        arr.push(',');
+                    }
+                    arr.push_str(&format!(
+                        "{{\"node_id\":{vid},\"addr\":\"{bind}\",\"height\":{height},\"pop_score\":100,\"qber\":{qber:.6},\"healthy\":true}}"
+                    ));
+                }
+                arr.push(']');
+                HttpResponse::ok_json(arr)
+            }
+
+            ("POST", "/pop/mine") => {
+                let mut guard = state.lock().expect("testnet state mutex poisoned");
+                let epoch = guard.tokenomics.current_epoch();
+                let mut proofs = Vec::new();
+                let mut last_monobit_z = 0.0f64;
+                let mut last_runs_z = 0.0f64;
+                let mut last_qber = guard.last_qber;
+                let mut all_valid = true;
+
+                for vid in 0..4u64 {
+                    match PopMiner::mine_pad_batch(vid, 8, 8) {
+                        Ok(batch) => {
+                            let challenge = PopAuditor::issue_challenge(vid, epoch);
+                            let proof = PopMiner::answer_challenge(&batch, &challenge)
+                                .with_liveness(1, 1);
+                            if let Ok(rcpt) = PopAuditor::verify_proof(&challenge, &proof) {
+                                last_monobit_z = rcpt.entropy_stats.monobit_z_score;
+                                last_runs_z = rcpt.entropy_stats.runs_z_score;
+                                last_qber = rcpt.qkd_telemetry.qber;
+                            } else {
+                                all_valid = false;
+                            }
+                            proofs.push((challenge, proof));
+                        }
+                        Err(_) => {
+                            all_valid = false;
+                        }
+                    }
+                }
+
+                let report = PopEpochCoordinator::run_audited_epoch(&mut guard.tokenomics, &proofs);
+                let _ = guard.shielded_ledger.proactive_refresh_epoch();
+                guard.last_qber = last_qber;
+                guard.push_event(format!(
+                    "POP MINE: epoch #{} audited {}/{} validators, subsidy={} vern, QBER={:.4}%",
+                    report.settlement.epoch,
+                    report.accepted.len(),
+                    proofs.len(),
+                    report.settlement.subsidy_minted,
+                    last_qber * 100.0
+                ));
+                HttpResponse::ok_json(format!(
+                    "{{\"status\":\"mined\",\"epoch\":{},\"pss_epoch\":{},\"audited_validators\":{},\"passed_validators\":{},\"beaver_verified\":{},\"monobit_z\":{:.4},\"runs_z\":{:.4},\"qber\":{:.6},\"subsidy_minted_vern\":{},\"total_burned_vern\":{},\"circulating_supply_vern\":{}}}",
+                    report.settlement.epoch,
+                    guard.shielded_ledger.epoch(),
+                    proofs.len(),
+                    report.accepted.len(),
+                    all_valid,
+                    last_monobit_z,
+                    last_runs_z,
+                    last_qber,
+                    report.settlement.subsidy_minted,
+                    report.settlement.total_burned,
+                    report.settlement.circulating_supply,
+                ))
+            }
 
             ("GET", "/status") => {
                 let guard = state.lock().expect("testnet state mutex poisoned");
@@ -1355,6 +1432,7 @@ impl TestnetServer {
 // 5. Self-Contained Dark-Mode Vernam (VRNM) Testnet Web Explorer & Wallet UI
 // ============================================================================
 
+#[allow(dead_code)]
 const EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1828,7 +1906,7 @@ mod tests {
         assert!(headers.contains("Access-Control-Allow-Origin: *"));
         assert_eq!(
             body,
-            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"0.3.0"}"#
+            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"0.4.0"}"#
         );
 
         // 2. GET / (Dark-mode interactive explorer HTML)

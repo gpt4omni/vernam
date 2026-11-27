@@ -1,0 +1,151 @@
+# Vernam (VRNM) — 4-Node Decentralized P2P Testnet Mesh
+#
+# Demonstrates automatic transitive peer discovery over `/p2p/peers` gossip:
+#   vrnm-node-0 (seed)       -> host :8080
+#   vrnm-node-1 --seed node0 -> host :8081
+#   vrnm-node-2 --seed node1 -> host :8082  (auto-discovers node0 transitively!)
+#   vrnm-node-3 --seed node2 -> host :8083  (auto-discovers node0 & node1 transitively!)
+#
+# Launch the full 4-validator decentralized mesh:
+#   docker compose -f deploy/docker-compose.multi-node.yml up -d --build
+#
+# Verify automatic peer discovery from node-3 (which only knew node-2!):
+#   curl -fsS http://127.0.0.1:8083/p2p/peers
+#
+# Tear down and wipe ephemeral testnet volumes:
+#   docker compose -f deploy/docker-compose.multi-node.yml down -v
+
+x-vrnam-node: &vrnam-node
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: vernam-testnet:latest
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 256
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+  networks:
+    - vernam-mesh
+
+services:
+  vrnm-node-0:
+    <<: *vrnam-node
+    container_name: vrnm-node-0
+    command:
+      - "node"
+      - "--id"
+      - "0"
+      - "--bind"
+      - "0.0.0.0:8080"
+      - "--advertise"
+      - "vrnm-node-0:8080"
+    ports:
+      - "${VRNM_NODE0_PORT:-8080}:8080"
+    environment:
+      VRNM_NODE_ID: "0"
+      VRNM_BIND: "0.0.0.0:8080"
+      VRNM_ADVERTISE: "vrnm-node-0:8080"
+      VRNM_DATA_DIR: "/var/lib/vernam"
+    volumes:
+      - vrnm-node-0-data:/var/lib/vernam
+
+  vrnm-node-1:
+    <<: *vrnam-node
+    container_name: vrnm-node-1
+    depends_on:
+      vrnm-node-0:
+        condition: service_healthy
+    command:
+      - "node"
+      - "--id"
+      - "1"
+      - "--bind"
+      - "0.0.0.0:8080"
+      - "--advertise"
+      - "vrnm-node-1:8080"
+      - "--seed"
+      - "vrnm-node-0:8080"
+    ports:
+      - "${VRNM_NODE1_PORT:-8081}:8080"
+    environment:
+      VRNM_NODE_ID: "1"
+      VRNM_BIND: "0.0.0.0:8080"
+      VRNM_ADVERTISE: "vrnm-node-1:8080"
+      VRNM_SEED: "vrnm-node-0:8080"
+      VRNM_DATA_DIR: "/var/lib/vernam"
+    volumes:
+      - vrnm-node-1-data:/var/lib/vernam
+
+  vrnm-node-2:
+    <<: *vrnam-node
+    container_name: vrnm-node-2
+    depends_on:
+      vrnm-node-1:
+        condition: service_healthy
+    command:
+      - "node"
+      - "--id"
+      - "2"
+      - "--bind"
+      - "0.0.0.0:8080"
+      - "--advertise"
+      - "vrnm-node-2:8080"
+      - "--seed"
+      - "vrnm-node-1:8080"
+    ports:
+      - "${VRNM_NODE2_PORT:-8082}:8080"
+    environment:
+      VRNM_NODE_ID: "2"
+      VRNM_BIND: "0.0.0.0:8080"
+      VRNM_ADVERTISE: "vrnm-node-2:8080"
+      VRNM_SEED: "vrnm-node-1:8080"
+      VRNM_DATA_DIR: "/var/lib/vernam"
+    volumes:
+      - vrnm-node-2-data:/var/lib/vernam
+
+  vrnm-node-3:
+    <<: *vrnam-node
+    container_name: vrnm-node-3
+    depends_on:
+      vrnm-node-2:
+        condition: service_healthy
+    command:
+      - "node"
+      - "--id"
+      - "3"
+      - "--bind"
+      - "0.0.0.0:8080"
+      - "--advertise"
+      - "vrnm-node-3:8080"
+      - "--seed"
+      - "vrnm-node-2:8080"
+    ports:
+      - "${VRNM_NODE3_PORT:-8083}:8080"
+    environment:
+      VRNM_NODE_ID: "3"
+      VRNM_BIND: "0.0.0.0:8080"
+      VRNM_ADVERTISE: "vrnm-node-3:8080"
+      VRNM_SEED: "vrnm-node-2:8080"
+    volumes:
+      - vrnm-node-3-data:/var/lib/vernam
+
+volumes:
+  vrnm-node-0-data:
+  vrnm-node-1-data:
+  vrnm-node-2-data:
+  vrnm-node-3-data:
+
+networks:
+  vernam-mesh:
+    driver: bridge
