@@ -1,0 +1,45 @@
+[Unit]
+Description=Vernam (VRNM) Information-Theoretically Secure Testnet Node
+Documentation=https://github.com/gpt4omni/vernam
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vernam
+Group=vernam
+WorkingDirectory=/var/lib/vernam
+StateDirectory=vernam
+StateDirectoryMode=0700
+Environment=VRNM_BIND=0.0.0.0:8080
+Environment=VRNM_DATA_DIR=/var/lib/vernam
+ExecStart=/usr/local/bin/vrnm testnet --bind 0.0.0.0:8080
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=65536
+UMask=0077
+
+# Sandboxing & privilege hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,76 @@
+# Vernam (VRNM) Testnet — Docker Compose Deployment
+#
+# Quick start (HTTP on port 8080):
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Automatic Let's Encrypt HTTPS (with Caddy reverse proxy):
+#   VRNM_DOMAIN=testnet.example.com VRNM_PORT=127.0.0.1:8080 \
+#     docker compose -f deploy/docker-compose.yml --profile https up -d --build
+
+services:
+  vernam-testnet:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vernam-testnet:latest
+    container_name: vernam-testnet
+    restart: unless-stopped
+    ports:
+      - "${VRNM_PORT:-8080}:8080"
+    environment:
+      VRNM_BIND: "0.0.0.0:8080"
+      VRNM_DATA_DIR: "/var/lib/vernam"
+    volumes:
+      - vernam-data:/var/lib/vernam
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - vernam-net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: vernam-caddy
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on:
+      vernam-testnet:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      VRNM_DOMAIN: "${VRNM_DOMAIN:-localhost}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      - vernam-net
+
+volumes:
+  vernam-data:
+  caddy-data:
+  caddy-config:
+
+networks:
+  vernam-net:
+    driver: bridge

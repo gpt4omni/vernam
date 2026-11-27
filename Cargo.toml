@@ -1,8 +1,8 @@
 [package]
 name = "vernam-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Vernam (VRNM): High-speed, information-theoretically secure OTP cryptocurrency core"
+description = "Vernam (VRNM): High-speed, information-theoretically secure OTP cryptocurrency core, CLI wallet, and VPS testnet"
 
 [profile.release]
 opt-level = 3

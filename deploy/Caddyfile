@@ -1,0 +1,22 @@
+# Vernam (VRNM) Testnet — Automatic HTTPS Reverse Proxy (Caddy v2)
+#
+# Set VRNM_DOMAIN to your public DNS name (with A/AAAA pointing to your VPS)
+# for automatic Let's Encrypt TLS certificates. Defaults to `localhost`.
+
+{$VRNM_DOMAIN:localhost} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy vernam-testnet:8080 {
+		health_uri /health
+		health_interval 15s
+		health_timeout 3s
+	}
+}
