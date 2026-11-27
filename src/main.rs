@@ -19,7 +19,7 @@ use vernam_rs::dynamic_quorum::{
 use vernam_rs::entropy_beacon::{AutonomousEpochClock, BeaconConfig, OtpChannelKey, VernamBeacon};
 use vernam_rs::entropy_harvester::default_commodity_extractor;
 use vernam_rs::fast_engine::run_speed_benchmarks;
-use vernam_rs::field::random_field_elem;
+use vernam_rs::field::{random_field_elem, random_nonzero_field_elem};
 use vernam_rs::geo_triangulation::{
     DistanceProbeKey, respond_probe, verify_probe_response,
 };
@@ -40,10 +40,11 @@ use vernam_rs::oblivious_shuffle::{
     AuthenticatedLedgerState, DealerShuffleSecret, ObliviousEpochMixer, ShuffleMaskCorrelation,
 };
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
-use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
+use vernam_rs::p2p_node::{BlockSealKey, P2pNode, P2pNodeConfig, discover_network_peers};
 use vernam_rs::pop_mining::{
-    BeaconPairingSchedule, BilateralPopSubmission, DEFAULT_CHALLENGE_SLOT_COUNT, PeerReceiptKey,
-    PopAuditPolicy, PopAuditor, PopEpochCoordinator, PopMiner, PopReplayRegistry,
+    BeaconPairingSchedule, BilateralDeliveryReceipt, BilateralPopSubmission,
+    DEFAULT_CHALLENGE_SLOT_COUNT, PeerReceiptKey, PopAuditPolicy, PopAuditor, PopChallenge,
+    PopCommitment, PopEpochCoordinator, PopMiner, PopProof, PopReplayRegistry,
     audit_pad_entropy_extended,
 };
 use vernam_rs::privacy_mpc::{
@@ -53,7 +54,10 @@ use vernam_rs::privacy_mpc::{
 use vernam_rs::qkd::{
     AttackProfile, Bb84Channel, BufferedQkdPool, EntropySource, PoolConfig, QkdKeyProvider,
 };
-use vernam_rs::testnet_server::{TestnetConfig, TestnetServer, parse_json_u64};
+use vernam_rs::testnet_server::{
+    TestnetConfig, TestnetServer, parse_hex_u128, parse_json_str, parse_json_u64,
+    parse_json_u64_array,
+};
 use vernam_rs::tokenomics::{
     EpochContribution, FeeLane, MAX_SUPPLY, OneTimeAuditKey, SlashingOffense, TokenomicsEngine,
     VERN_PER_VRNM,
@@ -77,7 +81,7 @@ fn fmt_vrnm(verns: u64) -> String {
 
 fn print_help() {
     println!(
-        r#"Vernam (VRNM) v2.1 — Zero-Admin, Information-Theoretically Secure OTP Coin & Circuits VM
+        r#"Vernam (VRNM) v2.2 — Experimental Information-Theoretically Secure OTP Coin & Circuits VM
 
 USAGE:
   vrnm [COMMAND] [OPTIONS]
@@ -89,35 +93,38 @@ COMMANDS:
   circuits-demo                         Run v2.1 Confidential IT-MPC Circuits VM, Dark-Pool AMM, Vickrey Auction, Ballot Box & Adaptive Tuner demo
   bench                                 Run high-throughput Express, Shielded & real-TCP TPS benchmarks
   testnet [--bind 0.0.0.0:8080] [--data-dir <path>]
-                                        Start all-in-one 4-validator HTTP testnet + web explorer
+                                        Start all-in-one 4-validator HTTP testnet + authenticated web explorer
                                         (enables crash-safe Carter-Wegman on-disk persistence with --data-dir)
   validator [--id 0] [--committee 4] [--bind 0.0.0.0:9100] [--http 127.0.0.1:9200] [--peers 1=ip:port,...] [--max-epochs N]
                                         Start a single-share multi-host IT-MPC validator daemon
-  node    [--id 0] [--bind 0.0.0.0:8080] [--advertise <IP:PORT>] [--seed <HOST:PORT> ...]
+  node    [--id 0] [--bind 0.0.0.0:8080] [--advertise <IP:PORT>] [--seed <HOST:PORT> ...] [--seal-key-file <path>]
                                         Start an independent decentralized P2P validator node
-                                        (auto-discovers all peers via seed gossip & syncs blocks)
+                                        (loads private block-seal key from VRNM_P2P_SEAL_KEY / keyfile or generates ephemeral OS key)
   pop-mine                              Run a standalone beacon-paired bilateral Proof-of-Pad (PoP) audit
   miner   [--id 0] [--cores 1] [--node <url>] [--rounds 1] [--interval 15] [--pages 16] [--triples 32]
-                                        Run a 1-core (or N-core) Proof-of-Pad entropy & Beaver miner
+                                        Run a remote Proof-of-Pad entropy & Beaver miner (POST /pop/commit -> POST /pop/submit)
   hw-entropy                            Probe hardware QRNG (/dev/hwrng, VRNM_QRNG_DEVICE) + NIST SP 800-90B health test
-  wallet create  --name <n> [--id <u32>] [--pages 16] [--node <url>] [--dir <path>]
-  wallet status  [--name <n>] [--node <url>] [--dir <path>]
-  wallet peers   [--node <url>]         Auto-discover all active peer nodes from any single seed
-  wallet faucet  --name <n> [--express 1000] [--shielded 500] [--node <url>]
-  wallet balance --name <n> [--node <url>]
-  wallet send    --from <n> --to <name|id> --amount <u64> [--node <url>]
+  wallet create   --name <n> [--id <u32>] [--pages 16] [--node <url>] [--dir <path>]
+  wallet register --name <n> [--count 16] [--node <url>] [--dir <path>]
+  wallet status   [--name <n>] [--node <url>] [--dir <path>]
+  wallet peers    [--node <url>]        Auto-discover all active peer nodes from any single seed
+  wallet faucet   --name <n> [--express 1000] [--shielded 500] [--node <url>]
+  wallet balance  --name <n> [--node <url>]
+  wallet send     --from <n> --to <name|id> --amount <u64> [--node <url>]
   wallet send-private --from <n> --to <name|id> --amount <u64> [--node <url>]
-  wallet refill  --name <n> [--pages 8]
-  wallet pop-mine [--node <url>]        Trigger beacon-paired bilateral PoP epoch mining on node
+  wallet refill   --name <n> [--pages 8]
+  wallet pop-mine [--id 0] [--pages 8] [--triples 8] [--node <url>]
+                                        Run 1 remote interactive PoP commit -> challenge -> submit round
   wallet refresh-epoch [--node <url>]
   help                                  Show this help message
 
 ENVIRONMENT:
-  VRNM_BIND        Default listen address (default: 0.0.0.0:8080)
-  VRNM_DATA_DIR    Crash-safe on-disk persistence directory for `vrnm testnet`
-  VRNM_QRNG_DEVICE Hardware QRNG device path (e.g. /dev/hwrng, /dev/TrueRNG)
-  VRNM_NODE        Default RPC/seed node URL for wallet commands (default: http://127.0.0.1:8080)
-  VRNM_WALLET_DIR  Base directory for local wallets (default: ~/.vernam/wallets)
+  VRNM_BIND         Default listen address (default: 0.0.0.0:8080)
+  VRNM_DATA_DIR     Crash-safe on-disk persistence directory for `vrnm testnet`
+  VRNM_P2P_SEAL_KEY Private 254-bit Carter-Wegman block-sealing key (`<r_hex>:<s_hex>`) for `vrnm node`
+  VRNM_QRNG_DEVICE  Hardware QRNG device path (e.g. /dev/hwrng, /dev/TrueRNG)
+  VRNM_NODE         Default RPC/seed node URL for wallet commands (default: http://127.0.0.1:8080)
+  VRNM_WALLET_DIR   Base directory for local wallets (default: ~/.vernam/wallets)
 "#
     );
 }
@@ -240,16 +247,25 @@ fn cmd_node(args: &[String]) -> Result<(), String> {
         None => 2_000,
     };
 
+    let cluster_seal_key = match get_flag(args, "--seal-key-file") {
+        Some(path) => Some(
+            BlockSealKey::from_env_or_file(Path::new(&path))
+                .map_err(|e| format!("invalid P2P seal keyfile '{path}': {e}"))?,
+        ),
+        None => None,
+    };
+
     let cfg = P2pNodeConfig {
         node_id,
         bind_addr: bind_addr.clone(),
         advertise_addr: advertise_addr.clone(),
         seeds: seeds.clone(),
         gossip_interval_ms,
+        cluster_seal_key,
     };
     let node = P2pNode::bind(cfg).map_err(|e| format!("failed to bind P2P node: {e}"))?;
     println!("========================================================================");
-    println!("  VERNAM (VRNM) v0.4 DECENTRALIZED P2P VALIDATOR NODE RUNNING");
+    println!("  VERNAM (VRNM) v2.2 DECENTRALIZED P2P VALIDATOR NODE RUNNING");
     println!("  Node ID         : {node_id}");
     println!("  Listen Address  : http://{}/", node.local_addr());
     println!("  Advertised Addr : {}", node.advertise_addr());
@@ -379,6 +395,224 @@ fn cmd_pop_mine() -> Result<(), String> {
     Ok(())
 }
 
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_registered_auth_keys(body: &str) -> Result<Vec<(u64, u128, u128)>, String> {
+    let Some(start) = body.find("\"keys\":[") else {
+        return Err(format!("register response missing 'keys' array: {body}"));
+    };
+    let rest = &body[start + "\"keys\":[".len()..];
+    let Some(end) = rest.find(']') else {
+        return Err("malformed 'keys' array in register response".to_string());
+    };
+    let inner = &rest[..end];
+    let mut keys = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(obj_start) = inner[cursor..].find('{') {
+        let abs_start = cursor + obj_start;
+        let Some(obj_end) = inner[abs_start..].find('}') else {
+            break;
+        };
+        let obj = &inner[abs_start..=abs_start + obj_end];
+        let pad_id = parse_json_u64(obj, "pad_id")
+            .ok_or_else(|| "missing pad_id in register response".to_string())?;
+        let r_str = parse_json_str(obj, "r")
+            .ok_or_else(|| "missing r in register response".to_string())?;
+        let s_str = parse_json_str(obj, "s")
+            .ok_or_else(|| "missing s in register response".to_string())?;
+        let r = parse_hex_u128(&r_str)
+            .ok_or_else(|| format!("invalid hex r '{r_str}' in register response"))?;
+        let s = parse_hex_u128(&s_str)
+            .ok_or_else(|| format!("invalid hex s '{s_str}' in register response"))?;
+        keys.push((pad_id, r, s));
+        cursor = abs_start + obj_end + 1;
+    }
+    if keys.is_empty() {
+        return Err(format!("no auth keys returned by node: {body}"));
+    }
+    Ok(keys)
+}
+
+fn format_pop_commit_json(commit: &PopCommitment) -> String {
+    let mut digests_json = String::from("[");
+    for (i, &d) in commit.page_digests.iter().enumerate() {
+        if i > 0 {
+            digests_json.push(',');
+        }
+        digests_json.push_str(&format!("\"0x{:032x}\"", d));
+    }
+    digests_json.push(']');
+    format!(
+        "{{\"validator_id\":{},\"pad_pages_mined\":{},\"beaver_triples_mined\":{},\"commit_r\":\"0x{:032x}\",\"commit_s\":\"0x{:032x}\",\"page_digests\":{},\"batch_commitment\":\"{}\"}}",
+        commit.validator_id,
+        commit.pad_pages_mined,
+        commit.beaver_triples_mined,
+        commit.commit_r,
+        commit.commit_s,
+        digests_json,
+        hex_encode_bytes(&commit.batch_commitment),
+    )
+}
+
+fn format_pop_submit_json(proof: &PopProof, receipt: &BilateralDeliveryReceipt) -> String {
+    let mut samples_json = String::from("[");
+    for (i, (_, sample)) in proof.audited_pad_samples.iter().enumerate() {
+        if i > 0 {
+            samples_json.push(',');
+        }
+        samples_json.push('"');
+        samples_json.push_str(&hex_encode_bytes(sample));
+        samples_json.push('"');
+    }
+    samples_json.push(']');
+
+    let mut digests_json = String::from("[");
+    for (i, &d) in proof.page_digests.iter().enumerate() {
+        if i > 0 {
+            digests_json.push(',');
+        }
+        digests_json.push_str(&format!("\"0x{:032x}\"", d));
+    }
+    digests_json.push(']');
+
+    format!(
+        concat!(
+            "{{",
+            "\"validator_id\":{},",
+            "\"epoch\":{},",
+            "\"audited_pad_index\":{},",
+            "\"audited_triple_index\":{},",
+            "\"audited_pad_samples\":{},",
+            "\"sacrificed_a\":\"0x{:032x}\",",
+            "\"sacrificed_b\":\"0x{:032x}\",",
+            "\"sacrificed_c\":\"0x{:032x}\",",
+            "\"page_digests\":{},",
+            "\"batch_commitment\":\"{}\",",
+            "\"sample_commitment_tag\":\"{}\",",
+            "\"challenged_slots_tag\":\"{}\",",
+            "\"qber_bits\":{},",
+            "\"sifted_bits\":{},",
+            "\"decoy_ratio_bits\":{},",
+            "\"y1_bits\":{},",
+            "\"counterparty_id\":{},",
+            "\"pages_commitment_digest\":\"0x{:032x}\",",
+            "\"counterparty_mac\":\"{}\"",
+            "}}"
+        ),
+        proof.validator_id,
+        proof.epoch,
+        proof.audited_pad_index,
+        proof.audited_triple_index,
+        samples_json,
+        proof.sacrificed_triple.a,
+        proof.sacrificed_triple.b,
+        proof.sacrificed_triple.c,
+        digests_json,
+        hex_encode_bytes(&proof.batch_commitment),
+        hex_encode_bytes(&proof.sample_commitment_tag),
+        hex_encode_bytes(&proof.challenged_slots_tag),
+        proof.qkd_telemetry.qber.to_bits(),
+        proof.qkd_telemetry.sifted_bits,
+        proof.qkd_telemetry.decoy_yield_ratio.to_bits(),
+        proof.qkd_telemetry.single_photon_yield_lower_bound.to_bits(),
+        receipt.counterparty_id,
+        receipt.pages_commitment_digest,
+        hex_encode_bytes(&receipt.counterparty_mac),
+    )
+}
+
+/// Execute a real interactive remote Proof-of-Pad round against a Vernam testnet node:
+/// 1. Mine fresh OTP pages + Beaver triples locally (`PopMiner::mine_pad_batch`).
+/// 2. Pre-commit page digests to `POST /pop/commit`.
+/// 3. Receive server's threshold-beacon-derived `PopChallenge`, Sattolo counterparty, and `PeerReceiptKey`.
+/// 4. Open ONLY the challenged slots + sacrificed Beaver triple and co-sign the bilateral receipt.
+/// 5. Submit the proof to `POST /pop/submit` for real server-side verification & epoch settlement.
+fn submit_remote_pop_round(
+    rpc: &WalletRpcClient,
+    validator_id: u64,
+    pages: usize,
+    triples: usize,
+) -> Result<(f64, String), String> {
+    let mut batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
+        .map_err(|e| format!("local PoP mine failed: {e}"))?;
+    let qber = batch.qkd_telemetry.qber;
+    let commit_r = random_nonzero_field_elem();
+    let commit_s = random_field_elem();
+    let commit = PopMiner::commit_batch(&batch, commit_r, commit_s);
+
+    let commit_body = format_pop_commit_json(&commit);
+    let commit_resp = rpc
+        .pop_commit(&commit_body)
+        .map_err(|e| format!("POST /pop/commit failed: {e}"))?;
+
+    let epoch = parse_json_u64(&commit_resp, "epoch")
+        .ok_or_else(|| format!("missing 'epoch' in /pop/commit response: {commit_resp}"))?;
+    let expected_counterparty = parse_json_u64(&commit_resp, "expected_counterparty")
+        .ok_or_else(|| "missing 'expected_counterparty' in /pop/commit response".to_string())?;
+    let challenge_r = parse_json_str(&commit_resp, "challenge_r")
+        .and_then(|s| parse_hex_u128(&s))
+        .ok_or_else(|| "missing/invalid 'challenge_r'".to_string())?;
+    let sample_mask_s = parse_json_str(&commit_resp, "sample_mask_s")
+        .and_then(|s| parse_hex_u128(&s))
+        .ok_or_else(|| "missing/invalid 'sample_mask_s'".to_string())?;
+    let batch_mask_s = parse_json_str(&commit_resp, "batch_mask_s")
+        .and_then(|s| parse_hex_u128(&s))
+        .ok_or_else(|| "missing/invalid 'batch_mask_s'".to_string())?;
+    let slots_mask_s = parse_json_str(&commit_resp, "slots_mask_s")
+        .and_then(|s| parse_hex_u128(&s))
+        .ok_or_else(|| "missing/invalid 'slots_mask_s'".to_string())?;
+    let pad_slot_indices: Vec<usize> = parse_json_u64_array(&commit_resp, "pad_slot_indices", 64)
+        .ok_or_else(|| "missing/invalid 'pad_slot_indices'".to_string())?
+        .into_iter()
+        .map(|v| v as usize)
+        .collect();
+    let beaver_slot_index = parse_json_u64(&commit_resp, "beaver_slot_index")
+        .ok_or_else(|| "missing 'beaver_slot_index'".to_string())? as usize;
+    let peer_key_r = parse_json_str(&commit_resp, "peer_key_r")
+        .and_then(|s| parse_hex_u128(&s))
+        .ok_or_else(|| "missing/invalid 'peer_key_r'".to_string())?;
+    let peer_key_s = parse_json_str(&commit_resp, "peer_key_s")
+        .and_then(|s| parse_hex_u128(&s))
+        .ok_or_else(|| "missing/invalid 'peer_key_s'".to_string())?;
+
+    let challenge = PopChallenge {
+        validator_id,
+        epoch,
+        challenge_r,
+        sample_mask_s,
+        batch_mask_s,
+        slots_mask_s,
+        pad_slot_indices,
+        beaver_slot_index,
+    };
+    let peer_key = PeerReceiptKey::from_parts(peer_key_r, peer_key_s)
+        .map_err(|e| format!("invalid peer_key from node: {e}"))?;
+    let peer_receipt = BilateralDeliveryReceipt::issue_from_peer_pages(
+        validator_id,
+        expected_counterparty,
+        epoch,
+        &batch.pad_pages,
+        batch.beaver_triples.len(),
+        commit.commit_r,
+        batch.qkd_telemetry,
+        &peer_key,
+    );
+    let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
+    let submit_body = format_pop_submit_json(&proof, &peer_receipt);
+    let submit_resp = rpc
+        .pop_submit(&submit_body)
+        .map_err(|e| format!("POST /pop/submit failed: {e}"))?;
+    Ok((qber, submit_resp))
+}
+
 fn cmd_miner(args: &[String]) -> Result<(), String> {
     let validator_id: u64 = match get_flag(args, "--id") {
         Some(s) => s.parse::<u64>().map_err(|_| "invalid --id <u64>")?,
@@ -411,103 +645,29 @@ fn cmd_miner(args: &[String]) -> Result<(), String> {
     let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
 
     println!("========================================================================");
-    println!("  VERNAM (VRNM) PROOF-OF-PAD (PoP) ENTROPY MINER");
-    println!("  Validator ID : V{validator_id} | Worker Cores : {cores} (pinned 1-thread mode={})", cores == 1);
-    println!("  Target Node  : {node_url}");
+    println!("  VERNAM (VRNM) v2.2 INTERACTIVE PROOF-OF-PAD (PoP) ENTROPY MINER");
+    println!("  Validator ID : V{validator_id} | Worker Cores : {cores}");
+    println!("  Target Node  : {node_url} (POST /pop/commit -> POST /pop/submit)");
     println!("  Batch Size   : {pages} OTP pages ({} B) + {triples} Beaver triples / round", pages * FRAME_BYTES);
     println!("========================================================================");
 
-    let counterparty_id = validator_id.wrapping_add(1);
-    let mut replay = PopReplayRegistry::default();
     let mut round: usize = 0;
     loop {
         round += 1;
         let t0 = Instant::now();
-        // Strictly single-threaded 1-core execution when cores == 1 (or parallel workers if > 1).
-        let (rcpt, total_pages, total_triples) = if cores == 1 {
-            let peer_key = PeerReceiptKey::generate();
-            let (mut batch, commit, peer_receipt) = PopMiner::mine_bilateral_pad_batch(
-                validator_id,
-                counterparty_id,
-                round as u64,
-                pages,
-                triples,
-                &peer_key,
-            )
-            .map_err(|e| format!("PoP bilateral mine failed: {e}"))?;
-            let challenge = PopAuditor::issue_challenge(validator_id, round as u64);
-            let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
-            let rcpt = PopAuditor::verify_bilateral_proof(
-                &commit,
-                &challenge,
-                &proof,
-                Some(&peer_receipt),
-                Some(&peer_key),
-                &mut replay,
-            )
-            .map_err(|e| format!("bilateral self-audit failed: {e}"))?;
-            (rcpt, pages, triples)
-        } else {
-            let mut results = Vec::with_capacity(cores);
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(cores);
-                for c in 0..cores {
-                    handles.push(s.spawn(move || -> Result<_, String> {
-                        let peer_key = PeerReceiptKey::generate();
-                        let mut worker_replay = PopReplayRegistry::default();
-                        let (mut batch, cm, peer_receipt) = PopMiner::mine_bilateral_pad_batch(
-                            validator_id,
-                            counterparty_id,
-                            round as u64,
-                            pages,
-                            triples,
-                            &peer_key,
-                        )
-                        .map_err(|e| format!("worker {c}: {e}"))?;
-                        let ch = PopAuditor::issue_challenge(validator_id, round as u64);
-                        let pr = PopMiner::answer_challenge(&mut batch, &ch).with_liveness(1, 1);
-                        PopAuditor::verify_bilateral_proof(
-                            &cm,
-                            &ch,
-                            &pr,
-                            Some(&peer_receipt),
-                            Some(&peer_key),
-                            &mut worker_replay,
-                        )
-                        .map_err(|e| format!("worker {c}: {e}"))
-                    }));
-                }
-                for h in handles {
-                    results.push(h.join().map_err(|_| "miner worker panicked".to_string())?);
-                }
-                Ok::<(), String>(())
-            })?;
-            let first = results.into_iter().next().unwrap()?;
-            (first, pages * cores, triples * cores)
-        };
-        let mine_ms = t0.elapsed().as_secs_f64() * 1_000.0;
-        let pads_per_sec = total_pages as f64 / (mine_ms / 1_000.0);
-        let triples_per_sec = total_triples as f64 / (mine_ms / 1_000.0);
+        let res = submit_remote_pop_round(&rpc, validator_id, pages, triples);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+        let pads_per_sec = pages as f64 / (elapsed_ms / 1_000.0).max(1e-6);
 
-        let t_net = Instant::now();
-        let node_resp = rpc.mine_pop_epoch();
-        let net_ms = t_net.elapsed().as_secs_f64() * 1_000.0;
-
-        match node_resp {
-            Ok(json) => {
+        match res {
+            Ok((qber, json)) => {
                 println!(
-                    "[Round #{round}] Local 1-core mine: {mine_ms:.1} ms ({pads_per_sec:.0} pads/s, {triples_per_sec:.0} triples/s) | \
-                     QBER={:.2}% monobit_z={:.2} runs_z={:.2} | Node submit: {net_ms:.1} ms -> {json}",
-                    rcpt.qkd_telemetry.qber * 100.0,
-                    rcpt.entropy_stats.monobit_z_score,
-                    rcpt.entropy_stats.runs_z_score,
+                    "[Round #{round}] Real PoP commit->challenge->submit OK ({elapsed_ms:.1} ms, {pads_per_sec:.0} pads/s, QBER={:.2}%) -> {json}",
+                    qber * 100.0,
                 );
             }
             Err(e) => {
-                println!(
-                    "[Round #{round}] Local mine OK ({mine_ms:.1} ms, QBER={:.2}%), node submit warning: {e}",
-                    rcpt.qkd_telemetry.qber * 100.0
-                );
+                println!("[Round #{round}] Remote PoP round failed ({elapsed_ms:.1} ms): {e}");
             }
         }
 
@@ -596,7 +756,7 @@ fn cmd_testnet(args: &[String]) -> Result<(), String> {
         .local_addr()
         .map_err(|e| format!("local_addr error: {e}"))?;
     println!("========================================================================");
-    println!("  VERNAM (VRNM) v1.2 LIVE TESTNET NODE RUNNING");
+    println!("  VERNAM (VRNM) v2.2 LIVE TESTNET NODE RUNNING");
     println!("  Web Explorer & Faucet : http://{addr}/");
     println!(
         "  Crash-Safe Storage    : {}",
@@ -635,10 +795,47 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
                 None => 16,
             };
             let node_url = resolve_node_url(rest, None);
-            let w = VernamWallet::create(&dir, &name, account_id, 4, pages, &node_url)
+            let mut w = VernamWallet::create(&dir, &name, account_id, 4, pages, &node_url)
                 .map_err(|e| format!("wallet create failed: {e}"))?;
+            if let Ok(rpc) = WalletRpcClient::new(&node_url)
+                && let Ok(resp) = rpc.register_account_auth(account_id, 16)
+                && let Ok(keys) = parse_registered_auth_keys(&resp)
+                && w.store_auth_keys(&keys).is_ok()
+            {
+                println!(
+                    "Registered {} one-time Carter-Wegman auth keys with {node_url} (stored 0600 in auth_keys.bin).",
+                    keys.len()
+                );
+            } else {
+                println!(
+                    "Note: node {node_url} not registered yet; run `vrnm wallet register --name {name}` once online."
+                );
+            }
             println!("Created crash-safe Vernam (VRNM) wallet at {}", dir.display());
             println!("{}", w.status_report());
+            Ok(())
+        }
+        "register" => {
+            let dir = resolve_wallet_dir(rest, "--name")?;
+            let mut w = VernamWallet::open(&dir).map_err(|e| format!("open wallet: {e}"))?;
+            let count: usize = match get_flag(rest, "--count") {
+                Some(s) => s.parse::<usize>().map_err(|_| "invalid --count <usize>")?,
+                None => 16,
+            };
+            let node_url = resolve_node_url(rest, Some(&w));
+            let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
+            let resp = rpc
+                .register_account_auth(w.metadata().account_id, count)
+                .map_err(|e| format!("register auth keys RPC failed: {e}"))?;
+            let keys = parse_registered_auth_keys(&resp)?;
+            w.store_auth_keys(&keys)
+                .map_err(|e| format!("failed to persist auth_keys.bin: {e}"))?;
+            println!(
+                "Registered and stored {} single-use CW-MAC auth keys for account #{} (remaining: {}).",
+                keys.len(),
+                w.metadata().account_id,
+                w.remaining_auth_keys(),
+            );
             Ok(())
         }
         "status" => {
@@ -691,9 +888,21 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
             let mut w = VernamWallet::open(&dir).map_err(|e| format!("open wallet: {e}"))?;
             let node_url = resolve_node_url(rest, Some(&w));
             let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
-            let bal_json = rpc
-                .get_balance(w.metadata().account_id)
-                .map_err(|e| format!("balance RPC failed: {e}"))?;
+            let bal_json = if w.remaining_auth_keys() > 0 {
+                let (auth_pad_id, auth_tag) = w
+                    .sign_balance_auth()
+                    .map_err(|e| format!("sign private balance auth: {e}"))?;
+                rpc.get_private_balance(w.metadata().account_id, auth_pad_id, &auth_tag)
+                    .map_err(|e| format!("private balance RPC failed: {e}"))?
+            } else {
+                println!(
+                    "Note: 0 local auth keys; querying public GET /balance/{} (shielded balance REDACTED). Run `vrnm wallet register --name {}` to unlock private balance.",
+                    w.metadata().account_id,
+                    w.metadata().name,
+                );
+                rpc.get_balance(w.metadata().account_id)
+                    .map_err(|e| format!("balance RPC failed: {e}"))?
+            };
             if let (Some(eb), Some(sb)) = (
                 parse_json_u64(&bal_json, "express_balance"),
                 parse_json_u64(&bal_json, "shielded_balance"),
@@ -706,7 +915,11 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
                 w.metadata().account_id
             );
             println!("{bal_json}");
-            println!("Local WAL OTP pages remaining: {}", w.remaining_pages());
+            println!(
+                "Local WAL OTP pages remaining: {} | Single-use CW-MAC auth keys remaining: {}",
+                w.remaining_pages(),
+                w.remaining_auth_keys(),
+            );
             Ok(())
         }
         "send" => {
@@ -724,26 +937,25 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
                 w.replenish_pads_via_qkd(8)
                     .map_err(|e| format!("QKD refill failed: {e}"))?;
             }
+            let (auth_pad_id, auth_tag) = w.sign_express_auth(to_id, amount).map_err(|e| {
+                format!("sign express CW-MAC auth failed ({e}); run `vrnm wallet register --name {}`", w.metadata().name)
+            })?;
             let bundle = w
                 .prepare_express_transfer(to_id, amount)
                 .map_err(|e| format!("sign express tx: {e}"))?;
             let node_url = resolve_node_url(rest, Some(&w));
             let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
-            let frame_hex = bundle.primary_frame_hex().unwrap_or_default();
-            let tag_hex = bundle.primary_tag_hex().unwrap_or_default();
             let resp = rpc
-                .send_express(
+                .send_express_authenticated(
                     bundle.sender_id,
                     bundle.recipient_id,
                     bundle.amount,
-                    bundle.page_id,
-                    bundle.nonce,
-                    &frame_hex,
-                    &tag_hex,
+                    auth_pad_id,
+                    &auth_tag,
                 )
                 .map_err(|e| format!("send express RPC failed: {e}"))?;
             println!(
-                "Sent {amount} VRNM (Express Lane, WAL page #{} burned) -> account #{to_id}:",
+                "Sent {amount} VRNM (Express Lane, WAL page #{} + auth pad #{auth_pad_id} burned) -> account #{to_id}:",
                 bundle.page_id
             );
             println!("{resp}");
@@ -761,8 +973,11 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
 
             let node_url = resolve_node_url(rest, Some(&w));
             let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
-            // Sync shielded balance before local proof check
-            if let Ok(bal_json) = rpc.get_balance(w.metadata().account_id)
+            // Sync private balance if at least 2 auth keys are available (1 for balance sync, 1 for tx).
+            if w.remaining_auth_keys() >= 2
+                && let Ok((bal_pad, bal_tag)) = w.sign_balance_auth()
+                && let Ok(bal_json) =
+                    rpc.get_private_balance(w.metadata().account_id, bal_pad, &bal_tag)
                 && let (Some(eb), Some(sb)) = (
                     parse_json_u64(&bal_json, "express_balance"),
                     parse_json_u64(&bal_json, "shielded_balance"),
@@ -770,14 +985,28 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
             {
                 let _ = w.sync_balances(eb, sb);
             }
+            let (auth_pad_id, auth_tag) =
+                w.sign_shielded_auth(bucket, slot, amount).map_err(|e| {
+                    format!(
+                        "sign shielded CW-MAC auth failed ({e}); run `vrnm wallet register --name {}`",
+                        w.metadata().name
+                    )
+                })?;
             let _local_req = w
                 .prepare_shielded_transfer(bucket, slot, amount)
                 .map_err(|e| format!("prepare shielded tx: {e}"))?;
             let resp = rpc
-                .send_shielded(w.metadata().account_id, bucket, slot, amount)
+                .send_shielded_authenticated(
+                    w.metadata().account_id,
+                    bucket,
+                    slot,
+                    amount,
+                    auth_pad_id,
+                    &auth_tag,
+                )
                 .map_err(|e| format!("send shielded RPC failed: {e}"))?;
             println!(
-                "Sent {amount} VRNM (Shielded IT-MPC Lane, hidden amount & recipient) -> account #{to_id} (bucket {bucket}, slot {slot}):"
+                "Sent {amount} VRNM (Shielded IT-MPC Lane, auth pad #{auth_pad_id} burned) -> account #{to_id} (bucket {bucket}, slot {slot}):"
             );
             println!("{resp}");
             Ok(())
@@ -821,12 +1050,25 @@ fn cmd_wallet(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "pop-mine" => {
+            let validator_id: u64 = match get_flag(rest, "--id") {
+                Some(s) => s.parse::<u64>().map_err(|_| "invalid --id <u64>")?,
+                None => 0,
+            };
+            let pages: usize = match get_flag(rest, "--pages") {
+                Some(s) => s.parse::<usize>().map_err(|_| "invalid --pages <usize>")?,
+                None => 8,
+            };
+            let triples: usize = match get_flag(rest, "--triples") {
+                Some(s) => s.parse::<usize>().map_err(|_| "invalid --triples <usize>")?,
+                None => 8,
+            };
             let node_url = resolve_node_url(rest, None);
             let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
-            let resp = rpc
-                .mine_pop_epoch()
-                .map_err(|e| format!("PoP mine RPC failed: {e}"))?;
-            println!("Verified Proof-of-Pad (PoP) Epoch Mined @ {node_url}:");
+            let (qber, resp) = submit_remote_pop_round(&rpc, validator_id, pages, triples)?;
+            println!(
+                "Verified Remote Proof-of-Pad (PoP) Epoch Mined @ {node_url} (V{validator_id}, QBER={:.2}%):",
+                qber * 100.0
+            );
             println!("{resp}");
             Ok(())
         }

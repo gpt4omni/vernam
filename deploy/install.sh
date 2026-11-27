@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-# Vernam (VRNM) v1.2 — Zero-Dependency One-Line Installer
+# Vernam (VRNM) v2.2.0 — User-Space Zero-Dependency Installer (No sudo)
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/gpt4omni/vernam/main/deploy/install.sh | bash
+# Recommended inspect-first usage:
+#   git clone https://github.com/gpt4omni/vernam.git
+#   cd vernam
+#   less deploy/install.sh
+#   bash deploy/install.sh
+#
+# Installs strictly in user-space to ~/.local/bin/vrnm and NEVER invokes sudo.
+# For root VPS systemd provisioning, inspect and run deploy/vps-setup.sh instead.
 #
 # Optional environment overrides:
 #   VRNM_REPO_URL     (default: https://github.com/gpt4omni/vernam.git)
@@ -23,6 +29,12 @@ log()  { printf '\033[1;32m[vernam]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[vernam]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[vernam]\033[0m %s\n' "$*" >&2; exit 1; }
 
+check_non_root() {
+    if [[ "${EUID}" -eq 0 ]]; then
+        err "Refusing to run deploy/install.sh as root. This script installs strictly in user-space (~/.local/bin/vrnm) without root privileges. For VPS systemd provisioning, inspect and run deploy/vps-setup.sh."
+    fi
+}
+
 check_rust() {
     if [[ -f "${HOME}/.cargo/env" ]]; then
         # shellcheck disable=SC1091
@@ -33,14 +45,11 @@ check_rust() {
         warn "Rust / Cargo toolchain not found in PATH."
         cat >&2 <<'EOF'
 
-Install Rust (edition 2024 requires Rust >= 1.85) with rustup:
+Vernam (edition 2024) requires Rust >= 1.85.
+Install Rust via your OS package manager or the official installer at https://rustup.rs,
+then ensure cargo is on your PATH and re-run:
 
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-  source "$HOME/.cargo/env"
-
-Then re-run this installer:
-
-  curl -fsSL https://raw.githubusercontent.com/gpt4omni/vernam/main/deploy/install.sh | bash
+  bash deploy/install.sh
 EOF
         exit 1
     fi
@@ -79,7 +88,7 @@ resolve_source() {
         fi
     fi
 
-    # 3. Clone or update from GitHub.
+    # 3. Clone or update from GitHub into user-space VRNM_SRC_DIR.
     if ! command -v git >/dev/null 2>&1; then
         err "'git' is required to clone ${VRNM_REPO_URL}. Please install git and retry."
     fi
@@ -125,7 +134,7 @@ build_and_install() {
     mkdir -p "${VRNM_INSTALL_DIR}"
     cp -f "${built_bin}" "${VRNM_INSTALL_DIR}/vrnm"
     chmod 0755 "${VRNM_INSTALL_DIR}/vrnm"
-    log "Installed vrnm -> ${VRNM_INSTALL_DIR}/vrnm"
+    log "Installed user-space binary -> ${VRNM_INSTALL_DIR}/vrnm"
 }
 
 print_quickstart() {
@@ -143,8 +152,8 @@ NOTE: ${VRNM_INSTALL_DIR} is not currently in your PATH. Add it with:
     cat <<EOF
 ${path_note}
 ========================================================================
-  Vernam (VRNM) v1.2 installed successfully!
-  Zero external crates | Pure Information-Theoretic Security
+  Vernam (VRNM) v2.2.0 installed in user-space!
+  MIT License | Experimental Research Testnet | Zero External Crates
   Live Testnet Explorer : ${VRNM_TESTNET_URL}/
 ========================================================================
 
@@ -156,19 +165,19 @@ Quick-Start Commands:
      vrnm wallet faucet --name alice --node "\$VRNM_NODE"
      vrnm wallet balance --name alice --node "\$VRNM_NODE"
 
-  2. Send a blinded Shielded IT-MPC transfer (amount & recipient hidden):
+  2. Send a CW-MAC authenticated Shielded IT-MPC transfer:
      vrnm wallet create --name bob --node "\$VRNM_NODE"
      vrnm wallet send-private --from alice --to bob --amount 25 --node "\$VRNM_NODE"
 
   3. Join the decentralized P2P validator mesh (auto-discovers peers):
      vrnm node --bind 0.0.0.0:8080 --advertise <YOUR_PUBLIC_IP>:8080 --seed ${VRNM_TESTNET_SEED}
 
-  4. Run a verified Beacon-Paired Proof-of-Pad (PoP) audit or live miner:
-     vrnm pop-mine
+  4. Run an interactive Proof-of-Pad miner (POST /pop/commit -> POST /pop/submit):
      vrnm miner --cores 1 --node "\$VRNM_NODE"
 
-  5. Explore local standalone testnet, v1.0 zero-admin demo & benchmarks:
+  5. Explore local standalone testnet, Confidential Circuits VM & benchmarks:
      vrnm testnet --bind 127.0.0.1:8080
+     vrnm circuits-demo
      vrnm v1-demo
      vrnm bench
      vrnm help
@@ -176,6 +185,7 @@ EOF
 }
 
 main() {
+    check_non_root
     check_rust
     resolve_source
     build_and_install

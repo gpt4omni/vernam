@@ -7,6 +7,7 @@
 //! - 16-bit Shamir-shared confidential range proofs + blinded one-hot selectors (`ConfidentialTransferRequest`)
 //! - BB84 + Weak/Vacuum Decoy-State QKD pad replenishment (`Bb84Channel`)
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -17,7 +18,9 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::field::{PRIME_P, random_field_elem, zeroize_slice};
+use crate::field::{
+    PRIME_P, add_mod, mul_mod, random_field_elem, reduce, zeroize_slice, zeroize_u128,
+};
 use crate::otp::{
     FRAME_BYTES, MAC_TAG_BYTES, OtpError, PadPage, WalPadBook, open_frame, seal_frame,
 };
@@ -72,6 +75,45 @@ pub fn validate_wallet_name(name: &str) -> Result<&str, WalletError> {
 pub const EXPRESS_PAYLOAD_BYTES: usize = 32;
 
 const METADATA_FILENAME: &str = "wallet.meta";
+const AUTH_KEYS_FILENAME: &str = "auth_keys.bin";
+const AUTH_KEYS_MAGIC: &[u8; 8] = b"VRNMAUTH";
+const AUTH_KEYS_VERSION: u32 = 1;
+const AUTH_KEY_RECORD_BYTES: usize = 40; // pad_id (8) + r (16) + s (16)
+
+/// Domain separator for Express Lane sender Carter-Wegman authentication tags.
+pub const AUTH_DOMAIN_EXPRESS: u64 = 1;
+
+/// Domain separator for Shielded Lane sender Carter-Wegman authentication tags.
+pub const AUTH_DOMAIN_SHIELDED: u64 = 2;
+
+/// Domain separator for Private Balance query Carter-Wegman authentication tags.
+pub const AUTH_DOMAIN_BALANCE: u64 = 3;
+
+/// Domain separator for P2P transaction sender Carter-Wegman authentication tags.
+pub const AUTH_DOMAIN_P2P_TX: u64 = 4;
+
+/// Compute the canonical 127-bit Carter-Wegman wallet authentication tag over `F_(2^127 - 1)`
+/// matching `testnet_server` and `p2p_node` (`AUTH_DOMAIN_EXPRESS = 1`, `AUTH_DOMAIN_SHIELDED = 2`,
+/// `AUTH_DOMAIN_BALANCE = 3`, `AUTH_DOMAIN_P2P_TX = 4`).
+pub fn compute_wallet_auth_tag(
+    domain: u64,
+    account_id: u32,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    pad_id: u64,
+    r: u128,
+    s: u128,
+) -> [u8; 16] {
+    let r = reduce(r);
+    let mut acc = mul_mod(reduce(domain as u128), r);
+    acc = mul_mod(add_mod(acc, reduce(account_id as u128)), r);
+    acc = mul_mod(add_mod(acc, reduce(arg1 as u128)), r);
+    acc = mul_mod(add_mod(acc, reduce(arg2 as u128)), r);
+    acc = mul_mod(add_mod(acc, reduce(arg3 as u128)), r);
+    acc = mul_mod(add_mod(acc, reduce(pad_id as u128)), r);
+    add_mod(acc, reduce(s)).to_le_bytes()
+}
 
 // ============================================================================
 // Errors
@@ -100,6 +142,8 @@ pub enum WalletError {
     },
     /// At least one validator's one-time pad book has no unused pages left.
     PadExhausted { validator_id: usize },
+    /// Local one-time Carter-Wegman authentication key pool is exhausted.
+    AuthKeysExhausted,
     /// Malformed hexadecimal input.
     InvalidHex(String),
     /// Malformed binary express payload.
@@ -130,6 +174,10 @@ impl fmt::Display for WalletError {
             WalletError::PadExhausted { validator_id } => write!(
                 f,
                 "validator {validator_id} pad book exhausted; replenish pads via QKD"
+            ),
+            WalletError::AuthKeysExhausted => write!(
+                f,
+                "wallet one-time auth key pool exhausted; register fresh auth keys via /account/register"
             ),
             WalletError::InvalidHex(msg) => write!(f, "invalid hex string: {msg}"),
             WalletError::InvalidPayload(msg) => write!(f, "invalid express payload: {msg}"),
@@ -582,16 +630,147 @@ fn validate_single_line(field_name: &str, value: &str) -> Result<(), WalletError
 }
 
 // ============================================================================
+// Crash-Safe One-Time Carter-Wegman Auth Key Storage
+// ============================================================================
+
+/// Single one-time Carter-Wegman authentication key `(pad_id, r, s)` with redacted `Debug`
+/// and volatile zeroization of `(r, s)` on `Drop`.
+struct WalletAuthKey {
+    pad_id: u64,
+    r: u128,
+    s: u128,
+}
+
+impl fmt::Debug for WalletAuthKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WalletAuthKey")
+            .field("pad_id", &self.pad_id)
+            .field("r", &"[REDACTED]")
+            .field("s", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for WalletAuthKey {
+    fn drop(&mut self) {
+        zeroize_u128(&mut self.r);
+        zeroize_u128(&mut self.s);
+    }
+}
+
+fn save_auth_keys_atomic(path: &Path, keys: &VecDeque<WalletAuthKey>) -> Result<(), WalletError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let count = u32::try_from(keys.len())
+        .map_err(|_| WalletError::InvalidConfig("too many auth keys to persist".into()))?;
+    let mut buf = Vec::with_capacity(16 + keys.len() * AUTH_KEY_RECORD_BYTES);
+    buf.extend_from_slice(AUTH_KEYS_MAGIC);
+    buf.extend_from_slice(&AUTH_KEYS_VERSION.to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
+    for k in keys {
+        buf.extend_from_slice(&k.pad_id.to_le_bytes());
+        buf.extend_from_slice(&k.r.to_le_bytes());
+        buf.extend_from_slice(&k.s.to_le_bytes());
+    }
+
+    let tmp_path = temp_metadata_path(path);
+    let write_res: io::Result<()> = (|| {
+        let mut file = open_owner_only_write(&tmp_path)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    zeroize_slice(&mut buf);
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(WalletError::Io(err));
+    }
+
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        sync_parent_dir(path)?;
+    }
+
+    Ok(())
+}
+
+fn load_auth_keys(path: &Path) -> Result<VecDeque<WalletAuthKey>, WalletError> {
+    if !path.exists() {
+        return Ok(VecDeque::new());
+    }
+    let mut raw = fs::read(path)?;
+    let parsed: Result<VecDeque<WalletAuthKey>, WalletError> = (|| {
+        if raw.len() < 16 {
+            return Err(WalletError::CorruptMetadata(
+                "auth_keys.bin truncated header".into(),
+            ));
+        }
+        if &raw[0..8] != AUTH_KEYS_MAGIC {
+            return Err(WalletError::CorruptMetadata(
+                "auth_keys.bin invalid magic header".into(),
+            ));
+        }
+        let version = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+        if version != AUTH_KEYS_VERSION {
+            return Err(WalletError::CorruptMetadata(format!(
+                "unsupported auth_keys.bin version {version}"
+            )));
+        }
+        let count = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+        let expected_len = 16usize
+            .checked_add(
+                count
+                    .checked_mul(AUTH_KEY_RECORD_BYTES)
+                    .ok_or_else(|| WalletError::CorruptMetadata("auth_keys.bin count overflow".into()))?,
+            )
+            .ok_or_else(|| WalletError::CorruptMetadata("auth_keys.bin length overflow".into()))?;
+        if raw.len() != expected_len {
+            return Err(WalletError::CorruptMetadata(format!(
+                "auth_keys.bin length mismatch: expected {expected_len}, got {}",
+                raw.len()
+            )));
+        }
+
+        let mut keys = VecDeque::with_capacity(count);
+        for i in 0..count {
+            let base = 16 + i * AUTH_KEY_RECORD_BYTES;
+            let pad_id = u64::from_le_bytes(raw[base..base + 8].try_into().unwrap());
+            let r = u128::from_le_bytes(raw[base + 8..base + 24].try_into().unwrap());
+            let s = u128::from_le_bytes(raw[base + 24..base + 40].try_into().unwrap());
+            if r == 0 || r >= PRIME_P || s >= PRIME_P {
+                return Err(WalletError::CorruptMetadata(format!(
+                    "auth_keys.bin record {i} has out-of-field Carter-Wegman key"
+                )));
+            }
+            keys.push_back(WalletAuthKey { pad_id, r, s });
+        }
+        Ok(keys)
+    })();
+    zeroize_slice(&mut raw);
+    parsed
+}
+
+// ============================================================================
 // VernamWallet
 // ============================================================================
 
-/// Crash-safe Vernam (VRNM) wallet holding metadata and one `WalPadBook` per validator.
+/// Crash-safe Vernam (VRNM) wallet holding metadata, one `WalPadBook` per validator,
+/// and crash-safe one-time Carter-Wegman authentication keys (`auth_keys.bin`, `0600`).
 #[derive(Debug)]
 pub struct VernamWallet {
     dir: PathBuf,
     config: WalletConfig,
     metadata: WalletMetadata,
     pad_books: Vec<WalPadBook>,
+    auth_keys: VecDeque<WalletAuthKey>,
 }
 
 impl VernamWallet {
@@ -684,11 +863,13 @@ impl VernamWallet {
             config,
             metadata,
             pad_books,
+            auth_keys: VecDeque::new(),
         })
     }
 
     /// Reopen an existing `VernamWallet` from disk, replaying every validator's WAL so all
-    /// previously burned pages remain permanently burned and wiped.
+    /// previously burned pages remain permanently burned and wiped, and loading any persisted
+    /// one-time Carter-Wegman auth keys from `auth_keys.bin`.
     pub fn open(dir: &Path) -> Result<Self, WalletError> {
         Self::open_with_config(dir, WalletConfig::default())
     }
@@ -710,17 +891,25 @@ impl VernamWallet {
             pad_books.push(book);
         }
 
+        let auth_keys = load_auth_keys(&Self::auth_keys_path(dir))?;
+
         Ok(Self {
             dir: dir.to_path_buf(),
             config,
             metadata,
             pad_books,
+            auth_keys,
         })
     }
 
     /// Path to the wallet metadata file (`<wallet_dir>/wallet.meta`).
     pub fn metadata_path(dir: &Path) -> PathBuf {
         dir.join(METADATA_FILENAME)
+    }
+
+    /// Path to the crash-safe one-time Carter-Wegman auth key file (`<wallet_dir>/auth_keys.bin`).
+    pub fn auth_keys_path(dir: &Path) -> PathBuf {
+        dir.join(AUTH_KEYS_FILENAME)
     }
 
     /// Path to validator `validator_id`'s crash-safe pad book (`<wallet_dir>/pad_v<id>.bin`).
@@ -767,6 +956,130 @@ impl VernamWallet {
     /// Construct a [`WalletRpcClient`] configured for this wallet's `node_url` and timeout.
     pub fn rpc_client(&self) -> Result<WalletRpcClient, WalletError> {
         WalletRpcClient::with_timeout(&self.metadata.node_url, self.config.rpc_timeout)
+    }
+
+    /// Persist freshly registered one-time Carter-Wegman auth keys `(pad_id, r, s)` into
+    /// crash-safe `<wallet_dir>/auth_keys.bin` (`0600` on Unix, atomic `fsync` + `rename`).
+    pub fn store_auth_keys(&mut self, keys: &[(u64, u128, u128)]) -> Result<(), WalletError> {
+        for &(pad_id, r, s) in keys {
+            if r == 0 || r >= PRIME_P {
+                return Err(WalletError::InvalidConfig(format!(
+                    "auth key pad_id={pad_id} has invalid r (must be in (0, PRIME_P))"
+                )));
+            }
+            if s >= PRIME_P {
+                return Err(WalletError::InvalidConfig(format!(
+                    "auth key pad_id={pad_id} has invalid s (must be in [0, PRIME_P))"
+                )));
+            }
+            if self.auth_keys.iter().any(|existing| existing.pad_id == pad_id) {
+                return Err(WalletError::InvalidConfig(format!(
+                    "duplicate auth key pad_id={pad_id} already stored in wallet"
+                )));
+            }
+        }
+        // Check for duplicate pad_ids within the incoming slice.
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                if keys[i].0 == keys[j].0 {
+                    return Err(WalletError::InvalidConfig(format!(
+                        "duplicate auth key pad_id={} in input batch",
+                        keys[i].0
+                    )));
+                }
+            }
+        }
+
+        let prev_len = self.auth_keys.len();
+        for &(pad_id, r, s) in keys {
+            self.auth_keys.push_back(WalletAuthKey { pad_id, r, s });
+        }
+
+        if let Err(err) = save_auth_keys_atomic(&Self::auth_keys_path(&self.dir), &self.auth_keys) {
+            self.auth_keys.truncate(prev_len);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Number of unused one-time Carter-Wegman authentication keys remaining in this wallet.
+    pub fn remaining_auth_keys(&self) -> usize {
+        self.auth_keys.len()
+    }
+
+    /// Crash-safely pop and burn one auth key (`fsync` removal to `auth_keys.bin` BEFORE emitting
+    /// any tag), compute the canonical CW-MAC tag, and volatile-zeroize `(r, s)` immediately on drop.
+    fn sign_and_burn_auth(
+        &mut self,
+        domain: u64,
+        arg1: u64,
+        arg2: u64,
+        arg3: u64,
+    ) -> Result<(u64, String), WalletError> {
+        let key = self
+            .auth_keys
+            .pop_front()
+            .ok_or(WalletError::AuthKeysExhausted)?;
+
+        // Burn-before-emit: durably remove key from auth_keys.bin BEFORE computing the tag.
+        if let Err(err) = save_auth_keys_atomic(&Self::auth_keys_path(&self.dir), &self.auth_keys) {
+            self.auth_keys.push_front(key);
+            return Err(err);
+        }
+
+        let pad_id = key.pad_id;
+        let tag = compute_wallet_auth_tag(
+            domain,
+            self.metadata.account_id,
+            arg1,
+            arg2,
+            arg3,
+            pad_id,
+            key.r,
+            key.s,
+        );
+        // Explicitly drop key now so volatile zeroize_u128 runs on r and s immediately.
+        drop(key);
+
+        Ok((pad_id, bytes_to_hex(&tag)))
+    }
+
+    /// Pop and burn 1 one-time auth key to authenticate an Express Lane transfer
+    /// (`AUTH_DOMAIN_EXPRESS = 1`), returning `(pad_id, 32-char lowercase hex tag)`.
+    pub fn sign_express_auth(
+        &mut self,
+        recipient: u32,
+        amount: u64,
+    ) -> Result<(u64, String), WalletError> {
+        self.sign_and_burn_auth(AUTH_DOMAIN_EXPRESS, recipient as u64, amount, 0)
+    }
+
+    /// Pop and burn 1 one-time auth key to authenticate a Shielded IT-MPC transfer
+    /// (`AUTH_DOMAIN_SHIELDED = 2`), returning `(pad_id, 32-char lowercase hex tag)`.
+    pub fn sign_shielded_auth(
+        &mut self,
+        bucket: usize,
+        slot: usize,
+        amount: u64,
+    ) -> Result<(u64, String), WalletError> {
+        self.sign_and_burn_auth(AUTH_DOMAIN_SHIELDED, bucket as u64, slot as u64, amount)
+    }
+
+    /// Pop and burn 1 one-time auth key to authenticate a Private Balance query
+    /// (`AUTH_DOMAIN_BALANCE = 3`), returning `(pad_id, 32-char lowercase hex tag)`.
+    pub fn sign_balance_auth(&mut self) -> Result<(u64, String), WalletError> {
+        self.sign_and_burn_auth(AUTH_DOMAIN_BALANCE, 0, 0, 0)
+    }
+
+    /// Pop and burn 1 one-time auth key to authenticate a P2P transfer
+    /// (`AUTH_DOMAIN_P2P_TX = 4`), returning `(pad_id, 32-char lowercase hex tag)`.
+    pub fn sign_p2p_tx_auth(
+        &mut self,
+        recipient: u32,
+        amount: u64,
+        nonce: u64,
+    ) -> Result<(u64, String), WalletError> {
+        self.sign_and_burn_auth(AUTH_DOMAIN_P2P_TX, recipient as u64, amount, nonce)
     }
 
     /// Prepare a crash-safe express lane transfer bundle:
@@ -967,6 +1280,7 @@ impl VernamWallet {
              Shielded Balance : {} VRNM (cached)\n\
              Validators       : {}\n\
              Remaining Pads   : {} min [{}]\n\
+             Auth Keys        : {}\n\
              Burned Pages     : {}\n\
              Next Nonce       : {}\n",
             m.name,
@@ -980,6 +1294,7 @@ impl VernamWallet {
             m.num_validators,
             remaining,
             per_val.join(", "),
+            self.auth_keys.len(),
             m.burned_pages,
             m.next_nonce,
         )
@@ -1123,6 +1438,73 @@ impl WalletRpcClient {
             "{{\"sender\":{sender},\"recipient_bucket\":{recipient_bucket},\"recipient_slot\":{recipient_slot},\"amount\":{amount}}}"
         );
         self.request("POST", "/tx/shielded", Some(&body))
+    }
+
+    /// `POST /account/register` — provision `count` fresh one-time Carter-Wegman auth keys for `account_id`.
+    pub fn register_account_auth(
+        &self,
+        account_id: u32,
+        count: usize,
+    ) -> Result<String, WalletError> {
+        let body = format!("{{\"account_id\":{account_id},\"count\":{count}}}");
+        self.request("POST", "/account/register", Some(&body))
+    }
+
+    /// `POST /tx/express` with mandatory one-time Carter-Wegman authentication (`auth_pad_id`, `auth_tag`).
+    pub fn send_express_authenticated(
+        &self,
+        sender: u32,
+        recipient: u32,
+        amount: u64,
+        auth_pad_id: u64,
+        auth_tag_hex: &str,
+    ) -> Result<String, WalletError> {
+        let escaped_tag = escape_json_str(auth_tag_hex);
+        let body = format!(
+            "{{\"sender\":{sender},\"recipient\":{recipient},\"amount\":{amount},\"auth_pad_id\":{auth_pad_id},\"auth_tag\":\"{escaped_tag}\",\"auth_tag_hex\":\"{escaped_tag}\"}}"
+        );
+        self.request("POST", "/tx/express", Some(&body))
+    }
+
+    /// `POST /tx/shielded` with mandatory one-time Carter-Wegman authentication (`auth_pad_id`, `auth_tag`).
+    pub fn send_shielded_authenticated(
+        &self,
+        sender: u32,
+        recipient_bucket: usize,
+        recipient_slot: usize,
+        amount: u64,
+        auth_pad_id: u64,
+        auth_tag_hex: &str,
+    ) -> Result<String, WalletError> {
+        let escaped_tag = escape_json_str(auth_tag_hex);
+        let body = format!(
+            "{{\"sender\":{sender},\"recipient_bucket\":{recipient_bucket},\"recipient_slot\":{recipient_slot},\"amount\":{amount},\"auth_pad_id\":{auth_pad_id},\"auth_tag\":\"{escaped_tag}\",\"auth_tag_hex\":\"{escaped_tag}\"}}"
+        );
+        self.request("POST", "/tx/shielded", Some(&body))
+    }
+
+    /// `POST /balance/private` — authenticated private shielded balance query (`AUTH_DOMAIN_BALANCE = 3`).
+    pub fn get_private_balance(
+        &self,
+        account_id: u32,
+        auth_pad_id: u64,
+        auth_tag_hex: &str,
+    ) -> Result<String, WalletError> {
+        let escaped_tag = escape_json_str(auth_tag_hex);
+        let body = format!(
+            "{{\"account_id\":{account_id},\"auth_pad_id\":{auth_pad_id},\"auth_tag\":\"{escaped_tag}\",\"auth_tag_hex\":\"{escaped_tag}\"}}"
+        );
+        self.request("POST", "/balance/private", Some(&body))
+    }
+
+    /// `POST /pop/commit` — submit a Proof-of-Pad (PoP) miner commitment to receive a challenge.
+    pub fn pop_commit(&self, commit_json: &str) -> Result<String, WalletError> {
+        self.request("POST", "/pop/commit", Some(commit_json))
+    }
+
+    /// `POST /pop/submit` — submit a Proof-of-Pad (PoP) challenge response proof.
+    pub fn pop_submit(&self, submit_json: &str) -> Result<String, WalletError> {
+        self.request("POST", "/pop/submit", Some(submit_json))
     }
 
     /// `POST /epoch/refresh`
@@ -2327,5 +2709,238 @@ mod tests {
         assert!(parse_http_response(too_many.as_bytes()).is_err());
         // Missing CRLF after chunk payload rejected.
         assert!(decode_chunked_body(b"4\r\nabcdXX0\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn test_wallet_one_time_auth_keys_burn_on_use_and_never_replay() {
+        let tmp = TempWalletDir::new("one_time_auth");
+        let mut wallet = VernamWallet::create(tmp.path(), "auth_alice", 9, 4, 4, DEFAULT_NODE_URL)
+            .expect("create wallet");
+        assert_eq!(wallet.remaining_auth_keys(), 0);
+
+        // Signing before storing keys must fail cleanly with AuthKeysExhausted.
+        assert!(matches!(
+            wallet.sign_express_auth(12, 100),
+            Err(WalletError::AuthKeysExhausted)
+        ));
+
+        // Provision 3 distinct one-time CW-MAC auth keys.
+        let k1 = (101u64, 0x1234_5678_9abc_def1u128, 0xfedc_ba98_7654_3210u128);
+        let k2 = (102u64, 0x2234_5678_9abc_def2u128, 0x0edc_ba98_7654_3211u128);
+        let k3 = (103u64, 0x3234_5678_9abc_def3u128, 0x1edc_ba98_7654_3212u128);
+        wallet
+            .store_auth_keys(&[k1, k2, k3])
+            .expect("store 3 auth keys");
+        assert_eq!(wallet.remaining_auth_keys(), 3);
+
+        // Duplicate pad_id or out-of-field r/s must be rejected.
+        assert!(wallet.store_auth_keys(&[k1]).is_err());
+        assert!(wallet.store_auth_keys(&[(200, 0, 1)]).is_err());
+        assert!(wallet.store_auth_keys(&[(201, PRIME_P, 1)]).is_err());
+        assert!(wallet.store_auth_keys(&[(202, 1, PRIME_P)]).is_err());
+
+        // Verify auth_keys.bin has 0600 permissions on Unix.
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(VernamWallet::auth_keys_path(tmp.path()))
+                .expect("stat auth_keys.bin")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "auth_keys.bin must be owner-only 0600");
+        }
+
+        // 1. Express auth burns k1 (pad_id=101) and matches canonical compute_wallet_auth_tag.
+        let (exp_pad, exp_tag) = wallet
+            .sign_express_auth(42, 750)
+            .expect("sign_express_auth");
+        assert_eq!(exp_pad, 101);
+        assert_eq!(exp_tag.len(), 32);
+        let expected_exp = bytes_to_hex(&compute_wallet_auth_tag(
+            AUTH_DOMAIN_EXPRESS,
+            9,
+            42,
+            750,
+            0,
+            101,
+            k1.1,
+            k1.2,
+        ));
+        assert_eq!(exp_tag, expected_exp);
+        assert_eq!(wallet.remaining_auth_keys(), 2);
+
+        // Simulate crash + restart: reopen wallet from disk and verify k1 is permanently gone!
+        drop(wallet);
+        let mut reopened = VernamWallet::open(tmp.path()).expect("reopen wallet");
+        assert_eq!(reopened.remaining_auth_keys(), 2);
+
+        // 2. Shielded auth burns k2 (pad_id=102) — never replays pad_id=101.
+        let (sh_pad, sh_tag) = reopened
+            .sign_shielded_auth(1, 5, 300)
+            .expect("sign_shielded_auth");
+        assert_eq!(sh_pad, 102);
+        let expected_sh = bytes_to_hex(&compute_wallet_auth_tag(
+            AUTH_DOMAIN_SHIELDED,
+            9,
+            1,
+            5,
+            300,
+            102,
+            k2.1,
+            k2.2,
+        ));
+        assert_eq!(sh_tag, expected_sh);
+        assert_eq!(reopened.remaining_auth_keys(), 1);
+
+        // 3. Balance auth burns k3 (pad_id=103).
+        let (bal_pad, bal_tag) = reopened.sign_balance_auth().expect("sign_balance_auth");
+        assert_eq!(bal_pad, 103);
+        let expected_bal = bytes_to_hex(&compute_wallet_auth_tag(
+            AUTH_DOMAIN_BALANCE,
+            9,
+            0,
+            0,
+            0,
+            103,
+            k3.1,
+            k3.2,
+        ));
+        assert_eq!(bal_tag, expected_bal);
+        assert_eq!(reopened.remaining_auth_keys(), 0);
+
+        // 4. Exhausted pool must fail closed both before and after reopen (zero replay!).
+        assert!(matches!(
+            reopened.sign_balance_auth(),
+            Err(WalletError::AuthKeysExhausted)
+        ));
+        drop(reopened);
+        let mut reopened2 = VernamWallet::open(tmp.path()).expect("reopen exhausted wallet");
+        assert_eq!(reopened2.remaining_auth_keys(), 0);
+        assert!(matches!(
+            reopened2.sign_express_auth(42, 1),
+            Err(WalletError::AuthKeysExhausted)
+        ));
+
+        // 5. Mock HTTP roundtrip for all 6 new authenticated & remote PoP WalletRpcClient methods.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock auth RPC listener");
+        let addr = listener.local_addr().expect("local addr");
+        let exp_tag_srv = exp_tag.clone();
+        let sh_tag_srv = sh_tag.clone();
+        let bal_tag_srv = bal_tag.clone();
+
+        let server = thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().expect("accept auth RPC client");
+                let mut req_buf = Vec::new();
+                let mut tmp_buf = [0u8; 2048];
+                loop {
+                    let n = stream.read(&mut tmp_buf).expect("read request");
+                    if n == 0 {
+                        break;
+                    }
+                    req_buf.extend_from_slice(&tmp_buf[..n]);
+                    if let Some(hdr_end) = find_subslice(&req_buf, b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&req_buf[..hdr_end]).unwrap();
+                        let content_len: usize = headers
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if req_buf.len() >= hdr_end + 4 + content_len {
+                            break;
+                        }
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&req_buf);
+                let first_line = req_str.lines().next().unwrap_or("");
+                let body_part = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                let (status_line, resp_body) = match first_line {
+                    l if l.starts_with("POST /account/register ") => {
+                        assert!(body_part.contains("\"account_id\":9"));
+                        assert!(body_part.contains("\"count\":8"));
+                        ("HTTP/1.1 200 OK", "{\"registered\":8}".to_string())
+                    }
+                    l if l.starts_with("POST /tx/express ") => {
+                        assert!(body_part.contains("\"sender\":9"));
+                        assert!(body_part.contains("\"recipient\":42"));
+                        assert!(body_part.contains("\"amount\":750"));
+                        assert!(body_part.contains("\"auth_pad_id\":101"));
+                        assert!(body_part.contains(&format!("\"auth_tag\":\"{exp_tag_srv}\"")));
+                        ("HTTP/1.1 200 OK", "{\"express_authed\":true}".to_string())
+                    }
+                    l if l.starts_with("POST /tx/shielded ") => {
+                        assert!(body_part.contains("\"sender\":9"));
+                        assert!(body_part.contains("\"recipient_bucket\":1"));
+                        assert!(body_part.contains("\"recipient_slot\":5"));
+                        assert!(body_part.contains("\"amount\":300"));
+                        assert!(body_part.contains("\"auth_pad_id\":102"));
+                        assert!(body_part.contains(&format!("\"auth_tag\":\"{sh_tag_srv}\"")));
+                        ("HTTP/1.1 200 OK", "{\"shielded_authed\":true}".to_string())
+                    }
+                    l if l.starts_with("POST /balance/private ") => {
+                        assert!(body_part.contains("\"account_id\":9"));
+                        assert!(body_part.contains("\"auth_pad_id\":103"));
+                        assert!(body_part.contains(&format!("\"auth_tag\":\"{bal_tag_srv}\"")));
+                        ("HTTP/1.1 200 OK", "{\"shielded_balance\":5000}".to_string())
+                    }
+                    l if l.starts_with("POST /pop/commit ") => {
+                        assert!(body_part.contains("\"validator_id\":0"));
+                        ("HTTP/1.1 200 OK", "{\"challenge_id\":1}".to_string())
+                    }
+                    l if l.starts_with("POST /pop/submit ") => {
+                        assert!(body_part.contains("\"challenge_id\":1"));
+                        ("HTTP/1.1 200 OK", "{\"accepted\":true}".to_string())
+                    }
+                    other => (
+                        "HTTP/1.1 404 Not Found",
+                        format!("{{\"error\":\"unexpected: {other}\"}}"),
+                    ),
+                };
+
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write resp");
+                stream.flush().expect("flush resp");
+            }
+        });
+
+        let rpc = WalletRpcClient::new(&format!("http://{addr}")).expect("create rpc client");
+        assert!(rpc.register_account_auth(9, 8).unwrap().contains("\"registered\":8"));
+        assert!(
+            rpc.send_express_authenticated(9, 42, 750, exp_pad, &exp_tag)
+                .unwrap()
+                .contains("\"express_authed\":true")
+        );
+        assert!(
+            rpc.send_shielded_authenticated(9, 1, 5, 300, sh_pad, &sh_tag)
+                .unwrap()
+                .contains("\"shielded_authed\":true")
+        );
+        assert!(
+            rpc.get_private_balance(9, bal_pad, &bal_tag)
+                .unwrap()
+                .contains("\"shielded_balance\":5000")
+        );
+        assert!(
+            rpc.pop_commit(r#"{"validator_id":0,"epoch":1}"#)
+                .unwrap()
+                .contains("\"challenge_id\":1")
+        );
+        assert!(
+            rpc.pop_submit(r#"{"challenge_id":1,"proof":"ok"}"#)
+                .unwrap()
+                .contains("\"accepted\":true")
+        );
+
+        server.join().expect("mock auth server finished");
     }
 }

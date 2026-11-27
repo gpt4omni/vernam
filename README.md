@@ -2,181 +2,206 @@
   <img src="assets/logo.svg" alt="Vernam (VRNM) Logo" width="140" />
 </p>
 
-# Vernam (`VRNM`) v2.1
+# Vernam (`VRNM`) v2.2.0
 
-**Vernam (`VRNM`)** is a zero-admin, 100% decentralized, **information-theoretically secure** cryptocurrency core, split-share networked IT-MPC engine, crash-safe CLI wallet, **Beacon-Paired Proof-of-Pad (`PoP`)** entropy mining engine, self-contained dark-mode explorer, and multi-VPS P2P testnet written in **zero-dependency Rust** (`std` only — `0` external crates in `Cargo.toml`, plus a Python research lab in `python-lab/`).
+**Vernam (`VRNM`)** is an open-source, zero-dependency Rust (`std` only — `0` external crates in `Cargo.toml`) research ledger, split-share networked IT-MPC engine, Confidential IT-MPC Circuits VM, crash-safe WAL CLI wallet, interactive **Proof-of-Pad (`PoP`)** entropy mining engine, and self-contained dark-mode web explorer built over the Mersenne prime field $\mathbb{F}_{2^{127}-1}$.
 
-Security rests exclusively on **Shannon information theory** and **quantum mechanics** over the Mersenne prime field $\mathbb{F}_{2^{127}-1}$ — **zero computational assumptions** (no SHA-256, RSA, ECDSA, Ed25519, AES, VDFs, BLS, or zk-SNARKs anywhere in the core stack). When paired with physical QRNG/QKD hardware, `VRNM` is mathematically immune to **quantum computers (Shor's / Grover's)**, **"Harvest Now, Decrypt Later"**, and even **$P = NP$**.
+Security in the core protocol rests on **Shannon information theory** (one-time pads, Carter–Wegman universal hashing, and $(t, N)$ Shamir secret sharing with Beaver multiplication triples and Proactive Secret Sharing) rather than computational hardness assumptions (zero SHA-256, RSA, ECDSA, Ed25519, AES, BLS, or zk-SNARKs in the core Rust stack).
 
+> **MIT Licensed Open-Source Research Testnet:** [LICENSE](LICENSE)  
 > **Live Public Testnet Explorer & Faucet:** `http://88.216.62.115:8080/`  
-> **Full Technical Whitepaper & Architecture Spec:** [VERNAM_V1_ARCHITECTURE.md](VERNAM_V1_ARCHITECTURE.md)
+> **Technical Architecture Spec:** [VERNAM_V1_ARCHITECTURE.md](VERNAM_V1_ARCHITECTURE.md)
 
 ---
 
-## Feature Highlights (`v1.0` → `v1.2.0`)
+## Research Testnet & Honest Threat Model
 
-* **Zero External Crates & Zero Computational Cryptography:** Compiles 100% offline with Rust `std` only (`Cargo.toml` has zero dependencies) and zero external CDN assets in the embedded web explorer.
-* **Dual-Lane Information-Theoretic Settlement:**
-  * **Express Lane (`VRNM-Fast`):** 2-phase batched BFT (`PrePrepare → Prepare → Commit`) authenticated by single-use OTP + 4-way pipelined Carter–Wegman MACs over $\mathbb{F}_{2^{127}-1}$ ($\Pr[\text{forgery}] \le d / (2^{127}-1)$).
-  * **Shielded Lane (`VRNM-Private`):** Sharded $(t, N)$ Shamir IT-MPC with Beaver Square Pairs, Shared-Factor Beaver Stars, zero-leak $[\rho]\cdot[Z]$ blinded Schwartz–Zippel RLC ($< 2^{-121}$ soundness), Proactive Secret Sharing (PSS), and fixed-size `CoverFrame`s — **zero zk-SNARKs**.
-* **Zero-Admin Decentralization (`src/entropy_beacon.rs`, `src/distributed_mpc.rs`, `src/dynamic_quorum.rs`):**
-  * Unbiasable, unabortable threshold-Shamir **Distributed Entropy Beacon** ($\Gamma_e$) over pairwise OTP+MAC links (defeats last-revealer aborts via Lagrange fallback reconstruction).
-  * True **4-daemon split-share real-TCP IT-MPC** where each validator server holds **only 1 Shamir share**.
-  * **Zero-reconstruction dynamic committee resharing** scaling $(t, N) \to (t', N')$ (`4 → 7 → 10`) without ever reconstructing user balances.
-* **ASI-Hardened Beacon-Paired Bilateral Proof-of-Pad (`v1.1`–`v1.2`):**
-  * Deterministic **Sattolo derangement pairing** derived from $\Gamma_e$ binds each miner to an unpredictable counterparty validator, requiring **co-signed bilateral peer CW-MAC receipts**, interactive commit-then-challenge Monobit + Wald–Wolfowitz Runs + Beaver triple + BB84 QKD audits, and a sliding-window **Cross-Epoch Anti-Replay Registry**.
-* **v1.2 Self-Contained Explorer & Onboarding Kit:** Live dark-mode dashboard surfacing fail-closed badges for Threshold Beacon $\Gamma_e$, `BEACON-PAIRED` Sattolo pairing, `CO-SIGNED` bilateral receipts, `anti_replay_tracked_pads`, an **ASI Security Posture** bar, 4-share Shamir inspector, and 1-click Copy-Paste CLI onboarding.
+> **IMPORTANT — Read Before Running or Evaluating:**
+> 1. **Experimental Research Software (MIT License):** Vernam (`VRNM`) is an experimental, unaudited open-source research testnet released under the [MIT License](LICENSE). **Do NOT use it to store real financial value. `VRNM` is NOT for sale.**
+> 2. **Real Networked TPS vs. Single-Machine Kernel Benchmarks:**
+>    * **Real Networked 4-Daemon Split-Share TCP MPC:** **`~9,571 TPS`** on local multi-process loopback TCP (`~91 µs` p50) and **`~1,191 TPS`** on a 1-vCore ARM64 VPS — where 4 independent TCP validator servers hold **1 Shamir share each** over pairwise OTP+MAC sockets.
+>    * **Single-Machine In-Process Kernel Benchmarks:** Express Lane `77M–86M TPS` and Shielded Lane `690k–1.46M TPS` measure **in-memory single-host compute throughput** (no WAN RTT, no TCP serialization, no disk fsync per tx). They are reported separately below and must not be conflated with wide-area networked consensus TPS.
+> 3. **Symmetric Single-Use CW-MAC Authentication Model (Not Open Public-Key Signatures):**
+>    * Because Vernam intentionally omits ECDSA/Ed25519, account authentication uses **pre-registered single-use pairwise Carter–Wegman MAC keys** $(pad\_id, r, s) \in \mathbb{F}_{2^{127}-1}^2$ — NOT open public-key signatures.
+>    * In `v2.2.0`, every Express transfer (`AUTH_DOMAIN_EXPRESS = 1`), Shielded transfer (`AUTH_DOMAIN_SHIELDED = 2`), Private Balance query (`AUTH_DOMAIN_BALANCE = 3`), and P2P transaction/announcement requires a valid single-use CW-MAC tag, and each key is **burned immediately after one use**. Users must provision/register fresh keys (`POST /account/register` or `vrnm wallet`) before exhausting their pad book.
+> 4. **Simulated Software BB84 vs. Physical Quantum/Hardware Entropy:**
+>    * On the public software testnet, BB84 photon basis sifting and QBER telemetry (`src/qkd.rs`) are **simulated in software** unless connected to real physical entropy/quantum devices (`/dev/hwrng`, USB QRNG via `VRNM_QRNG_DEVICE`, an ETSI GS QKD 014 KME, or Tier-2 multi-path relays in `src/key_transport.rs`). Information-theoretic security against a computationally unbounded adversary requires real physical entropy and out-of-band / QKD key distribution; software-only OS CSPRNG mode inherits the security assumptions of the host OS CSPRNG.
+> 5. **Transport Security (TLS Required in Production):**
+>    * The built-in zero-dependency HTTP server binds raw HTTP on `:8080` by default (suitable for local development and public testnet demos). Any production or sensitive deployment **must** terminate TLS in front of `:8080` using a reverse proxy such as [`deploy/Caddyfile`](deploy/Caddyfile) or Nginx, especially because `POST /account/register` transmits symmetric CW-MAC key material.
 
 ---
 
-## 30-Second Quick Start
+## Measured Benchmarks (Networked First, In-Process Kernel Second)
 
-### 1. Install `vrnm` (One-Line Zero-Dependency Build)
+Measured with `cargo run --release -- bench` (`opt-level = 3`, `lto = true`, `codegen-units = 1`, zero external crates):
 
-Requires Rust `>= 1.85` (edition 2024). Installs `vrnm` to `~/.local/bin/vrnm`:
+### 1. Real Networked Multi-Daemon TCP Throughput (Primary Metric)
+
+| Deployment / Path | Measured Throughput | Latency / Notes |
+| :--- | :--- | :--- |
+| **4-Daemon Split-Share Real-TCP Shielded MPC (Local Workstation)** | **`~9,571 TPS`** | `~91 µs` p50 across 4 independent TCP validator daemons (1 Shamir share per process, pairwise OTP+MAC sockets, `0.04 ms` distributed PSS refresh) |
+| **4-Daemon Split-Share Real-TCP Shielded MPC (1-vCore ARM64 VPS)** | **`~1,191 TPS`** | 4 independent TCP validator daemons on 1 ARM64 vCore (`88.216.62.115`) |
+| **Live Cross-Atlantic HTTP/1.1 Shielded Finality** | Network-RTT bound | `~340 ms` WAN RTT (`+1.3 ms` server-side IT-MPC execution) |
+
+### 2. Single-Machine In-Process Kernel Benchmarks (No Network / No Disk I/O)
+
+| Kernel Subsystem | Local Workstation (i9-11900, 16T, AVX-512) | 1-vCore ARM64 VPS (`88.216.62.115`) | Notes |
+| :--- | :--- | :--- | :--- |
+| **Express Lane (`VRNM-Fast`) 4-Val In-Process BFT** | **77.6M – 85.7M TPS** (`0.117 ms/block`) | **5.29M TPS** | 4 persistent threads, 2-phase BFT + 24 OTP/CW votes/block + 4-way pipelined CW block seals |
+| **Shielded Lane (`VRNM-Private`) In-Process IT-MPC** | **690k – 1.46M TPS** (up to 1.66M peak) | **166k TPS** | Beaver Square Pairs + Shared-Factor Beaver Stars + blinded $[\rho]\cdot[Z]$ Schwartz–Zippel RLC (`< 2⁻¹²¹` soundness) |
+| **SIMD OTP XOR** | **51.0 – 61.29 GB/s** (`AVX-512F`) | **22.10 GB/s** (`ARM64 NEON`) | Runtime-dispatched SIMD / portable word XOR |
+| **4-Way Fused Carter–Wegman MAC** ($\mathbb{F}_{2^{127}-1}$) | **13.6M – 15.9M ops/s** (`6.09 GB/s`) | Portable 128-bit | Runtime `BMI2`/`ADX` dispatch |
+| **Toeplitz QKD Privacy Amplification** | **177 – 260 Mbps** (`VPOPCNTDQ`) | Portable GF(2) | 2-universal GF(2) Toeplitz hashing |
+
+---
+
+## Quick Start (Inspect-First Source Build — Zero External Crates)
+
+Requires **Rust `>= 1.85`** (edition 2024). Because `Cargo.toml` has **zero external crates**, Vernam builds 100% offline directly from the git checkout — no `curl | bash` required:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gpt4omni/vernam/main/deploy/install.sh | bash
+git clone https://github.com/gpt4omni/vernam.git
+cd vernam
+cargo build --release --offline
 ```
 
-### 2. Connect to the Live Testnet (`http://88.216.62.115:8080/`)
+The compiled binary is at `./target/release/vernam-rs`. (If you prefer installing it into `~/.local/bin/vrnm`, you can inspect and run the optional user-space helper `bash deploy/install.sh`, which never uses `sudo`.)
 
-Open `http://88.216.62.115:8080/` in your browser for the interactive Web Explorer & Faucet, or use the CLI wallet directly:
+### Run Local Demos & Benchmarks
+
+```bash
+# Run the full release test suite
+cargo test --release
+
+# Run v2.1 Confidential IT-MPC Circuits VM, Dark-Pool AMM, Vickrey Auction & Ballot Box demo
+./target/release/vernam-rs circuits-demo
+
+# Run v2.0 Multi-Source Entropy, Global Oblivious Shuffle, Herzberg Recovery & Geo-Triangulation demo
+./target/release/vernam-rs v2-demo
+
+# Run v1.0 Zero-Admin Beacon, 4-Daemon Real-TCP MPC & 4 -> 7 Resharing demo
+./target/release/vernam-rs v1-demo
+
+# Run real-TCP + in-process kernel benchmarks
+./target/release/vernam-rs bench
+```
+
+### Connect the CLI Wallet to the Live Testnet
 
 ```bash
 export VRNM_NODE="http://88.216.62.115:8080"
 
-# Auto-discover every active node on the P2P mesh from a single seed
+# Auto-discover active P2P peers from a single seed
 vrnm wallet peers
 
-# Create crash-safe WAL-persisted wallets (0600 permissions)
+# Create crash-safe WAL-persisted wallets (mode 0600) & register single-use CW-MAC auth keys
 vrnm wallet create --name alice
 vrnm wallet create --name bob
 
 # Claim testnet VRNM (Express + Shielded Shamir shares)
 vrnm wallet faucet --name alice
 
-# Send an Express 2-phase BFT transfer and a blinded Shielded IT-MPC transfer
+# Send CW-MAC authenticated Express BFT and blinded Shielded IT-MPC transfers
 vrnm wallet send --from alice --to bob --amount 25
 vrnm wallet send-private --from alice --to bob --amount 15
 
-# Inspect Express balance, owner Shielded balance, and raw 127-bit Shamir shares
+# Query public Express balance + CW-MAC authenticated owner Shielded balance (POST /balance/private)
 vrnm wallet balance --name bob
-
-# Trigger a Beacon-Paired Bilateral Proof-of-Pad (PoP) audit & epoch mine
-vrnm wallet pop-mine
 ```
 
-### 3. Join the Decentralized P2P Mesh or Run a PoP Miner
-
-Users and new validators only need **one** seed IP — nodes announce themselves and gossip `/p2p/peers` transitively across the mesh:
+### Join the Decentralized P2P Mesh or Run an Interactive PoP Miner
 
 ```bash
-# Join the live testnet as an independent P2P validator node
+# Join the testnet as an independent P2P validator node
 vrnm node --bind 0.0.0.0:8080 --advertise <YOUR_PUBLIC_IP>:8080 --seed 88.216.62.115:8080
 
-# Or run a 1-core Proof-of-Pad (PoP) entropy & Beaver-triple miner
+# Run a 1-core interactive Proof-of-Pad miner (POST /pop/commit -> POST /pop/submit)
 vrnm miner --cores 1 --node http://88.216.62.115:8080
 ```
 
 ---
 
-## Measured Release Benchmarks
+## Release Highlights (`v2.1` & `v2.2.0`)
 
-Measured with `cargo run --release -- bench` (`opt-level = 3`, `lto = true`, `codegen-units = 1`, zero external crates):
+### `v2.2.0` — Security Hardening, Authenticated API & Privacy Fixes
 
-### Local Workstation (Intel Core i9-11900, 16 Threads, AVX-512)
+* **Mandatory Single-Use CW-MAC Authentication (`POST /account/register`):** Every Express transfer (`AUTH_DOMAIN_EXPRESS = 1`), Shielded transfer (`AUTH_DOMAIN_SHIELDED = 2`), Private Balance query (`AUTH_DOMAIN_BALANCE = 3`), and P2P transaction is authenticated with a one-time Carter–Wegman tag over $\mathbb{F}_{2^{127}-1}$, burned immediately after verification.
+* **Zero Unauthenticated Privacy Leaks (`GET /balance/<id>` vs. `POST /balance/private`):** Unauthenticated `GET /balance/<id>` now returns public Express balance only and explicitly redacts both `shielded_balance` and raw validator Shamir shares. Account owners prove ownership via a burned one-time CW-MAC key at `POST /balance/private`.
+* **Interactive Proof-of-Pad Challenge-Response (`POST /pop/commit` → `POST /pop/submit`):** Server-side self-mining (`POST /pop/mine`) is disabled in `v2.2.0`. External miners commit fresh entropy pads, receive a beacon-derived challenge, and submit proofs interactively.
+* **Authenticated Zero-CDN Web Explorer (`src/explorer_ui.rs`):** Implements pure-JS `BigInt` $\mathbb{F}_{2^{127}-1}$ CW-MAC signing in browser session memory (`sessionAuthKeys`), explicit `REDACTED` balance states, an "Unlock Private Balance" flow, and inspect-first CLI snippets with zero external URLs.
+* **MIT License & Safe Installers:** Added standard [MIT `LICENSE`](LICENSE), enforced strictly user-space `deploy/install.sh` (zero `sudo`), and removed unverified `curl | sh` / `curl | bash` pipes from both `README.md` and `deploy/vps-setup.sh`.
 
-| Subsystem | Measured Speed | Notes |
-| :--- | :--- | :--- |
-| **Turbo Express Lane (`VRNM-Fast`) 4-Val BFT** | **77.6M – 85.7M TPS** (`0.117 ms/block`) | 4 persistent validator threads, 2-phase BFT + 24 real OTP/CW votes/block + 4-way pipelined CW block seals + zero-copy `Arc<[TurboTx]>` |
-| **Turbo Shielded Lane (`VRNM-Private`) IT-MPC** | **1.46M – 1.66M TPS** | Beaver Square Pairs (`x² - x`) + Shared-Factor Beaver Stars + Schwartz–Zippel RLC (`< 2⁻¹²¹` soundness, `178 → 66` openings/tx), 64 buckets, zero zk-SNARKs |
-| **4-Daemon Split-Share Real-TCP Shielded MPC** | **~9,571 TPS** (`~91 µs` p50) | 4 independent TCP validator servers (1 Shamir share each), pairwise OTP+MAC sockets, `0.04 ms` distributed PSS refresh |
-| **AVX-512F OTP XOR** | **51.0 – 61.29 GB/s** | Runtime-dispatched `AVX-512F` / `AVX2` / portable ARM64 NEON |
-| **4-Way Fused Carter–Wegman MAC** ($\mathbb{F}_{2^{127}-1}$) | **13.6M – 15.9M ops/s** (`6.09 GB/s`) | Fused 4-way dot-product over $\mathbb{F}_{2^{127}-1}$ with runtime `BMI2`/`ADX` dispatch |
-| **AVX-512 `VPOPCNTDQ` Toeplitz QKD PA** | **177 – 260 Mbps** | Bit-shift-grouped 8-way SIMD 2-universal GF(2) privacy amplification |
+### `v2.1` — Confidential IT-MPC Circuits VM & Adaptive Protocol Tuner
 
-### Live Production ARM64 VPS (`88.216.62.115`, 1 vCore)
-
-| Subsystem | Measured Speed | Notes |
-| :--- | :--- | :--- |
-| **Turbo Express Lane (`VRNM-Fast`) 4-Val BFT** | **5.29M TPS** | Single ARM64 vCore, 4-validator 2-phase BFT |
-| **Turbo Shielded Lane (`VRNM-Private`) IT-MPC** | **166k TPS** | Single ARM64 vCore, full IT-MPC range + recipient blinding |
-| **Portable ARM64 NEON OTP XOR** | **22.10 GB/s** | 4× unrolled 64-bit word XOR auto-vectorized to NEON `eor` |
-| **Live Cross-Atlantic Shielded Finality** | **~340 ms RTT** (`+1.3 ms` server MPC) | End-to-end live HTTP/1.1 testnet settlement |
+* **Straight-Line Confidential Arithmetic Circuit VM (`src/mpc_vm.rs`):** Non-Turing-complete, reentrancy-free acyclic DAG VM executing over Shamir secret shares in $\mathbb{F}_{2^{127}-1}$ with branchless oblivious `Mux`, bit-decomposition `AssertRangeBits`, batched zero-leak $[\rho]\cdot[Z]$ Schwartz–Zippel assertions with 100% atomic rollback, and Proactive Secret Sharing (PSS) across all persistent contract storage slots.
+* **Authenticated Bytecode & Cost Estimator (`src/mpc_bytecode.rs`):** Vernam Circuit Assembly (`VCA`) compiler, binary serializer authenticated with one-time Carter–Wegman MACs (`BytecodeMacKey`), and deterministic Beaver-triple + storage-write fee estimation.
+* **Confidential DeFi & Governance Suite (`src/mpc_defi.rs`):**
+  * `ConfidentialDarkPoolAmm`: Secret-shared reserves, swap direction, amounts, and slippage checks verified obliviously via Beaver triples.
+  * `ConfidentialSealedBidAuction`: First-Price and Vickrey Second-Price sealed-bid auctions using branchless bit-level IT-MPC comparisons without revealing losing bids.
+  * `ConfidentialBallotBox`: One-hot blinded secret-ballot governance with linear (`0`-triple) tally accumulation.
+* **Adaptive Protocol Controller (`src/adaptive_tuner.rs`):** Telemetry-driven epoch parameter controller adjusting Beaver pool targets and fee/audit margins safely within hard protocol invariants.
 
 ---
 
-## ASI Security Hardening Matrix (`v1.1.0` – `v1.2.0`)
+## Security Hardening Matrix (`v1.1` → `v2.2.0`)
 
-| Security Surface | Hardening Mechanism | Enforced Module(s) |
+| Security Surface | Mechanism | Primary Module(s) |
 | :--- | :--- | :--- |
-| **Field Side Channels & RAM Hygiene** | 100% division-free, branchless `reduce`, `add_mod`, `sub_mod`, `mul_mod`, `ct_select_u128`, constant-time `ct_eq_16`, and volatile RAM zeroization (`write_volatile` + `SeqCst` fences) | `src/field.rs`, `src/otp.rs`, `src/turbo_crypto.rs` |
-| **Two-Time-Pad Crash Safety** | Crash-consistent `WalPadBook` (`0600`) appends `[0xB1 \| page_id \| !page_id]`, `fsync`s WAL, zeros disk slot, and `fsync`s data file strictly before transmitting any pad | `src/otp.rs`, `src/wallet.rs` |
-| **Beacon Bias & Last-Revealer Abort** | Symmetric bivariate Shamir commit-reveal over pairwise OTP+MAC links; honest quorum reconstructs aborted dealer shares via Lagrange fallback | `src/entropy_beacon.rs` |
-| **Self-Mining / Collusion in PoP** | Unpredictable **Sattolo derangement pairing** (`BeaconPairingSchedule`) derived from $\Gamma_e$ + mandatory **co-signed bilateral peer CW-MAC receipts** | `src/pop_mining.rs`, `src/testnet_server.rs` |
-| **Pad Recycling & Theft Across Epochs** | Persistent 64-epoch sliding-window **Anti-Replay Registry** (`PopReplayRegistry`) tracks pad fingerprints across epochs and validators | `src/pop_mining.rs`, `src/testnet_server.rs` |
-| **Zero-Leak MPC Failure Blinding** | Blinded $[\rho]\cdot[Z]$ Schwartz–Zippel RLC verification (`< 2⁻¹²¹` soundness) ensures failed proofs open uniform random noise — leaking `0` bits | `src/privacy_mpc.rs`, `src/turbo_shielded.rs`, `src/distributed_mpc.rs` |
-| **BFT & Quorum Invariants** | Strict ViewChange lock safety, domain-separated single-use CW block seals, non-trivial $(t, N) \to (t', N')$ resharing verification, and flat-bond slashing | `src/bft.rs`, `src/dynamic_quorum.rs`, `src/tokenomics.rs` |
-| **HTTP/P2P DoS, SSRF & Eclipse Defense** | Bounded concurrency (`64`), memory-bounded per-IP rate limiter (`4096` IPs / `120 req/s`), 5 s Slowloris deadline, request-smuggling & JSON depth (`32`) limits, SSRF IP blocking, and `/24` IPv4 (`/48` IPv6) subnet diversity cap (`MAX_PEERS_PER_SUBNET = 4`) | `src/testnet_server.rs`, `src/p2p_node.rs` |
-| **Fail-Closed Explorer Telemetry** | Explorer UI renders zero external CDN URLs and verifies `beacon_paired_verified === true`, `bilateral_receipts_verified === true`, `beaver_verified === true`, `beacon_gamma`, and `anti_replay_tracked_pads` fail-closed | `src/explorer_ui.rs` |
+| **Account Ownership & Replay Protection** | Single-use pairwise CW-MAC keys over $\mathbb{F}_{2^{127}-1}$ (`AUTH_DOMAIN_EXPRESS=1`, `SHIELDED=2`, `BALANCE=3`) burned on first verification | `src/testnet_server.rs`, `src/wallet.rs`, `src/explorer_ui.rs` |
+| **Shielded Balance Privacy on RPC** | `GET /balance/<id>` redacts shielded balance & raw Shamir shares; owner queries authenticate via `POST /balance/private` | `src/testnet_server.rs`, `src/explorer_ui.rs` |
+| **Field Side Channels & RAM Hygiene** | Division-free, branchless `reduce`, `add_mod`, `sub_mod`, `mul_mod`, `ct_select_u128`, `ct_eq_16`, and volatile RAM zeroization (`write_volatile` + `SeqCst` fences) | `src/field.rs`, `src/otp.rs`, `src/turbo_crypto.rs` |
+| **Two-Time-Pad Crash Safety** | `WalPadBook` (`0600`) writes `[0xB1 \| page_id \| !page_id]`, `fsync`s WAL, zeros disk slot, and `fsync`s data file strictly before pad use | `src/otp.rs`, `src/wallet.rs`, `src/storage.rs` |
+| **Beacon Bias & Last-Revealer Abort** | Symmetric bivariate Shamir commit-reveal over pairwise OTP+MAC links with Lagrange fallback reconstruction | `src/entropy_beacon.rs` |
+| **PoP Anti-Self-Mining & Anti-Replay** | Interactive `/pop/commit` → `/pop/submit`, Sattolo derangement pairing from $\Gamma_e$, bilateral peer CW-MAC receipts, and 64-epoch `PopReplayRegistry` | `src/pop_mining.rs`, `src/testnet_server.rs` |
+| **Zero-Leak MPC Failure Blinding** | Blinded $[\rho]\cdot[Z]$ Schwartz–Zippel RLC (`< 2⁻¹²¹` soundness) reveals uniform random non-zero noise on proof failure (`0` bits leaked) | `src/privacy_mpc.rs`, `src/turbo_shielded.rs`, `src/mpc_vm.rs`, `src/mpc_defi.rs` |
+| **HTTP/P2P DoS, SSRF & Eclipse Defense** | Bounded concurrency (`64`), bounded per-IP rate limiter (`4096` IPs / `120 req/s`), 5 s Slowloris deadline, smuggling & JSON depth (`32`) guards, SSRF IP blocking, and `/24` IPv4 (`/48` IPv6) subnet cap (`4`) | `src/testnet_server.rs`, `src/p2p_node.rs` |
 
 ---
 
-## System Architecture
+## Architecture & Module Map (30 Modules, Zero External Crates)
 
 ```text
   ┌──────────────────────────┐        ┌────────────────────────────────────────┐
   │   CLI Wallet (`vrnm`)    │        │  Embedded Dark-Mode Web Explorer (/)   │
-  │  WAL PadBook (0600) +    │        │  Zero CDN · Fail-Closed PoP Badges ·   │
-  │  Auto-Discovering RPC    │        │  Shamir V0..V3 Share Inspector         │
+  │  WAL PadBook (0600) +    │        │  Zero CDN · Pure-JS BigInt CW-MAC ·    │
+  │  CW-MAC Auth RPC Client  │        │  Redacted Public / Private Unlock UI   │
   └────────────┬─────────────┘        └───────────────────┬────────────────────┘
-               │              HTTP/1.1 JSON               │
+               │           HTTP/1.1 JSON (TLS via Caddy)  │
                └────────────────────┬─────────────────────┘
                                     ▼
   ┌────────────────────────────────────────────────────────────────────────────┐
-  │     Hardened HTTP/P2P Edge (`testnet_server.rs` & `p2p_node.rs`)           │
-  │  Rate Limiter · Slowloris/Smuggling Guards · SSRF Block · /24 Eclipse Cap  │
+  │     Hardened HTTP/P2P Edge (`testnet_server.rs`, `p2p_node.rs`, `storage`) │
+  │  CW-MAC Auth · Rate Limiter · Slowloris/SSRF Guards · /24 Eclipse Defense  │
   └──────┬──────────────────────────┬───────────────────────────┬──────────────┘
          ▼                          ▼                           ▼
   ┌────────────────────┐   ┌──────────────────────┐   ┌────────────────────────┐
-  │ Express Lane BFT   │   │ Shielded IT-MPC Lane │   │ Autonomous PoP & QKD   │
+  │ Express Lane BFT   │   │ Shielded IT-MPC & VM │   │ PoP, Beacon & Entropy  │
   │ `bft.rs`           │   │ `privacy_mpc.rs`     │   │ `entropy_beacon.rs`    │
   │ `fast_engine.rs`   │   │ `turbo_shielded.rs`  │   │ `pop_mining.rs`        │
-  │ `turbo_express.rs` │   │ `distributed_mpc.rs` │   │ `qkd.rs` (BB84/Decoy)  │
-  │ 2-Phase OTP+CW BFT │   │ `dynamic_quorum.rs`  │   │ `tokenomics.rs` (21M)  │
+  │ `turbo_express.rs` │   │ `distributed_mpc.rs` │   │ `qkd.rs`, `hw_entropy` │
+  │                    │   │ `validator_daemon.rs`│   │ `entropy_harvester.rs` │
+  │                    │   │ `mpc_vm.rs`          │   │ `key_transport.rs`     │
+  │                    │   │ `mpc_bytecode.rs`    │   │ `geo_triangulation.rs` │
+  │                    │   │ `mpc_defi.rs`        │   │ `oblivious_shuffle.rs` │
+  │                    │   │ `dynamic_quorum.rs`  │   │ `vault_recovery.rs`    │
+  │                    │   │ `adaptive_tuner.rs`  │   │ `tokenomics.rs` (21M)  │
   └─────────┬──────────┘   └──────────┬───────────┘   └───────────┬────────────┘
             └─────────────────────────┴───────────────────────────┘
                                       ▼
   ┌────────────────────────────────────────────────────────────────────────────┐
-  │  Information-Theoretic Foundation (`field.rs`, `otp.rs`, `turbo_crypto.rs`)│
+  │  Information-Theoretic Core (`field.rs`, `otp.rs`, `turbo_crypto.rs`)      │
   │  Branchless F_(2^127-1) · AVX-512/NEON OTP XOR · 4-Way CW MAC · WAL Zero   │
   └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Core Modules (19 Modules, Zero External Crates)
-
-| Module | Role |
+| Layer | Modules |
 | :--- | :--- |
-| `src/field.rs` | Division-free, branchless Mersenne prime field $\mathbb{F}_{2^{127}-1}$, constant-time `ct_select_u128` / `ct_eq_16`, OS entropy & volatile RAM zeroization |
-| `src/otp.rs` | Word-level XOR OTP, injective Carter–Wegman one-time MAC, crash-safe `fsync` `WalPadBook` with on-disk zeroing |
-| `src/turbo_crypto.rs` | Runtime-dispatched `AVX-512F`/`AVX2`/NEON OTP XOR, 4-way fused Carter–Wegman MAC (`CwFastKey`), `VPOPCNTDQ` Toeplitz QKD privacy amplification |
-| `src/bft.rs` | 2-phase batched BFT (`PrePrepare → Prepare → Commit`), ViewChange lock safety, offline quorum sync & Web-of-Trust registry |
-| `src/fast_engine.rs` | Bitcoin Core BIP-152 compact block relay, `O(1)` `IndexedLedger`, stack `[u128; 4]` parallel Express & Shielded baseline engines |
-| `src/turbo_express.rs` | Persistent 4-validator threaded Express BFT engine with 4-way pipelined CW block seals & zero-copy `Arc<[TurboTx]>` batches |
-| `src/privacy_mpc.rs` | Precomputed `LagrangeCache`, auto-refilling `BeaverPool`, `ShardedPrivateLedger`, sender-anonymous rounds, PSS & `CoverFrame` |
-| `src/turbo_shielded.rs` | Algebraic IT-MPC acceleration: Beaver Square Pairs, Shared-Factor Beaver Stars, zero-leak $[\rho]\cdot[Z]$ Schwartz–Zippel RLC |
-| `src/distributed_mpc.rs` | True 4-daemon split-share real-TCP networked IT-MPC (1 Shamir share per server) over pairwise OTP+MAC sockets |
-| `src/entropy_beacon.rs` | Unbiasable, unabortable threshold-Shamir Distributed Entropy Beacon ($\Gamma_e$) + `AutonomousEpochClock` |
-| `src/dynamic_quorum.rs` | Permissionless beacon-challenged validator admission, zero-reconstruction $(t, N) \to (t', N')$ Shamir resharing & epoch state pruning |
-| `src/pop_mining.rs` | Sattolo beacon-paired bilateral Proof-of-Pad (`PoP`) mining: Monobit + Runs tests, Beaver spot-checks, QKD audits, co-signed peer receipts, `PopReplayRegistry` & auto-slashing |
-| `src/qkd.rs` | Bit-sliced BB84 + Weak/Vacuum Decoy-State QKD (QBER + PNS attack detection), Toeplitz PA, `BufferedQkdPool`, ETSI 014 & QRNG traits |
-| `src/tokenomics.rs` | 21,000,000 `VRNM` hard halving cap, Proof-of-Pad rewards, 80/20 pad-burn fees, flat-bond validator slashing & one-time CW audit tags |
-| `src/p2p_node.rs` | Multi-VPS decentralized P2P validator daemon with seed bootstrap, transitive `/p2p/peers` gossip, block sync, SSRF & `/24` eclipse defense |
-| `src/testnet_server.rs` | Hardened zero-dependency HTTP/1.1 testnet server (rate limiting, Slowloris/smuggling guards, beacon-paired `/pop/mine`, faucet & balance APIs) |
-| `src/explorer_ui.rs` | Self-contained zero-CDN dark-mode web explorer (ASI security posture bar, fail-closed PoP telemetry, P2P mesh, Shamir share inspector, Quick Join CLI) |
-| `src/wallet.rs` | Crash-safe disk-persisted `VernamWallet` (`0600`) + auto-discovering zero-dependency HTTP/1.1 `WalletRpcClient` |
-| `src/main.rs` | Unified `vrnm` CLI binary wiring testnet, P2P node, PoP miner, wallet, v1.0 zero-admin demo & benchmarks |
+| **Core Primitives** | `field.rs`, `otp.rs`, `turbo_crypto.rs`, `storage.rs` |
+| **Express BFT Lane** | `bft.rs`, `fast_engine.rs`, `turbo_express.rs` |
+| **Shielded IT-MPC & Networked Daemons** | `privacy_mpc.rs`, `turbo_shielded.rs`, `distributed_mpc.rs`, `validator_daemon.rs`, `dynamic_quorum.rs`, `oblivious_shuffle.rs`, `vault_recovery.rs` |
+| **v2.1 Confidential Circuits VM & DeFi** | `mpc_vm.rs`, `mpc_bytecode.rs`, `mpc_defi.rs`, `adaptive_tuner.rs` |
+| **PoP Mining, Beacon, QKD & Entropy** | `entropy_beacon.rs`, `pop_mining.rs`, `qkd.rs`, `hw_entropy.rs`, `entropy_harvester.rs`, `key_transport.rs`, `geo_triangulation.rs`, `tokenomics.rs` |
+| **Network Edge, UI, Wallet & CLI** | `testnet_server.rs`, `p2p_node.rs`, `explorer_ui.rs`, `wallet.rs`, `main.rs` |
 
 ---
 
@@ -184,48 +209,44 @@ Measured with `cargo run --release -- bench` (`opt-level = 3`, `lto = true`, `co
 
 | Command | Description |
 | :--- | :--- |
-| `vrnm demo` | Run the full 6-pillar showcase (WAL OTP, BFT sync, Sharded IT-MPC, BB84/PNS QKD, 21M Tokenomics & Fast Engine) |
-| `vrnm v1-demo` | Run the v1.0+ zero-admin demo (unbiasable threshold beacon under V3 abort, 4-daemon real-TCP MPC, `4 → 7` resharing) |
-| `vrnm bench` | Run full release speed benchmarks (SIMD crypto, Express BFT, Shielded IT-MPC, 4-daemon TCP MPC & BIP-152 compact relay) |
-| `vrnm testnet [--bind 0.0.0.0:8080]` | Start the all-in-one 4-validator HTTP/1.1 testnet node + interactive Web Explorer at `/` |
-| `vrnm node [--id N] [--bind ADDR] [--advertise IP:PORT] [--seed HOST:PORT]` | Start an independent decentralized P2P validator node with automatic transitive peer discovery |
-| `vrnm pop-mine` | Run a standalone Beacon-Paired Bilateral Proof-of-Pad (`PoP`) entropy & Beaver-triple audit round |
-| `vrnm miner [--id N] [--cores 1] [--node URL] [--rounds 0] [--interval 15]` | Run a live 1-core (or N-core) Proof-of-Pad entropy & Beaver-triple miner submitting epochs to a node |
-| `vrnm wallet create --name <n> [--node URL]` | Create a crash-safe WAL-persisted local OTP wallet (`~/.vernam/wallets/<n>`) |
-| `vrnm wallet peers [--node URL]` | Auto-discover all active peer nodes on the mesh from a single seed |
-| `vrnm wallet faucet --name <n> [--express 1000] [--shielded 500]` | Claim Express + Shielded testnet `VRNM` from the live faucet |
-| `vrnm wallet balance --name <n>` | Inspect Express balance, Shielded balance, raw `V0..V3` Shamir shares & remaining WAL OTP pages |
-| `vrnm wallet send --from <n> --to <name\|id> --amount <u64>` | Send an Express Lane (2-phase OTP + Carter–Wegman BFT) transfer |
-| `vrnm wallet send-private --from <n> --to <name\|id> --amount <u64>` | Send a blinded Shielded Lane (IT-MPC Beaver-triple) transfer hiding amount & recipient |
-| `vrnm wallet refill --name <n> [--pages 8]` | Replenish fresh BB84 QKD OTP pad pages into the local wallet WAL |
-| `vrnm wallet pop-mine [--node URL]` | Trigger a Beacon-Paired Bilateral Proof-of-Pad epoch mine via `POST /pop/mine` |
-| `vrnm wallet refresh-epoch [--node URL]` | Trigger a Proactive Secret Sharing (PSS) + BB84 QKD epoch rotation |
+| `vrnm demo` | Full 5-pillar showcase (WAL OTP, BFT sync, Sharded IT-MPC, BB84/PNS QKD, 21M Tokenomics & Fast Engine) |
+| `vrnm v1-demo` | v1.0 zero-admin threshold beacon (with abort recovery), 4-daemon real-TCP MPC & `4 → 7` resharing |
+| `vrnm v2-demo` | v2.0 multi-source entropy, global oblivious shuffle, Herzberg recovery & geo-triangulation demo |
+| `vrnm circuits-demo` | v2.1 Confidential IT-MPC Circuits VM, Dark-Pool AMM, Vickrey Auction, Ballot Box & Adaptive Tuner demo |
+| `vrnm bench` | Real 4-daemon TCP MPC + in-process Express BFT, Shielded IT-MPC & SIMD kernel benchmarks |
+| `vrnm testnet [--bind 0.0.0.0:8080] [--data-dir <path>]` | Start the all-in-one 4-validator HTTP/1.1 testnet node + authenticated Web Explorer at `/` |
+| `vrnm validator [--id 0] [--committee 4] [--bind ...]` | Start a single-share multi-host IT-MPC validator daemon (1 Shamir share per host) |
+| `vrnm node [--id N] [--bind ADDR] [--advertise IP:PORT] [--seed HOST:PORT]` | Start an independent decentralized P2P validator node with transitive peer gossip |
+| `vrnm miner [--id N] [--cores 1] [--node URL] [--rounds 0]` | Run an interactive Proof-of-Pad miner (`POST /pop/commit` → `POST /pop/submit`) |
+| `vrnm pop-mine` | Run a local standalone Beacon-Paired Bilateral Proof-of-Pad audit round |
+| `vrnm hw-entropy` | Probe `/dev/hwrng` or `VRNM_QRNG_DEVICE` with NIST SP 800-90B continuous health tests |
+| `vrnm wallet create\|peers\|faucet\|balance\|send\|send-private\|refill` | Crash-safe WAL (`0600`) CLI wallet with single-use CW-MAC auth |
 
 ---
 
 ## VPS & Multi-Node Docker Deployment
 
-Deploy a dedicated hardened systemd testnet + web explorer on any Ubuntu/Debian VPS:
+For a dedicated hardened systemd testnet on Ubuntu/Debian, **clone and inspect the provisioning script first** (requires root/sudo for `systemd` & `ufw`; not a client installer):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gpt4omni/vernam/main/deploy/vps-setup.sh | sudo bash
+git clone https://github.com/gpt4omni/vernam.git
+cd vernam
+less deploy/vps-setup.sh
+sudo bash deploy/vps-setup.sh
 ```
 
-Or spin up a 4-container local/VPS decentralized P2P mesh in one command:
+In production, front port `:8080` with automatic HTTPS using [`deploy/Caddyfile`](deploy/Caddyfile) (set `VRNM_DOMAIN=your.domain.example`).
+
+Or spin up a 4-container decentralized P2P mesh locally with Docker Compose:
 
 ```bash
 docker compose -f deploy/docker-compose.multi-node.yml up -d --build
 ```
 
-Full deployment guides: [deploy/DEPLOY_VPS.md](deploy/DEPLOY_VPS.md) and [deploy/JOIN_TESTNET.md](deploy/JOIN_TESTNET.md).
+See [deploy/DEPLOY_VPS.md](deploy/DEPLOY_VPS.md) and [deploy/JOIN_TESTNET.md](deploy/JOIN_TESTNET.md) for full operator documentation.
 
 ---
 
-## Local Build & Verification
+## License
 
-```bash
-cargo test --release
-cargo run --release -- v1-demo
-cargo run --release -- bench
-cargo run --release -- pop-mine
-```
+Released under the [MIT License](LICENSE). Copyright (c) 2026 Vernam (VRNM) Contributors.

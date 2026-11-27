@@ -3,9 +3,9 @@ members = [".", "vernam-kernel"]
 
 [package]
 name = "vernam-rs"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
-description = "Vernam (VRNM) v2.0: Zero-admin, zero-dependency, information-theoretically secure OTP cryptocurrency core"
+description = "Vernam (VRNM) v2.2: Zero-dependency, information-theoretically secure OTP cryptocurrency & confidential IT-MPC circuits research prototype"
 
 [profile.release]
 opt-level = 3

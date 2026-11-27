@@ -1,21 +1,23 @@
-//! Vernam (`VRNM`) v1.2 ASI-Hardened Self-Contained Dark-Mode Web Explorer & Testnet Dashboard.
+//! Vernam (`VRNM`) v2.2.0 Authenticated, Self-Contained Dark-Mode Web Explorer & Testnet Dashboard.
 //!
 //! Zero external crates and zero external CDN script/stylesheet dependencies so the
 //! explorer renders instantaneously even on offline, LAN, or air-gapped deployments.
 //!
 //! Exports [`VERNAM_EXPLORER_HTML`] for serving at `GET /`.
 
-/// Complete self-contained HTML5 + CSS + vanilla JS dashboard for Vernam (`VRNM`) Testnet v1.2.
+/// Complete self-contained HTML5 + CSS + vanilla JS dashboard for Vernam (`VRNM`) Testnet v2.2.0.
 ///
-/// Consumes the node's live HTTP/1.1 JSON endpoints:
+/// Consumes the hardened `v2.2.0` HTTP/1.1 JSON endpoints:
 /// - `GET /status` — BFT block height, Express/Shielded txs, PSS epoch, QKD QBER, tokenomics & events
 /// - `GET /p2p/peers` — Decentralized P2P gossip peer mesh (with graceful fallback to local `V0..V3`)
-/// - `POST /pop/mine` — Beacon-paired bilateral Proof-of-Pad audit & epoch mining (`beacon_gamma`,
-///   `beacon_paired_verified`, `bilateral_receipts_verified`, `anti_replay_tracked_pads`, with fallback to `POST /epoch/refresh`)
+/// - `POST /account/register` — Registers one-time `(pad_id, r, s)` Carter-Wegman auth keys in session
 /// - `POST /faucet` — Express BFT + Shielded Shamir faucet drip
-/// - `POST /tx/express` — 2-Phase OTP + Carter-Wegman BFT transfer
-/// - `POST /tx/shielded` — Blinded IT-MPC Beaver-triple transfer over `F_(2^127 - 1)`
-/// - `GET /balance/<id>` — Express balance, owner-reconstructed Shielded balance, and raw `V0..V3` Shamir shares
+/// - `POST /tx/express` — CW-MAC authenticated (`AUTH_DOMAIN_EXPRESS = 1`) 2-Phase OTP + BFT transfer
+/// - `POST /tx/shielded` — CW-MAC authenticated (`AUTH_DOMAIN_SHIELDED = 2`) Blinded IT-MPC transfer
+/// - `GET /balance/<id>` — Public Express balance only (shielded balance & raw Shamir shares REDACTED)
+/// - `POST /balance/private` — CW-MAC authenticated (`AUTH_DOMAIN_BALANCE = 3`) owner shielded balance
+/// - `POST /pop/commit` & `POST /pop/submit` — Interactive challenge-response Proof-of-Pad endpoints
+///   for external `vrnm miner` clients (server-side self-mining `/pop/mine` is disabled in `v2.2.0`)
 pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -79,7 +81,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     align-items: center;
     gap: 16px;
     padding: 18px 22px;
-    margin-bottom: 22px;
+    margin-bottom: 18px;
     border-radius: 16px;
     background: linear-gradient(135deg, rgba(13, 24, 44, 0.96), rgba(9, 17, 32, 0.94));
     border: 1px solid var(--border);
@@ -196,14 +198,14 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     50% { opacity: 0.35; transform: scale(0.88); }
   }
 
-  /* ASI Security Posture Bar */
+  /* Security Posture Bar */
   .posture-bar {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 11px 16px;
-    margin-bottom: 20px;
+    margin-bottom: 18px;
     border-radius: 13px;
     background: linear-gradient(90deg, rgba(11, 22, 40, 0.94), rgba(8, 17, 32, 0.9));
     border: 1px solid rgba(34, 211, 238, 0.24);
@@ -244,6 +246,20 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     box-shadow: 0 0 6px rgba(16, 185, 129, 0.85);
     flex-shrink: 0;
   }
+
+  /* Research Disclaimer Bar */
+  .disclaimer-bar {
+    padding: 10px 15px;
+    margin-bottom: 18px;
+    border-radius: 11px;
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.28);
+    color: #fde68a;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .disclaimer-bar strong { color: #fbbf24; }
 
   /* 6 KPI Cards */
   .kpi-grid {
@@ -333,17 +349,6 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     margin-bottom: 12px;
   }
 
-  .section-title {
-    font-size: 13px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-soft);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
   .mini-pill {
     font-family: var(--mono);
     font-size: 11px;
@@ -363,13 +368,19 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   /* Layout Grids */
   .split-main {
     display: grid;
-    grid-template-columns: 1.35fr 1fr;
+    grid-template-columns: 1.3fr 1fr;
     gap: 18px;
     margin-bottom: 22px;
   }
 
   @media (max-width: 1020px) {
     .split-main { grid-template-columns: 1fr; }
+  }
+
+  .auth-card {
+    margin-bottom: 22px;
+    border-color: rgba(34, 211, 238, 0.32);
+    background: linear-gradient(135deg, rgba(12, 22, 42, 0.94), rgba(10, 18, 34, 0.92));
   }
 
   .ops-grid {
@@ -482,11 +493,27 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   }
 
   /* Proof-of-Pad Mining Panel */
+  .pop-notice {
+    background: rgba(245, 158, 11, 0.08);
+    border: 1px solid rgba(245, 158, 11, 0.32);
+    border-radius: 10px;
+    padding: 11px 13px;
+    font-size: 12px;
+    color: #fde68a;
+    margin-bottom: 12px;
+    line-height: 1.5;
+  }
+
+  .pop-notice code {
+    color: #fef08a;
+    font-family: var(--mono);
+  }
+
   .audit-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
-    margin: 14px 0;
+    margin: 12px 0;
   }
 
   .audit-item {
@@ -519,13 +546,6 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .audit-val.has-tip {
-    cursor: help;
-    color: var(--cyan);
-    text-decoration: underline dotted rgba(34, 211, 238, 0.45);
-    text-underline-offset: 2px;
   }
 
   .supply-box {
@@ -576,6 +596,11 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   /* Forms & Buttons */
   .row-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }
   .row-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .row-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }
+
+  @media (max-width: 780px) {
+    .row-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
 
   label {
     display: block;
@@ -639,7 +664,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   .out-box.ok { border-color: rgba(16, 185, 129, 0.4); color: #a7f3d0; }
   .out-box.err { border-color: rgba(251, 113, 133, 0.45); color: #fecdd3; }
 
-  /* Shamir Share Inspector */
+  /* Balance & Privacy Inspector */
   .bal-summary {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -659,7 +684,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   }
 
   .bal-tile .k { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
-  .bal-tile .v { font-family: var(--mono); font-size: 17px; font-weight: 700; margin-top: 3px; }
+  .bal-tile .v { font-family: var(--mono); font-size: 15px; font-weight: 700; margin-top: 3px; word-break: break-word; }
 
   .shares-panel {
     margin-top: 12px;
@@ -675,19 +700,19 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     margin-bottom: 8px;
   }
 
-  .share-row {
-    display: grid;
-    grid-template-columns: 110px 1fr;
+  .privacy-row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
     align-items: center;
-    gap: 10px;
-    padding: 6px 0;
+    gap: 8px;
+    padding: 7px 0;
     border-bottom: 1px solid rgba(28, 44, 74, 0.45);
     font-family: var(--mono);
     font-size: 12px;
   }
 
-  .share-row:last-child { border-bottom: none; }
-  .share-hex { word-break: break-all; color: #7dd3fc; }
+  .privacy-row:last-child { border-bottom: none; }
 
   /* Quick Connect Card */
   .cmd-block {
@@ -795,10 +820,10 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
       <div class="logo" aria-label="Vernam VRNM"><svg viewBox="0 0 512 512" width="50" height="50"><defs><linearGradient id="vrnmAz" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#06B6D4"/><stop offset="100%" stop-color="#2563EB"/></linearGradient></defs><circle cx="256" cy="256" r="244" fill="#05070D"/><circle cx="256" cy="256" r="218" fill="none" stroke="#1E293B" stroke-width="6"/><path d="M 256 38 A 218 218 0 0 1 445 365" fill="none" stroke="url(#vrnmAz)" stroke-width="10" stroke-linecap="round"/><path d="M 256 474 A 218 218 0 0 1 67 147" fill="none" stroke="#F8FAFC" stroke-width="10" stroke-linecap="round"/><path d="M 142 152 L 200 152 L 256 306 L 312 152 L 370 152 L 278 386 L 234 386 Z" fill="#F8FAFC"/><circle cx="256" cy="184" r="30" fill="none" stroke="url(#vrnmAz)" stroke-width="8"/><line x1="256" y1="154" x2="256" y2="214" stroke="#0EA5E9" stroke-width="7" stroke-linecap="round"/><line x1="226" y1="184" x2="286" y2="184" stroke="#06B6D4" stroke-width="7" stroke-linecap="round"/></svg></div>
       <div>
         <div class="brand-title">
-          <h1>Vernam (VRNM) Testnet v2.1</h1>
-          <span class="version-tag">v1.2 ASI-HARDENED &bull; OTP + IT-MPC + QKD</span>
+          <h1>Vernam (VRNM) Testnet v2.2</h1>
+          <span class="version-tag">v2.2.0 HARDENED &bull; CW-MAC AUTH &bull; OTP + IT-MPC + QKD</span>
         </div>
-        <p class="brand-sub">Information-Theoretically Secure Ledger &bull; Carter-Wegman BFT &bull; Sharded Shamir Privacy &bull; Beacon-Paired PoP Mesh</p>
+        <p class="brand-sub">Information-Theoretically Secure Ledger &bull; Carter-Wegman BFT &bull; Sharded Shamir Privacy &bull; Interactive PoP Mesh</p>
       </div>
     </div>
     <div class="banner-pills">
@@ -807,15 +832,21 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     </div>
   </header>
 
-  <!-- ASI Security Posture Bar -->
-  <section class="posture-bar" aria-label="ASI Security Posture">
-    <span class="posture-title">ASI Security Posture</span>
+  <!-- Security Posture Bar -->
+  <section class="posture-bar" aria-label="Security Posture">
+    <span class="posture-title">v2.2.0 Security Posture</span>
     <span class="posture-pill"><span class="posture-dot"></span>Zero External Crates</span>
+    <span class="posture-pill"><span class="posture-dot"></span>Owner CW-MAC Auth</span>
     <span class="posture-pill"><span class="posture-dot"></span>Information-Theoretic Privacy</span>
     <span class="posture-pill"><span class="posture-dot"></span>Branchless F_(2^127-1)</span>
     <span class="posture-pill"><span class="posture-dot"></span>Sattolo Beacon Pairing</span>
     <span class="posture-pill"><span class="posture-dot"></span>Anti-Replay Registry</span>
     <span class="posture-pill"><span class="posture-dot"></span>/24 Eclipse Defense</span>
+  </section>
+
+  <!-- Honest Research Testnet Notice -->
+  <section class="disclaimer-bar" aria-label="Research Testnet Notice">
+    <strong>Experimental MIT Research Testnet:</strong> Not audited for real value; VRNM is not for sale. Transfers and private balance queries use single-use symmetric Carter-Wegman MAC keys over <code>F_(2^127-1)</code> (burned immediately on use). Software BB84 QBER on public testnet is simulated unless paired with physical QRNG / ETSI 014 QKD hardware; front raw <code>:8080</code> HTTP with TLS (<code>deploy/Caddyfile</code>) in production.
   </section>
 
   <!-- 6 KPI Cards -->
@@ -852,7 +883,35 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- Decentralized P2P Peer Mesh + Proof-of-Pad Mining Panel -->
+  <!-- Client-Side One-Time CW-MAC Auth Key Manager -->
+  <section class="card auth-card" aria-label="Account CW-MAC Key Registration">
+    <div class="section-head">
+      <div>
+        <h2>Client-Side One-Time CW-MAC Session Keys (<code>F_(2^127-1)</code>)</h2>
+        <p class="desc" style="margin-bottom:0;">Register single-use <code>(pad_id, r, s)</code> keys via <code>POST /account/register</code>. Keys live only in browser memory (<code>sessionAuthKeys</code>), sign requests in pure JS <code>BigInt</code>, and are burned immediately after one use.</p>
+      </div>
+      <span class="mini-pill cyan" id="auth-keys-pill">0 SESSION KEYS</span>
+    </div>
+    <div class="row-4" style="align-items:end;">
+      <div>
+        <label for="reg-acct">Account ID (0-63)</label>
+        <input id="reg-acct" type="number" value="1" min="0" max="63" onchange="updateSessionKeySummary()">
+      </div>
+      <div>
+        <label for="reg-count">One-Time Keys Batch (1-64)</label>
+        <input id="reg-count" type="number" value="8" min="1" max="64">
+      </div>
+      <div>
+        <button class="btn-cyan" id="btn-reg-keys" onclick="registerAccountAuthKeys()">Register Account Auth Keys (POST /account/register)</button>
+      </div>
+      <div>
+        <button class="btn-amber" onclick="clearSessionAuthKeys()">Zero &amp; Wipe Session Keys</button>
+      </div>
+    </div>
+    <div class="out-box" id="reg-out">No keys registered yet in this browser session. Register one-time keys for an Account ID to sign Express transfers (domain=1), Shielded transfers (domain=2), and Private Balance queries (domain=3).</div>
+  </section>
+
+  <!-- Decentralized P2P Peer Mesh + Interactive Proof-of-Pad Panel -->
   <section class="split-main">
     <div class="card">
       <div class="section-head">
@@ -864,7 +923,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
       </div>
 
       <div class="mesh-note">
-        <strong>Zero Manual Node Lists:</strong> Connect to any single seed peer &mdash; Vernam nodes and wallets automatically discover every active validator transitively over <code>/p2p/peers</code> gossip.
+        <strong>Zero Manual Node Lists:</strong> Connect to any single seed peer &mdash; Vernam nodes and wallets automatically discover active validators transitively over <code>/p2p/peers</code> gossip with SSRF and <code>/24</code> eclipse protection.
       </div>
 
       <div class="table-wrap">
@@ -889,36 +948,45 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     <div class="card">
       <div class="section-head">
         <div>
-          <h2>Proof-of-Pad (PoP) Mining</h2>
-          <p class="desc" style="margin-bottom:0;">Audit fresh OTP entropy, rotate Shamir PSS shares, and mint PoP epoch subsidy.</p>
+          <h2>Proof-of-Pad (PoP) Remote Mining</h2>
+          <p class="desc" style="margin-bottom:0;">Interactive challenge-response entropy &amp; Beaver-triple auditing via <code>POST /pop/commit</code> &rarr; <code>POST /pop/submit</code>.</p>
         </div>
-        <span class="mini-pill amber" id="pop-status-pill">READY</span>
+        <span class="mini-pill emerald" id="pop-status-pill">CHALLENGE-RESPONSE</span>
       </div>
 
-      <button class="btn-emerald" id="btn-pop-mine" onclick="runPopMine()">Run Proof-of-Pad Audit &amp; Mine Epoch</button>
-      <div class="out-box" id="pop-out">Click to run Monobit + Runs + Beaver Triple + BB84 QBER audit and settle epoch subsidy.</div>
+      <div class="pop-notice">
+        <strong>v2.2.0 Hardening:</strong> Server-side self-mining theater (<code>POST /pop/mine</code>) is <strong>disabled</strong> because a node auditing itself proves nothing. External miners must commit fresh entropy via <code>POST /pop/commit</code>, receive a beacon-derived challenge, and answer via <code>POST /pop/submit</code>.
+      </div>
+
+      <div class="cmd-block" style="margin-bottom:12px;">
+        <div class="cmd-head">
+          <span class="cmd-label">Run Authenticated Remote PoP Miner (<code>/pop/commit</code> &rarr; <code>/pop/submit</code>)</span>
+          <button class="copy-btn" onclick="copySnippet('cmd-pop-miner', this)">Copy</button>
+        </div>
+        <pre class="cmd-code" id="cmd-pop-miner">vrnm miner --cores 1 --node "$VRNM_NODE"</pre>
+      </div>
 
       <div class="audit-grid">
         <div class="audit-item">
           <div class="audit-top">
-            <span class="audit-name">Monobit Entropy</span>
-            <span class="status-badge status-warn" id="aud-monobit">PENDING</span>
+            <span class="audit-name">Commit Endpoint</span>
+            <span class="status-badge status-ok" id="aud-commit">ACTIVE</span>
           </div>
-          <div class="audit-val" id="aud-monobit-val">Bit balance check</div>
+          <div class="audit-val">POST /pop/commit</div>
         </div>
         <div class="audit-item">
           <div class="audit-top">
-            <span class="audit-name">Runs Test</span>
-            <span class="status-badge status-warn" id="aud-runs">PENDING</span>
+            <span class="audit-name">Submit Endpoint</span>
+            <span class="status-badge status-ok" id="aud-submit">ACTIVE</span>
           </div>
-          <div class="audit-val" id="aud-runs-val">Transition independence</div>
+          <div class="audit-val">POST /pop/submit</div>
         </div>
         <div class="audit-item">
           <div class="audit-top">
-            <span class="audit-name">Beaver Spot-Check</span>
-            <span class="status-badge status-warn" id="aud-beaver">PENDING</span>
+            <span class="audit-name">Self-Mine Theater</span>
+            <span class="status-badge status-bad" id="aud-self-mine">DISABLED</span>
           </div>
-          <div class="audit-val" id="aud-beaver-val">a&middot;b = c over F_(2^127-1)</div>
+          <div class="audit-val">POST /pop/mine disabled in v2.2.0</div>
         </div>
         <div class="audit-item">
           <div class="audit-top">
@@ -926,34 +994,6 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
             <span class="status-badge status-ok" id="aud-qber">PASS</span>
           </div>
           <div class="audit-val" id="aud-qber-val">Threshold &lt; 11.0%</div>
-        </div>
-        <div class="audit-item">
-          <div class="audit-top">
-            <span class="audit-name">Threshold Beacon &Gamma;<sub>e</sub></span>
-            <span class="status-badge status-warn" id="aud-beacon-gamma">PENDING</span>
-          </div>
-          <div class="audit-val" id="aud-beacon-gamma-val" title="Awaiting Threshold Beacon Epoch">Awaiting Epoch</div>
-        </div>
-        <div class="audit-item">
-          <div class="audit-top">
-            <span class="audit-name">Beacon Pairing Verified</span>
-            <span class="status-badge status-warn" id="aud-beacon-pair">PENDING</span>
-          </div>
-          <div class="audit-val" id="aud-beacon-pair-val">Sattolo derangement check</div>
-        </div>
-        <div class="audit-item">
-          <div class="audit-top">
-            <span class="audit-name">Bilateral Peer Receipts</span>
-            <span class="status-badge status-warn" id="aud-bilateral">PENDING</span>
-          </div>
-          <div class="audit-val" id="aud-bilateral-val">Counterparty CW-MAC co-sign</div>
-        </div>
-        <div class="audit-item">
-          <div class="audit-top">
-            <span class="audit-name">Anti-Replay Tracked Pads</span>
-            <span class="status-badge status-warn" id="aud-anti-replay">PENDING</span>
-          </div>
-          <div class="audit-val" id="aud-anti-replay-val">0 tracked pad fingerprints</div>
         </div>
       </div>
 
@@ -974,7 +1014,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- Interactive Testnet Controls -->
+  <!-- Interactive Authenticated Testnet Controls -->
   <section class="ops-grid">
     <div class="card">
       <h2>Testnet Faucet</h2>
@@ -989,20 +1029,20 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>Express Send (2-Phase BFT)</h2>
-      <p class="desc">Finalizes a 32-byte OTP + Carter-Wegman transaction across validators via <code>POST /tx/express</code>.</p>
+      <h2>Express Send (CW-MAC Signed BFT)</h2>
+      <p class="desc">Signs with a burned one-time <code>F_(2^127-1)</code> CW-MAC (<code>domain=1</code>) and submits to <code>POST /tx/express</code>.</p>
       <div class="row-3">
         <div><label for="e-from">Sender ID</label><input id="e-from" type="number" value="1" min="0" max="63"></div>
         <div><label for="e-to">Recipient ID</label><input id="e-to" type="number" value="2" min="0" max="63"></div>
         <div><label for="e-amt">Amount</label><input id="e-amt" type="number" value="50" min="1"></div>
       </div>
-      <button class="btn-cyan" onclick="doExpress()">Send Express BFT Tx</button>
-      <div class="out-box" id="e-out">Ready.</div>
+      <button class="btn-cyan" onclick="doExpress()">Sign &amp; Send Express BFT Tx</button>
+      <div class="out-box" id="e-out">Requires a registered session CW-MAC key for Sender ID.</div>
     </div>
 
     <div class="card">
-      <h2>Shielded Private Send (IT-MPC)</h2>
-      <p class="desc">Hides amount &amp; recipient inside an anonymity bucket using Beaver triples via <code>POST /tx/shielded</code>.</p>
+      <h2>Shielded Private Send (CW-MAC IT-MPC)</h2>
+      <p class="desc">Signs with a burned one-time CW-MAC (<code>domain=2</code>) and blinds amount &amp; recipient via <code>POST /tx/shielded</code>.</p>
       <div class="row-2">
         <div><label for="s-from">Sender ID</label><input id="s-from" type="number" value="1" min="0" max="63"></div>
         <div><label for="s-amt">Amount (Hidden)</label><input id="s-amt" type="number" value="25" min="1" max="65535"></div>
@@ -1011,40 +1051,43 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
         <div><label for="s-bkt">Recipient Bucket (0-3)</label><input id="s-bkt" type="number" value="0" min="0" max="3" oninput="updateShieldedHint()"></div>
         <div><label for="s-slot">Recipient Slot (0-15)</label><input id="s-slot" type="number" value="2" min="0" max="15" oninput="updateShieldedHint()"></div>
       </div>
-      <button class="btn-violet" onclick="doShielded()">Send Blinded Shielded Tx</button>
-      <div class="out-box" id="s-out">Target Account #2 (Bucket 0, Slot 2) &mdash; blinded from all validators.</div>
+      <button class="btn-violet" onclick="doShielded()">Sign &amp; Send Blinded Shielded Tx</button>
+      <div class="out-box" id="s-out">Target Account #2 (Bucket 0, Slot 2) &mdash; requires registered CW-MAC key for Sender ID.</div>
     </div>
   </section>
 
-  <!-- Account & Raw 127-Bit Shamir Share Inspector + Quick Connect -->
+  <!-- Privacy-Preserving Balance Inspector + Quick Connect -->
   <section class="split-bottom">
     <div class="card">
       <div class="section-head">
         <div>
-          <h2>Account &amp; Raw 127-Bit Shamir Share Inspector</h2>
-          <p class="desc" style="margin-bottom:0;">Queries <code>GET /balance/&lt;id&gt;</code> &mdash; compare owner-reconstructed balance against the 4 raw random hex shares held by <code>V0..V3</code>.</p>
+          <h2>Privacy-Preserving Balance Inspector</h2>
+          <p class="desc" style="margin-bottom:0;"><code>GET /balance/&lt;id&gt;</code> exposes only public Express state. Unlock your private Shielded balance with an owner CW-MAC key via <code>POST /balance/private</code>.</p>
         </div>
         <span class="mini-pill violet" id="insp-loc">Bucket 0 &bull; Slot 1</span>
       </div>
 
-      <div class="row-2" style="margin-top:12px;">
+      <div class="row-3" style="margin-top:12px;align-items:end;">
         <div>
-          <label for="i-acct">Inspect Account ID (0-63)</label>
-          <input id="i-acct" type="number" value="1" min="0" max="63" onchange="loadBalance()">
+          <label for="i-acct">Account ID (0-63)</label>
+          <input id="i-acct" type="number" value="1" min="0" max="63" onchange="loadBalance(true)">
         </div>
-        <div style="display:flex;align-items:end;">
-          <button class="btn-cyan" onclick="loadBalance()">Inspect Account &amp; Shares</button>
+        <div>
+          <button class="btn-cyan" onclick="loadBalance(true)">Inspect Public Balance</button>
+        </div>
+        <div>
+          <button class="btn-violet" id="btn-unlock-bal" onclick="unlockPrivateBalance()">Unlock Private Balance (POST /balance/private)</button>
         </div>
       </div>
 
       <div class="bal-summary">
         <div class="bal-tile">
-          <div class="k">Express Balance</div>
+          <div class="k">Express Balance (Public)</div>
           <div class="v c-emerald" id="b-exp">--</div>
         </div>
         <div class="bal-tile">
-          <div class="k">Shielded (Owner)</div>
-          <div class="v c-violet" id="b-sh">--</div>
+          <div class="k">Shielded Balance</div>
+          <div class="v c-amber" id="b-sh">REDACTED</div>
         </div>
         <div class="bal-tile">
           <div class="k">PSS Epoch</div>
@@ -1058,27 +1101,32 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 
       <div class="shares-panel">
         <div class="shares-caption">
-          Raw validator shares in <code>F_(2^127 - 1)</code> &mdash; any single validator sees uniform random noise and learns <strong>0 bits</strong> about your balance:
+          <strong>Zero Unauthenticated Privacy Leaks (v2.2.0):</strong> Unauthenticated RPC queries never reconstruct private balances or expose raw validator Shamir shares.
         </div>
-        <div class="share-row"><span class="c-emerald">V0 Share</span><span class="share-hex" id="b-v0">--</span></div>
-        <div class="share-row"><span class="c-cyan">V1 Share</span><span class="share-hex" id="b-v1">--</span></div>
-        <div class="share-row"><span class="c-violet">V2 Share</span><span class="share-hex" id="b-v2">--</span></div>
-        <div class="share-row"><span class="c-amber">V3 Share</span><span class="share-hex" id="b-v3">--</span></div>
+        <div class="privacy-row">
+          <span class="c-violet">Shielded State</span>
+          <span id="b-sh-status" class="c-amber">SHIELDED BALANCE: REDACTED (Owner CW-MAC Auth Required)</span>
+        </div>
+        <div class="privacy-row">
+          <span class="c-cyan">Validator Shares</span>
+          <span id="b-shares-status" class="c-muted">RAW SHAMIR SHARES: REDACTED (1 Share / Host in Multi-Host Mode)</span>
+        </div>
       </div>
+      <div class="out-box" id="bal-out">Public GET /balance/&lt;id&gt; loaded. Use "Unlock Private Balance" with a registered one-time CW-MAC key (domain=3) to authenticate as the account owner.</div>
     </div>
 
     <div class="card">
       <div class="section-head">
         <div>
-          <h2>Quick Join / Copy-Paste CLI</h2>
-          <p class="desc" style="margin-bottom:0;">Auto-configured via <code>window.location.origin</code> (live testnet seed: <code>88.216.62.115:8080</code>).</p>
+          <h2>Quick Join / Inspect-First CLI</h2>
+          <p class="desc" style="margin-bottom:0;">Auto-configured via <code>window.location.origin</code> (live testnet seed: <code>88.216.62.115:8080</code>). Inspect source before building.</p>
         </div>
         <span class="mini-pill" id="qc-origin-pill">ORIGIN</span>
       </div>
 
       <div class="cmd-block">
         <div class="cmd-head">
-          <span class="cmd-label">1. Install &amp; Connect to Live Testnet (<code>88.216.62.115:8080</code>)</span>
+          <span class="cmd-label">1. Clone &amp; Build Offline (0 External Crates)</span>
           <button class="copy-btn" onclick="copySnippet('cmd-install', this)">Copy</button>
         </div>
         <pre class="cmd-code" id="cmd-install">Loading...</pre>
@@ -1094,7 +1142,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 
       <div class="cmd-block">
         <div class="cmd-head">
-          <span class="cmd-label">3. Run Shielded IT-MPC Transfer</span>
+          <span class="cmd-label">3. Run CW-MAC Signed Shielded IT-MPC Transfer</span>
           <button class="copy-btn" onclick="copySnippet('cmd-shielded', this)">Copy</button>
         </div>
         <pre class="cmd-code" id="cmd-shielded">Loading...</pre>
@@ -1102,7 +1150,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 
       <div class="cmd-block">
         <div class="cmd-head">
-          <span class="cmd-label">4. Join P2P Mesh or Run PoP Miner</span>
+          <span class="cmd-label">4. Join P2P Mesh or Run Interactive PoP Miner</span>
           <button class="copy-btn" onclick="copySnippet('cmd-node', this)">Copy</button>
         </div>
         <pre class="cmd-code" id="cmd-node">Loading...</pre>
@@ -1125,7 +1173,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   </section>
 
   <footer>
-    Vernam (VRNM) v1.2 ASI-Hardened Explorer (API compat: Vernam (VRNM) Testnet v0.4+) &bull; Zero External Dependencies &bull; Pure Information-Theoretic Security (OTP + Carter-Wegman + Shamir IT-MPC + BB84 QKD)
+    Vernam (VRNM) v2.2.0 Authenticated Explorer (MIT License &bull; Experimental Research Testnet) &bull; Zero External Dependencies &bull; Pure Information-Theoretic Security (OTP + Carter-Wegman + Shamir IT-MPC + BB84 QKD)
   </footer>
 </div>
 
@@ -1133,9 +1181,139 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 const VERN_PER_VRNM = 1e8;
 const MAX_SUPPLY_VERN = 21000000 * VERN_PER_VRNM;
 
+// Canonical Carter-Wegman MAC over F_(2^127 - 1) matching Rust bit-for-bit.
+const PRIME_P = (1n << 127n) - 1n;
+const AUTH_DOMAIN_EXPRESS = 1;
+const AUTH_DOMAIN_SHIELDED = 2;
+const AUTH_DOMAIN_BALANCE = 3;
+const AUTH_DOMAIN_REGISTER = 4;
+
+const sessionAuthKeys = {};
+
 let prevExpress = 0;
 let prevTime = Date.now();
 let latestStatus = null;
+let unlockedPrivateCache = null;
+
+function parseFieldScalar(val) {
+  if (typeof val === 'bigint') return ((val % PRIME_P) + PRIME_P) % PRIME_P;
+  if (typeof val === 'number') return BigInt(val) % PRIME_P;
+  const s = String(val || '').trim();
+  if (/^0x[0-9a-fA-F]+$/.test(s)) {
+    return BigInt(s) % PRIME_P;
+  }
+  if (/^[0-9a-fA-F]{32}$/.test(s)) {
+    let acc = 0n;
+    for (let i = 15; i >= 0; i--) {
+      acc = (acc << 8n) | BigInt(parseInt(s.slice(i * 2, i * 2 + 2), 16));
+    }
+    return acc % PRIME_P;
+  }
+  return BigInt(s) % PRIME_P;
+}
+
+function computeAuthTagHex(domain, acct, a1, a2, a3, padId, rBig, sBig) {
+  const r = rBig % PRIME_P;
+  let acc = (BigInt(domain) * r) % PRIME_P;
+  acc = ((acc + BigInt(acct)) * r) % PRIME_P;
+  acc = ((acc + BigInt(a1)) * r) % PRIME_P;
+  acc = ((acc + BigInt(a2)) * r) % PRIME_P;
+  acc = ((acc + BigInt(a3)) * r) % PRIME_P;
+  acc = ((acc + BigInt(padId)) * r) % PRIME_P;
+  const tag = (acc + (sBig % PRIME_P)) % PRIME_P;
+  let hex = '';
+  for (let i = 0; i < 16; i++) hex += Number((tag >> BigInt(i * 8)) & 0xffn).toString(16).padStart(2, '0');
+  return hex;
+}
+
+function consumeOneTimeAuthKey(acctId) {
+  const list = sessionAuthKeys[acctId];
+  if (!list || list.length === 0) {
+    throw new Error(`No registered one-time CW-MAC auth keys in session for Acct #${acctId}. Click "Register Account Auth Keys" first.`);
+  }
+  const key = list.shift();
+  updateSessionKeySummary();
+  return key;
+}
+
+function burnKeyMaterial(key) {
+  if (!key) return;
+  key.r = 0n;
+  key.s = 0n;
+  key.r_hex = '';
+  key.s_hex = '';
+}
+
+function updateSessionKeySummary() {
+  let total = 0;
+  const parts = [];
+  for (const [acct, arr] of Object.entries(sessionAuthKeys)) {
+    if (arr && arr.length > 0) {
+      total += arr.length;
+      parts.push(`#${acct}:${arr.length}`);
+    }
+  }
+  const pill = document.getElementById('auth-keys-pill');
+  if (pill) {
+    pill.textContent = total > 0
+      ? `${total} KEYS (${parts.join(', ')})`
+      : '0 SESSION KEYS';
+    pill.className = 'mini-pill ' + (total > 0 ? 'emerald' : 'amber');
+  }
+}
+
+async function registerAccountAuthKeys() {
+  const acctId = Math.max(0, Math.min(63, parseInt(document.getElementById('reg-acct').value, 10) || 0));
+  const count = Math.max(1, Math.min(64, parseInt(document.getElementById('reg-count').value, 10) || 8));
+  const btn = document.getElementById('btn-reg-keys');
+  btn.disabled = true;
+  let authKey = null;
+  try {
+    if (!sessionAuthKeys[acctId]) sessionAuthKeys[acctId] = [];
+    const payload = { account_id: acctId, count };
+    let usedRefillAuth = false;
+    if (sessionAuthKeys[acctId].length > 0) {
+      authKey = consumeOneTimeAuthKey(acctId);
+      const tagHex = computeAuthTagHex(AUTH_DOMAIN_REGISTER, acctId, count, 0, 0, authKey.pad_id, authKey.r, authKey.s);
+      payload.auth_pad_id = authKey.pad_id;
+      payload.auth_tag = tagHex;
+      burnKeyMaterial(authKey);
+      authKey = null;
+      usedRefillAuth = true;
+    }
+
+    const res = await api('/account/register', 'POST', payload);
+    const returnedKeys = Array.isArray(res.keys) ? res.keys : [];
+    for (const k of returnedKeys) {
+      const padId = Number(k.pad_id);
+      const rBig = parseFieldScalar(k.r_hex ?? k.r);
+      const sBig = parseFieldScalar(k.s_hex ?? k.s);
+      sessionAuthKeys[acctId].push({ pad_id: padId, r: rBig, s: sBig });
+    }
+    updateSessionKeySummary();
+    setOut(
+      'reg-out',
+      `${usedRefillAuth ? 'Refilled' : 'Registered'} ${returnedKeys.length} single-use CW-MAC auth keys for Acct #${acctId} (session pool: ${sessionAuthKeys[acctId].length}). Each key is burned immediately after signing one request.`,
+      'ok'
+    );
+  } catch (err) {
+    burnKeyMaterial(authKey);
+    setOut('reg-out', 'Key registration failed: ' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function clearSessionAuthKeys() {
+  for (const acct of Object.keys(sessionAuthKeys)) {
+    for (const k of sessionAuthKeys[acct] || []) burnKeyMaterial(k);
+    delete sessionAuthKeys[acct];
+  }
+  unlockedPrivateCache = null;
+  updateSessionKeySummary();
+  setOut('reg-out', 'All in-memory session CW-MAC keys zeroed and wiped.', '');
+  loadBalance(true);
+}
 
 function esc(s) {
   return String(s == null ? '' : s)
@@ -1143,14 +1321,6 @@ function esc(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
-}
-
-function fmtVrnm(vern, digits = 4) {
-  const n = Number(vern || 0) / VERN_PER_VRNM;
-  return n.toLocaleString(undefined, {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits
-  }) + ' VRNM';
 }
 
 function fmtShortVrnm(vern) {
@@ -1354,171 +1524,82 @@ async function refreshStatus() {
   }
 }
 
-async function runPopMine() {
-  const btn = document.getElementById('btn-pop-mine');
-  const pill = document.getElementById('pop-status-pill');
-  btn.disabled = true;
-  btn.textContent = 'Auditing Entropy & Mining PoP Epoch...';
-  pill.textContent = 'AUDITING...';
-  pill.className = 'mini-pill amber';
-
-  try {
-    let res;
-    let usedFallback = false;
-    try {
-      res = await api('/pop/mine', 'POST', {});
-    } catch (e) {
-      if (e.status === 404 || e.status === 405) {
-        usedFallback = true;
-        res = await api('/epoch/refresh', 'POST', {});
-      } else {
-        throw e;
-      }
-    }
-
-    const audit = res.audit || res.entropy_audit || res || {};
-    const hasMonobitZ = typeof audit.monobit_z === 'number' && Number.isFinite(audit.monobit_z);
-    const hasRunsZ = typeof audit.runs_z === 'number' && Number.isFinite(audit.runs_z);
-    const monobitPass = hasMonobitZ
-      ? Math.abs(audit.monobit_z) <= 6.0
-      : (audit.monobit_passed === true);
-    const runsPass = hasRunsZ
-      ? Math.abs(audit.runs_z) <= 6.0
-      : (audit.runs_passed === true);
-    const auditedVals = Number(audit.audited_validators ?? res.audited_validators ?? 0);
-    const passedVals = Number(audit.passed_validators ?? res.passed_validators ?? 0);
-    const beaverPass =
-      (audit.beaver_verified === true && auditedVals > 0 && passedVals === auditedVals) ||
-      audit.beaver_passed === true ||
-      audit.beaver_spot_check_passed === true;
-    const rawQber = res.qber ?? audit.qber;
-    const qberVal = rawQber != null ? Number(rawQber) : NaN;
-    const qberPass = Number.isFinite(qberVal) && qberVal >= 0 && qberVal <= 0.11;
-
-    const rawGamma = audit.beacon_gamma ?? res.beacon_gamma;
-    const hasBeaconGamma = typeof rawGamma === 'string' && /^0x[0-9a-fA-F]{32}$/.test(rawGamma);
-    const beaconPairedPass = audit.beacon_paired_verified === true;
-    const bilateralPass = audit.bilateral_receipts_verified === true;
-    const rawTrackedPads = audit.anti_replay_tracked_pads ?? res.anti_replay_tracked_pads;
-    const hasAntiReplay = typeof rawTrackedPads === 'number' && Number.isFinite(rawTrackedPads) && rawTrackedPads > 0;
-
-    setAuditBadge('aud-monobit', Boolean(monobitPass));
-    setAuditBadge('aud-runs', Boolean(runsPass));
-    setAuditBadge('aud-beaver', Boolean(beaverPass));
-    setAuditBadge('aud-qber', Boolean(qberPass));
-    setAuditBadge('aud-beacon-gamma', Boolean(hasBeaconGamma), 'VERIFIED', 'MISSING');
-    setAuditBadge('aud-beacon-pair', Boolean(beaconPairedPass), 'BEACON-PAIRED', 'UNPAIRED');
-    setAuditBadge('aud-bilateral', Boolean(bilateralPass), 'CO-SIGNED', 'UNVERIFIED');
-    setAuditBadge('aud-anti-replay', Boolean(hasAntiReplay), 'TRACKING', 'MISSING');
-
-    if (hasMonobitZ) {
-      document.getElementById('aud-monobit-val').textContent = 'Monobit z-score: ' + audit.monobit_z.toFixed(3) + ' (|z| <= 6.0)';
-    } else if (audit.monobit_ones_ratio != null) {
-      document.getElementById('aud-monobit-val').textContent = 'Ones ratio: ' + (Number(audit.monobit_ones_ratio) * 100).toFixed(2) + '%';
-    } else {
-      document.getElementById('aud-monobit-val').textContent = usedFallback ? 'Unavailable on /epoch/refresh' : 'Missing monobit telemetry';
-    }
-
-    if (hasRunsZ) {
-      document.getElementById('aud-runs-val').textContent = 'Runs z-score: ' + audit.runs_z.toFixed(3) + ' (|z| <= 6.0)';
-    } else if (audit.runs_count != null) {
-      document.getElementById('aud-runs-val').textContent = 'Runs observed: ' + audit.runs_count;
-    } else {
-      document.getElementById('aud-runs-val').textContent = usedFallback ? 'Unavailable on /epoch/refresh' : 'Missing runs telemetry';
-    }
-
-    if (auditedVals > 0) {
-      document.getElementById('aud-beaver-val').textContent = 'Validators passed: ' + passedVals + '/' + auditedVals + ' (beaver=' + (audit.beaver_verified === true ? 'OK' : 'FAIL') + ')';
-    } else if (audit.beaver_triples_checked != null) {
-      document.getElementById('aud-beaver-val').textContent = 'Checked ' + audit.beaver_triples_checked + ' triples';
-    } else {
-      document.getElementById('aud-beaver-val').textContent = 'Missing Beaver audit proof';
-    }
-
-    document.getElementById('aud-qber-val').textContent = Number.isFinite(qberVal)
-      ? 'Live QBER: ' + (qberVal * 100).toFixed(3) + '% (<= 11%)'
-      : 'Missing QBER telemetry';
-
-    const gammaEl = document.getElementById('aud-beacon-gamma-val');
-    if (hasBeaconGamma) {
-      gammaEl.textContent = rawGamma.slice(0, 10) + '\u2026' + rawGamma.slice(-6);
-      gammaEl.title = 'Full Threshold Beacon Gamma_e: ' + rawGamma;
-      gammaEl.classList.add('has-tip');
-    } else {
-      gammaEl.textContent = usedFallback ? 'Unavailable on /epoch/refresh' : 'Awaiting Epoch';
-      gammaEl.title = 'Missing or unverified threshold beacon gamma';
-      gammaEl.classList.remove('has-tip');
-    }
-
-    document.getElementById('aud-beacon-pair-val').textContent = beaconPairedPass
-      ? 'Sattolo derangement verified'
-      : (usedFallback ? 'Unavailable on /epoch/refresh' : 'Beacon pairing check FAILED');
-
-    document.getElementById('aud-bilateral-val').textContent = bilateralPass
-      ? 'Counterparty CW-MACs verified'
-      : (usedFallback ? 'Unavailable on /epoch/refresh' : 'Bilateral receipts FAILED');
-
-    document.getElementById('aud-anti-replay-val').textContent = hasAntiReplay
-      ? Number(rawTrackedPads).toLocaleString() + ' pads fingerprinted'
-      : (usedFallback ? 'Unavailable on /epoch/refresh' : 'Anti-replay counter missing');
-
-    const subsidy = res.subsidy_minted_vern ?? res.subsidy_vern ?? res.reward_vern ?? 0;
-    const epochNum = res.settled_tokenomics_epoch ?? res.epoch ?? res.pss_epoch ?? 0;
-    const pssEpoch = res.pss_epoch ?? epochNum;
-    const allOk = Boolean(
-      monobitPass &&
-      runsPass &&
-      beaverPass &&
-      qberPass &&
-      hasBeaconGamma &&
-      beaconPairedPass &&
-      bilateralPass &&
-      hasAntiReplay
-    );
-
-    pill.textContent = allOk ? 'AUDIT PASSED' : 'AUDIT WARNING';
-    pill.className = 'mini-pill ' + (allOk ? 'emerald' : 'rose');
-
-    const gammaSummary = hasBeaconGamma
-      ? ` | \u0393=${rawGamma.slice(0, 10)}\u2026`
-      : '';
-    const replaySummary = hasAntiReplay
-      ? ` | Anti-Replay: ${Number(rawTrackedPads)} pads`
-      : '';
-
-    setOut(
-      'pop-out',
-      `Mined Epoch #${epochNum} (PSS #${pssEpoch}) | Subsidy: +${fmtVrnm(subsidy)} | QBER: ${(qberVal * 100).toFixed(3)}%${gammaSummary}${replaySummary}` +
-      (usedFallback ? ' (via /epoch/refresh)' : ' (via /pop/mine)'),
-      allOk ? 'ok' : 'err'
-    );
-
-    await Promise.all([refreshStatus(), refreshPeers(), loadBalance()]);
-  } catch (err) {
-    pill.textContent = 'ERROR';
-    pill.className = 'mini-pill rose';
-    setOut('pop-out', 'Audit / Mine failed: ' + err.message, 'err');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Run Proof-of-Pad Audit & Mine Epoch';
+function renderRedactedShielded(id) {
+  const shTile = document.getElementById('b-sh');
+  const shStatus = document.getElementById('b-sh-status');
+  const sharesStatus = document.getElementById('b-shares-status');
+  if (unlockedPrivateCache && unlockedPrivateCache.account_id === id) {
+    shTile.textContent = String(unlockedPrivateCache.shielded_balance);
+    shTile.className = 'v c-violet';
+    shStatus.textContent = `AUTHENTICATED OWNER BALANCE: ${unlockedPrivateCache.shielded_balance} (CW-MAC Verified)`;
+    shStatus.className = 'c-emerald';
+  } else {
+    shTile.textContent = 'REDACTED';
+    shTile.className = 'v c-amber';
+    shStatus.textContent = 'SHIELDED BALANCE: REDACTED (Owner CW-MAC Auth Required)';
+    shStatus.className = 'c-amber';
   }
+  sharesStatus.textContent = 'RAW SHAMIR SHARES: REDACTED (1 Share / Host in Multi-Host Mode)';
 }
 
-async function loadBalance() {
+async function loadBalance(resetPrivate = false) {
   const id = Math.max(0, parseInt(document.getElementById('i-acct').value, 10) || 0);
+  if (resetPrivate && unlockedPrivateCache && unlockedPrivateCache.account_id !== id) {
+    unlockedPrivateCache = null;
+  }
   try {
     const b = await api('/balance/' + id);
     document.getElementById('b-exp').textContent = b.express_balance;
-    document.getElementById('b-sh').textContent = b.shielded_balance;
-    document.getElementById('b-ep').textContent = '#' + b.epoch;
-    document.getElementById('b-loc').textContent = 'B' + b.bucket_id + ' / S' + b.slot_in_bucket;
-    document.getElementById('insp-loc').textContent = 'Bucket ' + b.bucket_id + ' \u2022 Slot ' + b.slot_in_bucket;
-    document.getElementById('b-v0').textContent = b.v0_shamir_share || '--';
-    document.getElementById('b-v1').textContent = b.v1_shamir_share || '--';
-    document.getElementById('b-v2').textContent = b.v2_shamir_share || '--';
-    document.getElementById('b-v3').textContent = b.v3_shamir_share || '--';
+    document.getElementById('b-ep').textContent = '#' + (b.epoch ?? b.pss_epoch ?? 0);
+    const bkt = b.bucket_id != null ? b.bucket_id : Math.floor(id / 16);
+    const slot = b.slot_in_bucket != null ? b.slot_in_bucket : (id % 16);
+    document.getElementById('b-loc').textContent = 'B' + bkt + ' / S' + slot;
+    document.getElementById('insp-loc').textContent = 'Bucket ' + bkt + ' \u2022 Slot ' + slot;
+    renderRedactedShielded(id);
   } catch (err) {
-    document.getElementById('b-v0').textContent = 'Error: ' + err.message;
+    setOut('bal-out', 'Public balance query failed: ' + err.message, 'err');
+  }
+}
+
+async function unlockPrivateBalance() {
+  const id = Math.max(0, parseInt(document.getElementById('i-acct').value, 10) || 0);
+  const btn = document.getElementById('btn-unlock-bal');
+  btn.disabled = true;
+  let key = null;
+  try {
+    key = consumeOneTimeAuthKey(id);
+    const tagHex = computeAuthTagHex(AUTH_DOMAIN_BALANCE, id, 0, 0, 0, key.pad_id, key.r, key.s);
+    const padId = key.pad_id;
+    burnKeyMaterial(key);
+    key = null;
+
+    const res = await api('/balance/private', 'POST', {
+      account_id: id,
+      pad_id: padId,
+      auth_pad_id: padId,
+      auth_tag: tagHex
+    });
+    unlockedPrivateCache = {
+      account_id: id,
+      shielded_balance: res.shielded_balance
+    };
+    if (res.express_balance != null) {
+      document.getElementById('b-exp').textContent = res.express_balance;
+    }
+    if (res.epoch != null || res.pss_epoch != null) {
+      document.getElementById('b-ep').textContent = '#' + (res.epoch ?? res.pss_epoch);
+    }
+    renderRedactedShielded(id);
+    setOut(
+      'bal-out',
+      `Unlocked private balance for Acct #${id}: Shielded=${res.shielded_balance} (CW-MAC pad #${padId} burned).`,
+      'ok'
+    );
+  } catch (err) {
+    burnKeyMaterial(key);
+    setOut('bal-out', 'Private balance unlock failed: ' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -1531,30 +1612,46 @@ async function doFaucet() {
     });
     setOut(
       'f-out',
-      `Credited Acct #${res.account_id} | Express=${res.express_balance}, Shielded=${res.shielded_balance}`,
+      `Credited Acct #${res.account_id} | Express=${res.express_balance} (+${res.express_credited ?? 0}), Shielded +${res.shielded_credited ?? 0} (use POST /balance/private to inspect)`,
       'ok'
     );
     document.getElementById('i-acct').value = res.account_id;
-    await Promise.all([refreshStatus(), refreshPeers(), loadBalance()]);
+    document.getElementById('reg-acct').value = res.account_id;
+    unlockedPrivateCache = null;
+    await Promise.all([refreshStatus(), refreshPeers(), loadBalance(true)]);
   } catch (err) {
     setOut('f-out', 'Error: ' + err.message, 'err');
   }
 }
 
 async function doExpress() {
+  let key = null;
   try {
+    const sender = parseInt(document.getElementById('e-from').value, 10) || 0;
+    const recipient = parseInt(document.getElementById('e-to').value, 10) || 0;
+    const amount = parseInt(document.getElementById('e-amt').value, 10) || 0;
+    key = consumeOneTimeAuthKey(sender);
+    const tagHex = computeAuthTagHex(AUTH_DOMAIN_EXPRESS, sender, recipient, amount, 0, key.pad_id, key.r, key.s);
+    const padId = key.pad_id;
+    burnKeyMaterial(key);
+    key = null;
+
     const res = await api('/tx/express', 'POST', {
-      sender: parseInt(document.getElementById('e-from').value, 10) || 0,
-      recipient: parseInt(document.getElementById('e-to').value, 10) || 0,
-      amount: parseInt(document.getElementById('e-amt').value, 10) || 0
+      sender,
+      recipient,
+      amount,
+      pad_id: padId,
+      auth_pad_id: padId,
+      auth_tag: tagHex
     });
     setOut(
       'e-out',
-      `Block #${res.block_height} finalized (Leader V${res.leader_id}) | Burned ${res.burned_vern} vern`,
+      `Block #${res.block_height} finalized (Leader V${res.leader_id}) | Burned ${res.burned_vern} vern | CW-MAC pad #${padId} burned`,
       'ok'
     );
     await Promise.all([refreshStatus(), refreshPeers(), loadBalance()]);
   } catch (err) {
+    burnKeyMaterial(key);
     setOut('e-out', 'Error: ' + err.message, 'err');
   }
 }
@@ -1563,24 +1660,49 @@ function updateShieldedHint() {
   const bkt = parseInt(document.getElementById('s-bkt').value, 10) || 0;
   const slot = parseInt(document.getElementById('s-slot').value, 10) || 0;
   const target = bkt * 16 + slot;
-  setOut('s-out', `Target Account #${target} (Bucket ${bkt}, Slot ${slot}) \u2014 blinded from all validators.`, '');
+  setOut('s-out', `Target Account #${target} (Bucket ${bkt}, Slot ${slot}) \u2014 requires registered CW-MAC key for Sender ID.`, '');
 }
 
 async function doShielded() {
+  let key = null;
   try {
+    const sender = parseInt(document.getElementById('s-from').value, 10) || 0;
+    const recipient_bucket = parseInt(document.getElementById('s-bkt').value, 10) || 0;
+    const recipient_slot = parseInt(document.getElementById('s-slot').value, 10) || 0;
+    const amount = parseInt(document.getElementById('s-amt').value, 10) || 0;
+    key = consumeOneTimeAuthKey(sender);
+    const tagHex = computeAuthTagHex(
+      AUTH_DOMAIN_SHIELDED,
+      sender,
+      recipient_bucket,
+      recipient_slot,
+      amount,
+      key.pad_id,
+      key.r,
+      key.s
+    );
+    const padId = key.pad_id;
+    burnKeyMaterial(key);
+    key = null;
+
     const res = await api('/tx/shielded', 'POST', {
-      sender: parseInt(document.getElementById('s-from').value, 10) || 0,
-      recipient_bucket: parseInt(document.getElementById('s-bkt').value, 10) || 0,
-      recipient_slot: parseInt(document.getElementById('s-slot').value, 10) || 0,
-      amount: parseInt(document.getElementById('s-amt').value, 10) || 0
+      sender,
+      recipient_bucket,
+      recipient_slot,
+      amount,
+      pad_id: padId,
+      auth_pad_id: padId,
+      auth_tag: tagHex
     });
+    unlockedPrivateCache = null;
     setOut(
       's-out',
-      `Blinded IT-MPC settled (${res.triples_consumed} triples) | Burned ${res.burned_vern} vern | Pool: ${res.beaver_pool_remaining}`,
+      `Blinded IT-MPC settled (${res.triples_consumed} triples) | Burned ${res.burned_vern} vern | Pool: ${res.beaver_pool_remaining} | CW-MAC pad #${padId} burned`,
       'ok'
     );
-    await Promise.all([refreshStatus(), refreshPeers(), loadBalance()]);
+    await Promise.all([refreshStatus(), refreshPeers(), loadBalance(true)]);
   } catch (err) {
+    burnKeyMaterial(key);
     setOut('s-out', 'Error: ' + err.message, 'err');
   }
 }
@@ -1599,10 +1721,15 @@ function initQuickConnect() {
 
   document.getElementById('qc-origin-pill').textContent = rawHost;
 
-  document.getElementById('cmd-install').textContent =
-    `curl -fsSL ${tlsProto}//raw.githubusercontent.com/gpt4omni/vernam/main/deploy/install.sh | bash\n` +
+  document.getElementById('cmd-pop-miner').textContent =
     `export VRNM_NODE="${origin}"\n` +
-    `vrnm wallet status --node "$VRNM_NODE"`;
+    `vrnm miner --cores 1 --node "$VRNM_NODE"`;
+
+  document.getElementById('cmd-install').textContent =
+    `git clone ${tlsProto}//github.com/gpt4omni/vernam.git\n` +
+    `cd vernam && cargo build --release --offline\n` +
+    `export VRNM_NODE="${origin}"\n` +
+    `./target/release/vernam-rs wallet status --node "$VRNM_NODE"`;
 
   document.getElementById('cmd-wallet').textContent =
     `export VRNM_NODE="${origin}"\n` +
@@ -1618,7 +1745,7 @@ function initQuickConnect() {
   document.getElementById('cmd-node').textContent =
     `# Join decentralized P2P mesh:\n` +
     `vrnm node --bind 0.0.0.0:8080 --advertise <YOUR_IP>:8080 --seed ${seedHostPort}\n` +
-    `# Or run 1-core Proof-of-Pad (PoP) miner:\n` +
+    `# Or run interactive PoP miner (POST /pop/commit -> POST /pop/submit):\n` +
     `vrnm miner --cores 1 --node "$VRNM_NODE"`;
 }
 
@@ -1652,6 +1779,7 @@ async function tick() {
 }
 
 initQuickConnect();
+updateSessionKeySummary();
 tick();
 setInterval(tick, 3000);
 </script>
@@ -1668,50 +1796,81 @@ mod tests {
         assert!(VERNAM_EXPLORER_HTML.starts_with("<!DOCTYPE html>"));
         assert!(VERNAM_EXPLORER_HTML.contains("</html>"));
         assert!(VERNAM_EXPLORER_HTML.contains("Vernam (VRNM) Live Testnet Explorer"));
-        assert!(VERNAM_EXPLORER_HTML.contains("Vernam (VRNM) Testnet v0.4"));
+        assert!(VERNAM_EXPLORER_HTML.contains("Vernam (VRNM) Testnet v2.2"));
         assert!(VERNAM_EXPLORER_HTML.contains("100% OTP"));
         assert!(VERNAM_EXPLORER_HTML.contains("Immune to Quantum"));
         assert!(VERNAM_EXPLORER_HTML.contains("21,000,000 VRNM"));
+        assert!(VERNAM_EXPLORER_HTML.contains("MIT License"));
     }
 
     #[test]
-    fn test_explorer_contains_all_required_endpoints() {
+    fn test_explorer_contains_all_v22_authenticated_endpoints() {
         let required_endpoints = [
             "/status",
             "/p2p/peers",
-            "/pop/mine",
-            "/epoch/refresh",
+            "/account/register",
             "/faucet",
             "/tx/express",
             "/tx/shielded",
             "/balance/",
+            "/balance/private",
+            "/pop/commit",
+            "/pop/submit",
         ];
         for ep in required_endpoints {
             assert!(
                 VERNAM_EXPLORER_HTML.contains(ep),
-                "explorer HTML missing required endpoint call: {ep}"
+                "explorer HTML missing required v2.2.0 endpoint: {ep}"
             );
         }
     }
 
     #[test]
-    fn test_explorer_inspects_all_four_shamir_shares_and_quick_connect() {
-        for share_field in [
+    fn test_explorer_privacy_redaction_and_cw_mac_client_signing() {
+        // Must NEVER leak raw validator Shamir shares over unauthenticated GET /balance/<id>
+        for leaked_field in [
             "v0_shamir_share",
             "v1_shamir_share",
             "v2_shamir_share",
             "v3_shamir_share",
         ] {
             assert!(
-                VERNAM_EXPLORER_HTML.contains(share_field),
-                "explorer HTML missing Shamir share field: {share_field}"
+                !VERNAM_EXPLORER_HTML.contains(leaked_field),
+                "explorer HTML must not expect unauthenticated raw share leak field: {leaked_field}"
             );
         }
 
+        // Explicit privacy-preserving redaction banners & authenticated private balance unlock
+        assert!(VERNAM_EXPLORER_HTML.contains("SHIELDED BALANCE: REDACTED"));
+        assert!(VERNAM_EXPLORER_HTML.contains("RAW SHAMIR SHARES: REDACTED"));
+        assert!(VERNAM_EXPLORER_HTML.contains("POST /balance/private"));
+        assert!(VERNAM_EXPLORER_HTML.contains("POST /account/register"));
+
+        // Canonical pure-JS BigInt F_(2^127-1) CW-MAC signing + one-time key burn
+        assert!(VERNAM_EXPLORER_HTML.contains("const PRIME_P = (1n << 127n) - 1n;"));
+        assert!(VERNAM_EXPLORER_HTML.contains("function computeAuthTagHex("));
+        assert!(VERNAM_EXPLORER_HTML.contains("AUTH_DOMAIN_EXPRESS = 1"));
+        assert!(VERNAM_EXPLORER_HTML.contains("AUTH_DOMAIN_SHIELDED = 2"));
+        assert!(VERNAM_EXPLORER_HTML.contains("AUTH_DOMAIN_BALANCE = 3"));
+        assert!(VERNAM_EXPLORER_HTML.contains("sessionAuthKeys"));
+        assert!(VERNAM_EXPLORER_HTML.contains("burnKeyMaterial"));
+    }
+
+    #[test]
+    fn test_explorer_pop_remote_mining_and_inspect_first_cli() {
+        assert!(VERNAM_EXPLORER_HTML.contains("POST /pop/commit"));
+        assert!(VERNAM_EXPLORER_HTML.contains("POST /pop/submit"));
+        assert!(VERNAM_EXPLORER_HTML.contains("vrnm miner"));
         assert!(VERNAM_EXPLORER_HTML.contains("window.location.origin"));
         assert!(VERNAM_EXPLORER_HTML.contains("vrnm wallet create"));
+        assert!(VERNAM_EXPLORER_HTML.contains("vrnm wallet send-private"));
         assert!(VERNAM_EXPLORER_HTML.contains("vrnm node --bind 0.0.0.0:8080 --advertise"));
         assert!(VERNAM_EXPLORER_HTML.contains("setInterval(tick, 3000)"));
+        assert!(VERNAM_EXPLORER_HTML.contains("88.216.62.115:8080"));
+        assert!(
+            !VERNAM_EXPLORER_HTML.contains("| bash"),
+            "explorer Quick Join CLI must use inspect-first git clone, not curl | bash"
+        );
     }
 
     #[test]
@@ -1737,31 +1896,10 @@ mod tests {
     }
 
     #[test]
-    fn test_pop_audit_badges_fail_closed_and_read_real_fields() {
-        assert!(
-            !VERNAM_EXPLORER_HTML.contains("usedFallback ? true : true"),
-            "PoP badges must never default to true on missing fields"
-        );
-        assert!(VERNAM_EXPLORER_HTML.contains("audit.beaver_verified === true"));
-        assert!(VERNAM_EXPLORER_HTML.contains("passedVals === auditedVals"));
-        assert!(VERNAM_EXPLORER_HTML.contains("Math.abs(audit.monobit_z) <= 6.0"));
-        assert!(VERNAM_EXPLORER_HTML.contains("Math.abs(audit.runs_z) <= 6.0"));
-    }
-
-    #[test]
-    fn test_pop_asi_telemetry_badges_fail_closed_and_posture_bar() {
-        // Strict fail-closed ASI PoP telemetry checks
-        assert!(VERNAM_EXPLORER_HTML.contains("audit.beacon_paired_verified === true"));
-        assert!(VERNAM_EXPLORER_HTML.contains("audit.bilateral_receipts_verified === true"));
-        assert!(VERNAM_EXPLORER_HTML.contains("beacon_gamma"));
-        assert!(VERNAM_EXPLORER_HTML.contains("anti_replay_tracked_pads"));
-        assert!(VERNAM_EXPLORER_HTML.contains("BEACON-PAIRED"));
-        assert!(VERNAM_EXPLORER_HTML.contains("CO-SIGNED"));
-        assert!(VERNAM_EXPLORER_HTML.contains("Awaiting Epoch"));
-
-        // ASI Security Posture bar pills
+    fn test_security_posture_bar_pills() {
         for pill in [
             "Zero External Crates",
+            "Owner CW-MAC Auth",
             "Information-Theoretic Privacy",
             "Branchless F_(2^127-1)",
             "Sattolo Beacon Pairing",
@@ -1770,13 +1908,8 @@ mod tests {
         ] {
             assert!(
                 VERNAM_EXPLORER_HTML.contains(pill),
-                "explorer HTML missing ASI security posture pill: {pill}"
+                "explorer HTML missing security posture pill: {pill}"
             );
         }
-
-        // Quick Join / Copy-Paste CLI onboarding kit
-        assert!(VERNAM_EXPLORER_HTML.contains("88.216.62.115:8080"));
-        assert!(VERNAM_EXPLORER_HTML.contains("vrnm wallet send-private"));
-        assert!(VERNAM_EXPLORER_HTML.contains("vrnm miner"));
     }
 }

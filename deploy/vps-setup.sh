@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Vernam (VRNM) Testnet — 1-Command Ubuntu/Debian VPS Installer
+# Vernam (VRNM) v2.2.0 Testnet — ROOT VPS PROVISIONING SCRIPT
 #
-# Idempotent setup script that installs prerequisites, builds `vrnm` in release
-# mode, configures a hardened systemd service, opens UFW port 8080 if active,
-# verifies `/health`, and prints connection details + sample wallet commands.
+# NOTE: This is a root server provisioning script for Ubuntu/Debian VPS hosts
+# (installs system packages, builds /usr/local/bin/vrnm, creates the `vernam`
+# system user, installs a hardened systemd service, and configures UFW).
+# It is NOT a desktop/client installer — for user-space CLI installation without
+# sudo, inspect and run `deploy/install.sh` instead.
 #
-# Usage:
+# Inspect-first usage (do NOT pipe unverified remote scripts to sudo bash):
+#   git clone https://github.com/gpt4omni/vernam.git
+#   cd vernam
+#   less deploy/vps-setup.sh
 #   sudo bash deploy/vps-setup.sh
-#   # or remotely:
-#   curl -fsSL https://raw.githubusercontent.com/gpt4omni/vernam/main/deploy/vps-setup.sh | sudo bash
 #
 # Optional environment overrides:
 #   VRNM_REPO_URL  (default: https://github.com/gpt4omni/vernam.git)
@@ -94,24 +97,33 @@ ensure_rust() {
         source "/root/.cargo/env"
     fi
 
-    if ! command -v cargo >/dev/null 2>&1; then
-        log "Installing Rust toolchain via rustup..."
-        curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-        # shellcheck disable=SC1091
-        source "${HOME}/.cargo/env"
+    if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+        warn "Rust / Cargo toolchain not found. This script does NOT execute unverified remote curl|sh installers."
+        cat >&2 <<'EOF'
+
+Please install Rust >= 1.85 (edition 2024) manually first — e.g. via your OS
+package manager (`apt install rustc cargo` if >= 1.85) or a verified rustup
+installer from https://rustup.rs — then re-run:
+
+  sudo bash deploy/vps-setup.sh
+EOF
+        exit 1
     fi
 
     # Edition 2024 requires Rust >= 1.85
-    local rustc_ver minor_ver
+    local rustc_ver major_ver minor_ver
     rustc_ver="$(rustc --version | awk '{print $2}')"
+    major_ver="$(printf '%s' "${rustc_ver}" | cut -d. -f1)"
     minor_ver="$(printf '%s' "${rustc_ver}" | cut -d. -f2)"
-    if [[ "${minor_ver}" =~ ^[0-9]+$ ]] && (( minor_ver < 85 )); then
-        if command -v rustup >/dev/null 2>&1; then
-            log "Updating Rust (${rustc_ver} < 1.85 required for edition 2024)..."
-            rustup update stable
-            rustup default stable
-        else
-            err "Rust ${rustc_ver} is too old for edition 2024 (requires >= 1.85). Please upgrade Rust."
+    if [[ "${major_ver}" =~ ^[0-9]+$ ]] && [[ "${minor_ver}" =~ ^[0-9]+$ ]]; then
+        if (( major_ver < 1 || (major_ver == 1 && minor_ver < 85) )); then
+            if command -v rustup >/dev/null 2>&1; then
+                log "Updating Rust (${rustc_ver} < 1.85 required for edition 2024)..."
+                rustup update stable
+                rustup default stable
+            else
+                err "Rust ${rustc_ver} is too old for edition 2024 (requires >= 1.85). Please upgrade Rust."
+            fi
         fi
     fi
 
@@ -126,7 +138,7 @@ resolve_source_dir() {
         candidate="${PWD}"
     fi
 
-    # 2. Check directory containing this script (when executed from disk, not piped via curl)
+    # 2. Check directory containing this script
     if [[ -z "${candidate}" ]] && [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ -f "${BASH_SOURCE[0]}" ]]; then
         local script_dir parent_dir
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -323,7 +335,7 @@ print_summary() {
     cat <<EOF
 
 ====================================================================
-  Vernam (VRNM) Testnet Node is LIVE!
+  Vernam (VRNM) v2.2.0 Testnet Node is LIVE!
 ====================================================================
 
   Dashboard URL : ${node_url}
@@ -345,7 +357,7 @@ print_summary() {
     vrnm wallet status --node "\$VRNM_NODE"
 
   SECURITY NOTE:
-    - For public production use, put Caddy or Nginx with HTTPS in front.
+    - Front :${VRNM_PORT} with HTTPS (see deploy/Caddyfile) before handling real auth keys.
     - NEVER restore an old snapshot/backup of burned OTP WAL pad files!
 ====================================================================
 EOF
