@@ -1161,6 +1161,43 @@ impl ShardedPrivateLedger {
         self.epoch
     }
 
+    /// Restore the proactive secret sharing epoch counter from a verified on-disk snapshot.
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch.max(1);
+    }
+
+    /// Restore verified canonical Shamir shares for `(bucket_id, slot)` from crash-safe storage.
+    ///
+    /// Rejects out-of-bounds indices, wrong share counts, non-canonical `>= PRIME_P` elements,
+    /// and shares that fail Lagrange degree-consistency verification.
+    pub fn restore_slot_shares(
+        &mut self,
+        bucket_id: usize,
+        slot: usize,
+        shares: &[u128],
+    ) -> Result<(), MpcError> {
+        let bucket = self
+            .buckets
+            .get_mut(bucket_id)
+            .ok_or(MpcError::InvalidParameters("restored bucket_id out of bounds"))?;
+        if slot >= bucket.balances.len() {
+            return Err(MpcError::InvalidParameters("restored slot out of bounds"));
+        }
+        if shares.len() != self.cache.num_validators() {
+            return Err(MpcError::InvalidParameters(
+                "restored share count does not match committee size",
+            ));
+        }
+        if shares.iter().any(|&s| s >= PRIME_P) {
+            return Err(MpcError::InvalidParameters(
+                "restored Shamir share >= PRIME_P",
+            ));
+        }
+        self.cache.verify_shares(shares)?;
+        bucket.balances[slot] = shares.to_vec();
+        Ok(())
+    }
+
     /// Fixed size `K` of each anonymity bucket.
     #[inline]
     pub fn bucket_size(&self) -> usize {

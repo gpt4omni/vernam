@@ -1,16 +1,17 @@
-//! Vernam (`VRNM`) v0.4 Self-Contained Dark-Mode Web Explorer & Testnet Dashboard.
+//! Vernam (`VRNM`) v1.2 ASI-Hardened Self-Contained Dark-Mode Web Explorer & Testnet Dashboard.
 //!
 //! Zero external crates and zero external CDN script/stylesheet dependencies so the
 //! explorer renders instantaneously even on offline, LAN, or air-gapped deployments.
 //!
 //! Exports [`VERNAM_EXPLORER_HTML`] for serving at `GET /`.
 
-/// Complete self-contained HTML5 + CSS + vanilla JS dashboard for Vernam (`VRNM`) Testnet v0.4.
+/// Complete self-contained HTML5 + CSS + vanilla JS dashboard for Vernam (`VRNM`) Testnet v1.2.
 ///
 /// Consumes the node's live HTTP/1.1 JSON endpoints:
 /// - `GET /status` — BFT block height, Express/Shielded txs, PSS epoch, QKD QBER, tokenomics & events
 /// - `GET /p2p/peers` — Decentralized P2P gossip peer mesh (with graceful fallback to local `V0..V3`)
-/// - `POST /pop/mine` — Proof-of-Pad entropy audit & epoch mining (with fallback to `POST /epoch/refresh`)
+/// - `POST /pop/mine` — Beacon-paired bilateral Proof-of-Pad audit & epoch mining (`beacon_gamma`,
+///   `beacon_paired_verified`, `bilateral_receipts_verified`, `anti_replay_tracked_pads`, with fallback to `POST /epoch/refresh`)
 /// - `POST /faucet` — Express BFT + Shielded Shamir faucet drip
 /// - `POST /tx/express` — 2-Phase OTP + Carter-Wegman BFT transfer
 /// - `POST /tx/shielded` — Blinded IT-MPC Beaver-triple transfer over `F_(2^127 - 1)`
@@ -197,6 +198,55 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   @keyframes pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
     50% { opacity: 0.35; transform: scale(0.88); }
+  }
+
+  /* ASI Security Posture Bar */
+  .posture-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 16px;
+    margin-bottom: 20px;
+    border-radius: 13px;
+    background: linear-gradient(90deg, rgba(11, 22, 40, 0.94), rgba(8, 17, 32, 0.9));
+    border: 1px solid rgba(34, 211, 238, 0.24);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.24);
+  }
+
+  .posture-title {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: var(--cyan);
+    padding-right: 8px;
+    border-right: 1px solid var(--border-bright);
+    margin-right: 2px;
+  }
+
+  .posture-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(16, 185, 129, 0.08);
+    border: 1px solid rgba(16, 185, 129, 0.28);
+    color: #a7f3d0;
+  }
+
+  .posture-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--emerald);
+    box-shadow: 0 0 6px rgba(16, 185, 129, 0.85);
+    flex-shrink: 0;
   }
 
   /* 6 KPI Cards */
@@ -470,6 +520,16 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     font-family: var(--mono);
     font-size: 11.5px;
     color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .audit-val.has-tip {
+    cursor: help;
+    color: var(--cyan);
+    text-decoration: underline dotted rgba(34, 211, 238, 0.45);
+    text-underline-offset: 2px;
   }
 
   .supply-box {
@@ -739,10 +799,10 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
       <div class="logo">V</div>
       <div>
         <div class="brand-title">
-          <h1>Vernam (VRNM) Testnet v0.4</h1>
-          <span class="version-tag">OTP + IT-MPC + QKD</span>
+          <h1>Vernam (VRNM) Testnet v1.2</h1>
+          <span class="version-tag">v1.2 ASI-HARDENED &bull; OTP + IT-MPC + QKD</span>
         </div>
-        <p class="brand-sub">Information-Theoretically Secure Ledger &bull; Carter-Wegman BFT &bull; Sharded Shamir Privacy &bull; Proof-of-Pad P2P Mesh</p>
+        <p class="brand-sub">Information-Theoretically Secure Ledger &bull; Carter-Wegman BFT &bull; Sharded Shamir Privacy &bull; Beacon-Paired PoP Mesh</p>
       </div>
     </div>
     <div class="banner-pills">
@@ -750,6 +810,17 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
       <span class="conn-pill" id="conn-pill"><span class="dot"></span><span id="conn-label">LIVE</span></span>
     </div>
   </header>
+
+  <!-- ASI Security Posture Bar -->
+  <section class="posture-bar" aria-label="ASI Security Posture">
+    <span class="posture-title">ASI Security Posture</span>
+    <span class="posture-pill"><span class="posture-dot"></span>Zero External Crates</span>
+    <span class="posture-pill"><span class="posture-dot"></span>Information-Theoretic Privacy</span>
+    <span class="posture-pill"><span class="posture-dot"></span>Branchless F_(2^127-1)</span>
+    <span class="posture-pill"><span class="posture-dot"></span>Sattolo Beacon Pairing</span>
+    <span class="posture-pill"><span class="posture-dot"></span>Anti-Replay Registry</span>
+    <span class="posture-pill"><span class="posture-dot"></span>/24 Eclipse Defense</span>
+  </section>
 
   <!-- 6 KPI Cards -->
   <section class="kpi-grid" aria-label="Network Key Performance Indicators">
@@ -859,6 +930,34 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
             <span class="status-badge status-ok" id="aud-qber">PASS</span>
           </div>
           <div class="audit-val" id="aud-qber-val">Threshold &lt; 11.0%</div>
+        </div>
+        <div class="audit-item">
+          <div class="audit-top">
+            <span class="audit-name">Threshold Beacon &Gamma;<sub>e</sub></span>
+            <span class="status-badge status-warn" id="aud-beacon-gamma">PENDING</span>
+          </div>
+          <div class="audit-val" id="aud-beacon-gamma-val" title="Awaiting Threshold Beacon Epoch">Awaiting Epoch</div>
+        </div>
+        <div class="audit-item">
+          <div class="audit-top">
+            <span class="audit-name">Beacon Pairing Verified</span>
+            <span class="status-badge status-warn" id="aud-beacon-pair">PENDING</span>
+          </div>
+          <div class="audit-val" id="aud-beacon-pair-val">Sattolo derangement check</div>
+        </div>
+        <div class="audit-item">
+          <div class="audit-top">
+            <span class="audit-name">Bilateral Peer Receipts</span>
+            <span class="status-badge status-warn" id="aud-bilateral">PENDING</span>
+          </div>
+          <div class="audit-val" id="aud-bilateral-val">Counterparty CW-MAC co-sign</div>
+        </div>
+        <div class="audit-item">
+          <div class="audit-top">
+            <span class="audit-name">Anti-Replay Tracked Pads</span>
+            <span class="status-badge status-warn" id="aud-anti-replay">PENDING</span>
+          </div>
+          <div class="audit-val" id="aud-anti-replay-val">0 tracked pad fingerprints</div>
         </div>
       </div>
 
@@ -975,15 +1074,23 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
     <div class="card">
       <div class="section-head">
         <div>
-          <h2>Quick-Connect Copy-Paste Kit</h2>
-          <p class="desc" style="margin-bottom:0;">Auto-configured for this live endpoint via <code>window.location.origin</code>.</p>
+          <h2>Quick Join / Copy-Paste CLI</h2>
+          <p class="desc" style="margin-bottom:0;">Auto-configured via <code>window.location.origin</code> (live testnet seed: <code>88.216.62.115:8080</code>).</p>
         </div>
         <span class="mini-pill" id="qc-origin-pill">ORIGIN</span>
       </div>
 
       <div class="cmd-block">
         <div class="cmd-head">
-          <span class="cmd-label">1. Connect Local <code>vrnm wallet</code> (Auto-Discover &amp; Failover)</span>
+          <span class="cmd-label">1. Install &amp; Connect to Live Testnet (<code>88.216.62.115:8080</code>)</span>
+          <button class="copy-btn" onclick="copySnippet('cmd-install', this)">Copy</button>
+        </div>
+        <pre class="cmd-code" id="cmd-install">Loading...</pre>
+      </div>
+
+      <div class="cmd-block">
+        <div class="cmd-head">
+          <span class="cmd-label">2. Create Wallet &amp; Claim Faucet</span>
           <button class="copy-btn" onclick="copySnippet('cmd-wallet', this)">Copy</button>
         </div>
         <pre class="cmd-code" id="cmd-wallet">Loading...</pre>
@@ -991,7 +1098,15 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
 
       <div class="cmd-block">
         <div class="cmd-head">
-          <span class="cmd-label">2. Join This Testnet as a Proof-of-Pad P2P Node</span>
+          <span class="cmd-label">3. Run Shielded IT-MPC Transfer</span>
+          <button class="copy-btn" onclick="copySnippet('cmd-shielded', this)">Copy</button>
+        </div>
+        <pre class="cmd-code" id="cmd-shielded">Loading...</pre>
+      </div>
+
+      <div class="cmd-block">
+        <div class="cmd-head">
+          <span class="cmd-label">4. Join P2P Mesh or Run PoP Miner</span>
           <button class="copy-btn" onclick="copySnippet('cmd-node', this)">Copy</button>
         </div>
         <pre class="cmd-code" id="cmd-node">Loading...</pre>
@@ -1014,7 +1129,7 @@ pub const VERNAM_EXPLORER_HTML: &str = r##"<!DOCTYPE html>
   </section>
 
   <footer>
-    Vernam (VRNM) Testnet v0.4 &bull; Zero External Dependencies &bull; Pure Information-Theoretic Security (OTP + Carter-Wegman + Shamir IT-MPC + BB84 QKD)
+    Vernam (VRNM) v1.2 ASI-Hardened Explorer (API compat: Vernam (VRNM) Testnet v0.4+) &bull; Zero External Dependencies &bull; Pure Information-Theoretic Security (OTP + Carter-Wegman + Shamir IT-MPC + BB84 QKD)
   </footer>
 </div>
 
@@ -1284,10 +1399,21 @@ async function runPopMine() {
     const qberVal = rawQber != null ? Number(rawQber) : NaN;
     const qberPass = Number.isFinite(qberVal) && qberVal >= 0 && qberVal <= 0.11;
 
+    const rawGamma = audit.beacon_gamma ?? res.beacon_gamma;
+    const hasBeaconGamma = typeof rawGamma === 'string' && /^0x[0-9a-fA-F]{32}$/.test(rawGamma);
+    const beaconPairedPass = audit.beacon_paired_verified === true;
+    const bilateralPass = audit.bilateral_receipts_verified === true;
+    const rawTrackedPads = audit.anti_replay_tracked_pads ?? res.anti_replay_tracked_pads;
+    const hasAntiReplay = typeof rawTrackedPads === 'number' && Number.isFinite(rawTrackedPads) && rawTrackedPads > 0;
+
     setAuditBadge('aud-monobit', Boolean(monobitPass));
     setAuditBadge('aud-runs', Boolean(runsPass));
     setAuditBadge('aud-beaver', Boolean(beaverPass));
     setAuditBadge('aud-qber', Boolean(qberPass));
+    setAuditBadge('aud-beacon-gamma', Boolean(hasBeaconGamma), 'VERIFIED', 'MISSING');
+    setAuditBadge('aud-beacon-pair', Boolean(beaconPairedPass), 'BEACON-PAIRED', 'UNPAIRED');
+    setAuditBadge('aud-bilateral', Boolean(bilateralPass), 'CO-SIGNED', 'UNVERIFIED');
+    setAuditBadge('aud-anti-replay', Boolean(hasAntiReplay), 'TRACKING', 'MISSING');
 
     if (hasMonobitZ) {
       document.getElementById('aud-monobit-val').textContent = 'Monobit z-score: ' + audit.monobit_z.toFixed(3) + ' (|z| <= 6.0)';
@@ -1317,17 +1443,56 @@ async function runPopMine() {
       ? 'Live QBER: ' + (qberVal * 100).toFixed(3) + '% (<= 11%)'
       : 'Missing QBER telemetry';
 
+    const gammaEl = document.getElementById('aud-beacon-gamma-val');
+    if (hasBeaconGamma) {
+      gammaEl.textContent = rawGamma.slice(0, 10) + '\u2026' + rawGamma.slice(-6);
+      gammaEl.title = 'Full Threshold Beacon Gamma_e: ' + rawGamma;
+      gammaEl.classList.add('has-tip');
+    } else {
+      gammaEl.textContent = usedFallback ? 'Unavailable on /epoch/refresh' : 'Awaiting Epoch';
+      gammaEl.title = 'Missing or unverified threshold beacon gamma';
+      gammaEl.classList.remove('has-tip');
+    }
+
+    document.getElementById('aud-beacon-pair-val').textContent = beaconPairedPass
+      ? 'Sattolo derangement verified'
+      : (usedFallback ? 'Unavailable on /epoch/refresh' : 'Beacon pairing check FAILED');
+
+    document.getElementById('aud-bilateral-val').textContent = bilateralPass
+      ? 'Counterparty CW-MACs verified'
+      : (usedFallback ? 'Unavailable on /epoch/refresh' : 'Bilateral receipts FAILED');
+
+    document.getElementById('aud-anti-replay-val').textContent = hasAntiReplay
+      ? Number(rawTrackedPads).toLocaleString() + ' pads fingerprinted'
+      : (usedFallback ? 'Unavailable on /epoch/refresh' : 'Anti-replay counter missing');
+
     const subsidy = res.subsidy_minted_vern ?? res.subsidy_vern ?? res.reward_vern ?? 0;
     const epochNum = res.settled_tokenomics_epoch ?? res.epoch ?? res.pss_epoch ?? 0;
     const pssEpoch = res.pss_epoch ?? epochNum;
-    const allOk = Boolean(monobitPass && runsPass && beaverPass && qberPass);
+    const allOk = Boolean(
+      monobitPass &&
+      runsPass &&
+      beaverPass &&
+      qberPass &&
+      hasBeaconGamma &&
+      beaconPairedPass &&
+      bilateralPass &&
+      hasAntiReplay
+    );
 
     pill.textContent = allOk ? 'AUDIT PASSED' : 'AUDIT WARNING';
     pill.className = 'mini-pill ' + (allOk ? 'emerald' : 'rose');
 
+    const gammaSummary = hasBeaconGamma
+      ? ` | \u0393=${rawGamma.slice(0, 10)}\u2026`
+      : '';
+    const replaySummary = hasAntiReplay
+      ? ` | Anti-Replay: ${Number(rawTrackedPads)} pads`
+      : '';
+
     setOut(
       'pop-out',
-      `Mined Epoch #${epochNum} (PSS #${pssEpoch}) | Subsidy: +${fmtVrnm(subsidy)} | QBER: ${(qberVal * 100).toFixed(3)}%` +
+      `Mined Epoch #${epochNum} (PSS #${pssEpoch}) | Subsidy: +${fmtVrnm(subsidy)} | QBER: ${(qberVal * 100).toFixed(3)}%${gammaSummary}${replaySummary}` +
       (usedFallback ? ' (via /epoch/refresh)' : ' (via /pop/mine)'),
       allOk ? 'ok' : 'err'
     );
@@ -1425,15 +1590,23 @@ async function doShielded() {
 }
 
 function initQuickConnect() {
+  const defaultSeed = '88.216.62.115:8080';
+  const proto = window.location.protocol === 'https:' ? 'https:' : 'http:';
   const origin = window.location.origin && window.location.origin !== 'null'
     ? window.location.origin
-    : 'localhost:8080';
-  const rawHost = window.location.host || '127.0.0.1:8080';
+    : (proto + '//' + defaultSeed);
+  const rawHost = window.location.host || defaultSeed;
   const seedHostPort = rawHost.includes(':')
     ? rawHost
     : rawHost + (window.location.protocol === 'https:' ? ':443' : ':80');
+  const tlsProto = 'https:';
 
   document.getElementById('qc-origin-pill').textContent = rawHost;
+
+  document.getElementById('cmd-install').textContent =
+    `curl -fsSL ${tlsProto}//raw.githubusercontent.com/gpt4omni/vernam/main/deploy/install.sh | bash\n` +
+    `export VRNM_NODE="${origin}"\n` +
+    `vrnm wallet status --node "$VRNM_NODE"`;
 
   document.getElementById('cmd-wallet').textContent =
     `export VRNM_NODE="${origin}"\n` +
@@ -1441,8 +1614,16 @@ function initQuickConnect() {
     `vrnm wallet faucet --name alice --node "$VRNM_NODE"\n` +
     `vrnm wallet balance --name alice --node "$VRNM_NODE"`;
 
+  document.getElementById('cmd-shielded').textContent =
+    `vrnm wallet create --name bob --node "$VRNM_NODE"\n` +
+    `vrnm wallet send-private --from alice --to bob --amount 25 --node "$VRNM_NODE"\n` +
+    `vrnm wallet balance --name bob --node "$VRNM_NODE"`;
+
   document.getElementById('cmd-node').textContent =
-    `vrnm node --bind 0.0.0.0:8080 --advertise <YOUR_IP>:8080 --seed ${seedHostPort}`;
+    `# Join decentralized P2P mesh:\n` +
+    `vrnm node --bind 0.0.0.0:8080 --advertise <YOUR_IP>:8080 --seed ${seedHostPort}\n` +
+    `# Or run 1-core Proof-of-Pad (PoP) miner:\n` +
+    `vrnm miner --cores 1 --node "$VRNM_NODE"`;
 }
 
 async function copySnippet(elId, btn) {
@@ -1569,5 +1750,37 @@ mod tests {
         assert!(VERNAM_EXPLORER_HTML.contains("passedVals === auditedVals"));
         assert!(VERNAM_EXPLORER_HTML.contains("Math.abs(audit.monobit_z) <= 6.0"));
         assert!(VERNAM_EXPLORER_HTML.contains("Math.abs(audit.runs_z) <= 6.0"));
+    }
+
+    #[test]
+    fn test_pop_asi_telemetry_badges_fail_closed_and_posture_bar() {
+        // Strict fail-closed ASI PoP telemetry checks
+        assert!(VERNAM_EXPLORER_HTML.contains("audit.beacon_paired_verified === true"));
+        assert!(VERNAM_EXPLORER_HTML.contains("audit.bilateral_receipts_verified === true"));
+        assert!(VERNAM_EXPLORER_HTML.contains("beacon_gamma"));
+        assert!(VERNAM_EXPLORER_HTML.contains("anti_replay_tracked_pads"));
+        assert!(VERNAM_EXPLORER_HTML.contains("BEACON-PAIRED"));
+        assert!(VERNAM_EXPLORER_HTML.contains("CO-SIGNED"));
+        assert!(VERNAM_EXPLORER_HTML.contains("Awaiting Epoch"));
+
+        // ASI Security Posture bar pills
+        for pill in [
+            "Zero External Crates",
+            "Information-Theoretic Privacy",
+            "Branchless F_(2^127-1)",
+            "Sattolo Beacon Pairing",
+            "Anti-Replay Registry",
+            "/24 Eclipse Defense",
+        ] {
+            assert!(
+                VERNAM_EXPLORER_HTML.contains(pill),
+                "explorer HTML missing ASI security posture pill: {pill}"
+            );
+        }
+
+        // Quick Join / Copy-Paste CLI onboarding kit
+        assert!(VERNAM_EXPLORER_HTML.contains("88.216.62.115:8080"));
+        assert!(VERNAM_EXPLORER_HTML.contains("vrnm wallet send-private"));
+        assert!(VERNAM_EXPLORER_HTML.contains("vrnm miner"));
     }
 }

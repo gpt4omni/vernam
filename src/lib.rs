@@ -1,4 +1,4 @@
-//! Vernam (VRNM) v1.0 — Zero-admin, 100% decentralized, information-theoretically secure OTP coin core.
+//! Vernam (VRNM) v1.2 — Zero-admin, 100% decentralized, information-theoretically secure OTP coin core.
 //!
 //! Zero external crates. Zero computational cryptography (no SHA-256, RSA, ECDSA, AES,
 //! or zk-SNARKs). Security rests solely on Shannon information theory and quantum mechanics.
@@ -10,14 +10,17 @@ pub mod entropy_beacon;
 pub mod explorer_ui;
 pub mod fast_engine;
 pub mod field;
+pub mod hw_entropy;
 pub mod otp;
 pub mod p2p_node;
 pub mod pop_mining;
 pub mod privacy_mpc;
 pub mod qkd;
+pub mod storage;
 pub mod testnet_server;
 pub mod tokenomics;
 pub mod turbo_crypto;
 pub mod turbo_express;
 pub mod turbo_shielded;
+pub mod validator_daemon;
 pub mod wallet;

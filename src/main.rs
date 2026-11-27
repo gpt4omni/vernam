@@ -16,6 +16,7 @@ use vernam_rs::dynamic_quorum::{
 use vernam_rs::entropy_beacon::{AutonomousEpochClock, BeaconConfig, OtpChannelKey, VernamBeacon};
 use vernam_rs::fast_engine::run_speed_benchmarks;
 use vernam_rs::field::random_field_elem;
+use vernam_rs::hw_entropy::{ContinuousHealthMonitor, discover_best_entropy_source};
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
 use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
 use vernam_rs::pop_mining::{
@@ -24,7 +25,7 @@ use vernam_rs::pop_mining::{
 };
 use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
 use vernam_rs::qkd::{
-    AttackProfile, Bb84Channel, BufferedQkdPool, PoolConfig, QkdKeyProvider,
+    AttackProfile, Bb84Channel, BufferedQkdPool, EntropySource, PoolConfig, QkdKeyProvider,
 };
 use vernam_rs::testnet_server::{TestnetConfig, TestnetServer, parse_json_u64};
 use vernam_rs::tokenomics::{
@@ -34,6 +35,9 @@ use vernam_rs::tokenomics::{
 use vernam_rs::turbo_crypto::run_turbo_crypto_bench;
 use vernam_rs::turbo_express::run_turbo_express_bench;
 use vernam_rs::turbo_shielded::run_turbo_shielded_bench;
+use vernam_rs::validator_daemon::{
+    ValidatorDaemonConfig, run_standalone_daemon_cli_with_max_epochs,
+};
 use vernam_rs::wallet::{DEFAULT_NODE_URL, VernamWallet, WalletRpcClient, validate_wallet_name};
 
 fn fmt_vrnm(verns: u64) -> String {
@@ -42,7 +46,7 @@ fn fmt_vrnm(verns: u64) -> String {
 
 fn print_help() {
     println!(
-        r#"Vernam (VRNM) v0.4 — Decentralized Pure-OTP & Proof-of-Pad Coin
+        r#"Vernam (VRNM) v1.2 — Zero-Admin, Information-Theoretically Secure OTP Coin
 
 USAGE:
   vrnm [COMMAND] [OPTIONS]
@@ -51,13 +55,18 @@ COMMANDS:
   demo                                  Run full 5-pillar showcase + speed benchmarks (default)
   v1-demo                               Run v1.0 zero-admin beacon, 4-daemon TCP MPC & 4->7 resharing demo
   bench                                 Run high-throughput Express, Shielded & real-TCP TPS benchmarks
-  testnet [--bind 0.0.0.0:8080]         Start all-in-one 4-validator HTTP testnet + web explorer
+  testnet [--bind 0.0.0.0:8080] [--data-dir <path>]
+                                        Start all-in-one 4-validator HTTP testnet + web explorer
+                                        (enables crash-safe Carter-Wegman on-disk persistence with --data-dir)
+  validator [--id 0] [--committee 4] [--bind 0.0.0.0:9100] [--http 127.0.0.1:9200] [--peers 1=ip:port,...] [--max-epochs N]
+                                        Start a single-share multi-host IT-MPC validator daemon
   node    [--id 0] [--bind 0.0.0.0:8080] [--advertise <IP:PORT>] [--seed <HOST:PORT> ...]
                                         Start an independent decentralized P2P validator node
                                         (auto-discovers all peers via seed gossip & syncs blocks)
-  pop-mine                              Run a standalone verified Proof-of-Pad (PoP) audit demo
+  pop-mine                              Run a standalone beacon-paired bilateral Proof-of-Pad (PoP) audit
   miner   [--id 0] [--cores 1] [--node <url>] [--rounds 1] [--interval 15] [--pages 16] [--triples 32]
                                         Run a 1-core (or N-core) Proof-of-Pad entropy & Beaver miner
+  hw-entropy                            Probe hardware QRNG (/dev/hwrng, VRNM_QRNG_DEVICE) + NIST SP 800-90B health test
   wallet create  --name <n> [--id <u32>] [--pages 16] [--node <url>] [--dir <path>]
   wallet status  [--name <n>] [--node <url>] [--dir <path>]
   wallet peers   [--node <url>]         Auto-discover all active peer nodes from any single seed
@@ -66,12 +75,14 @@ COMMANDS:
   wallet send    --from <n> --to <name|id> --amount <u64> [--node <url>]
   wallet send-private --from <n> --to <name|id> --amount <u64> [--node <url>]
   wallet refill  --name <n> [--pages 8]
-  wallet pop-mine [--node <url>]        Trigger verified Proof-of-Pad epoch mining on node
+  wallet pop-mine [--node <url>]        Trigger beacon-paired bilateral PoP epoch mining on node
   wallet refresh-epoch [--node <url>]
   help                                  Show this help message
 
 ENVIRONMENT:
   VRNM_BIND        Default listen address (default: 0.0.0.0:8080)
+  VRNM_DATA_DIR    Crash-safe on-disk persistence directory for `vrnm testnet`
+  VRNM_QRNG_DEVICE Hardware QRNG device path (e.g. /dev/hwrng, /dev/TrueRNG)
   VRNM_NODE        Default RPC/seed node URL for wallet commands (default: http://127.0.0.1:8080)
   VRNM_WALLET_DIR  Base directory for local wallets (default: ~/.vernam/wallets)
 "#
@@ -475,10 +486,76 @@ fn cmd_miner(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_validator(args: &[String]) -> Result<(), String> {
+    let mut cfg = ValidatorDaemonConfig::default();
+    if let Some(id) = get_flag(args, "--id") {
+        cfg.validator_id = id.parse::<u32>().map_err(|_| "invalid --id <u32>")?;
+    }
+    if let Some(c) = get_flag(args, "--committee") {
+        cfg.committee_size = c.parse::<usize>().map_err(|_| "invalid --committee <usize>")?;
+    }
+    if let Some(bind) = get_flag(args, "--bind") {
+        cfg.mpc_bind_addr = bind;
+    }
+    if let Some(http) = get_flag(args, "--http") {
+        cfg.http_bind_addr = Some(http);
+    }
+    if let Some(b) = get_flag(args, "--buckets") {
+        cfg.num_buckets = b.parse::<usize>().map_err(|_| "invalid --buckets <usize>")?;
+    }
+    for peer_arg in get_all_flags(args, "--peers") {
+        for item in peer_arg.split(',') {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some((id_str, addr)) = trimmed.split_once('=') else {
+                return Err(format!("invalid --peers entry '{trimmed}' (expected id=host:port)"));
+            };
+            let pid = id_str
+                .parse::<u32>()
+                .map_err(|_| format!("invalid peer validator id '{id_str}'"))?;
+            cfg.peer_mpc_addrs.push((pid, addr.to_string()));
+        }
+    }
+    let max_epochs = match get_flag(args, "--max-epochs") {
+        Some(s) => Some(s.parse::<u64>().map_err(|_| "invalid --max-epochs <u64>")?),
+        None => None,
+    };
+    run_standalone_daemon_cli_with_max_epochs(cfg, max_epochs)
+}
+
+fn cmd_hw_entropy() -> Result<(), String> {
+    println!("=== Vernam (VRNM) Hardware QRNG & NIST SP 800-90B Entropy Probe ===");
+    let mut source = discover_best_entropy_source();
+    println!("  Hardware QRNG Active : {}", source.is_hardware_backed());
+    println!("  Diagnostic           : {}", source.diagnostic());
+
+    let mut sample = [0u8; 256];
+    source
+        .fill_random(&mut sample)
+        .map_err(|e| format!("entropy source read failed: {e}"))?;
+    let mut monitor = ContinuousHealthMonitor::new();
+    let report = monitor
+        .check(&sample)
+        .map_err(|e| format!("NIST SP 800-90B health check failed: {e}"))?;
+    println!(
+        "  256B Health Gate     : PASS | monobit_z={:.3} runs_z={:.3} distinct_bytes={} max_rct_run={}",
+        report.monobit_z,
+        report.runs_z,
+        report.distinct_bytes,
+        report.max_consecutive_byte_run
+    );
+    Ok(())
+}
+
 fn cmd_testnet(args: &[String]) -> Result<(), String> {
     let mut cfg = TestnetConfig::default();
     if let Some(bind) = get_flag(args, "--bind") {
         cfg.bind_addr = bind;
+    }
+    if let Some(data_dir) = get_flag(args, "--data-dir") {
+        cfg.data_dir = Some(PathBuf::from(data_dir));
     }
     let server = TestnetServer::bind(cfg.clone())
         .map_err(|e| format!("failed to bind testnet server on {}: {e}", cfg.bind_addr))?;
@@ -486,8 +563,15 @@ fn cmd_testnet(args: &[String]) -> Result<(), String> {
         .local_addr()
         .map_err(|e| format!("local_addr error: {e}"))?;
     println!("========================================================================");
-    println!("  VERNAM (VRNM) v0.3 LIVE TESTNET NODE RUNNING");
+    println!("  VERNAM (VRNM) v1.2 LIVE TESTNET NODE RUNNING");
     println!("  Web Explorer & Faucet : http://{addr}/");
+    println!(
+        "  Crash-Safe Storage    : {}",
+        cfg.data_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(in-memory — pass --data-dir or VRNM_DATA_DIR to persist)".to_string())
+    );
     println!("  Health Check          : http://{addr}/health");
     println!("  JSON Telemetry        : http://{addr}/status");
     println!("  Validators            : 4 (V0..V3, N=3f+1, quorum=3, 100% pure OTP)");
@@ -1065,9 +1149,11 @@ fn main() {
             Ok(())
         }
         "testnet" => cmd_testnet(rest),
+        "validator" => cmd_validator(rest),
         "node" => cmd_node(rest),
         "pop-mine" => cmd_pop_mine(),
         "miner" => cmd_miner(rest),
+        "hw-entropy" => cmd_hw_entropy(),
         "wallet" => cmd_wallet(rest),
         "help" | "-h" | "--help" => {
             print_help();

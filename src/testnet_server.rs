@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,6 +31,10 @@ use crate::privacy_mpc::{
     DEFAULT_THRESHOLD, ShardedPrivateLedger,
 };
 use crate::qkd::{Bb84Channel, OsEntropySource, QkdKeyProvider};
+use crate::storage::{
+    CrashSafeChainStore, PersistedChainSnapshot, PersistedExpressAccount, PersistedShieldedSlot,
+    PersistedValidatorVault, SNAPSHOT_FORMAT_VERSION,
+};
 use crate::tokenomics::{
     EpochContribution, FeeLane, TokenomicsEngine, VERN_PER_VRNM, ValidatorStatus,
 };
@@ -112,16 +117,23 @@ pub struct TestnetConfig {
     pub num_buckets: usize,
     /// Maximum user account count exposed by the node (`0..max_accounts`, default `64`).
     pub max_accounts: usize,
+    /// Optional crash-safe on-disk persistence directory (defaults to `VRNM_DATA_DIR` if set).
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for TestnetConfig {
     fn default() -> Self {
         let bind_addr =
             std::env::var("VRNM_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        let data_dir = std::env::var("VRNM_DATA_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         Self {
             bind_addr,
             num_buckets: 4,
             max_accounts: 64,
+            data_dir,
         }
     }
 }
@@ -232,6 +244,10 @@ pub struct TestnetState {
     sender_nonces: BTreeMap<u32, u64>,
     /// External P2P nodes discovered via `POST /p2p/announce`: `addr -> (node_id, height, pop_score, qber)`.
     external_peers: BTreeMap<String, (u64, u64, u64, f64)>,
+    /// Optional crash-safe on-disk Carter-Wegman authenticated snapshot/WAL store.
+    store: Option<CrashSafeChainStore>,
+    /// Base block height restored from disk so BFT height indices start cleanly on restart.
+    restored_blocks_base: u64,
 }
 
 impl TestnetState {
@@ -248,13 +264,46 @@ impl TestnetState {
             ));
         }
 
+        // 0. Open optional crash-safe on-disk persistence store & load verified snapshot if present.
+        let store = match config.data_dir.as_ref() {
+            Some(dir) => Some(
+                CrashSafeChainStore::open(dir)
+                    .map_err(|e| format!("failed to open crash-safe chain store at {}: {e}", dir.display()))?,
+            ),
+            None => None,
+        };
+        let loaded_snapshot = if let Some(ref s) = store {
+            let (snap, _wal) = s
+                .load_latest()
+                .map_err(|e| format!("failed to verify on-disk chain snapshot: {e}"))?;
+            snap
+        } else {
+            None
+        };
+
         // 1. Initialize 4-validator Express BFT cluster with accounts 0..max_accounts + Treasury.
         let bft_config = BftConfig::default();
         let mut initial_balances = BTreeMap::new();
         for acct in 0..config.max_accounts as u32 {
             initial_balances.insert(acct, 0u64);
         }
-        initial_balances.insert(TREASURY_ACCOUNT_ID, TREASURY_INITIAL_BALANCE);
+        let mut restored_sender_nonces = BTreeMap::new();
+        let mut total_restored_express = 0u64;
+        if let Some(ref snap) = loaded_snapshot {
+            for acc in &snap.express_accounts {
+                if (acc.account_id as usize) < config.max_accounts {
+                    initial_balances.insert(acc.account_id, acc.balance);
+                    total_restored_express = total_restored_express.saturating_add(acc.balance);
+                }
+                if acc.nonce > 0 {
+                    restored_sender_nonces.insert(acc.account_id, acc.nonce);
+                }
+            }
+        }
+        initial_balances.insert(
+            TREASURY_ACCOUNT_ID,
+            TREASURY_INITIAL_BALANCE.saturating_sub(total_restored_express),
+        );
 
         let bft = BftCluster::new(
             bft_config,
@@ -265,8 +314,21 @@ impl TestnetState {
         );
 
         // 2. Initialize Sharded IT-MPC Shielded Ledger + auto-refilling BeaverPool.
-        let shielded_ledger = ShardedPrivateLedger::new_default(config.num_buckets)
+        let mut shielded_ledger = ShardedPrivateLedger::new_default(config.num_buckets)
             .map_err(|e| format!("failed to init ShardedPrivateLedger: {e}"))?;
+        if let Some(ref snap) = loaded_snapshot {
+            shielded_ledger.set_epoch(snap.pss_epoch);
+            for slot in &snap.shielded_slots {
+                shielded_ledger
+                    .restore_slot_shares(slot.bucket_id as usize, slot.slot_id as usize, &slot.shares)
+                    .map_err(|e| {
+                        format!(
+                            "failed to restore Shamir shares for bucket {} slot {}: {e}",
+                            slot.bucket_id, slot.slot_id
+                        )
+                    })?;
+            }
+        }
         let beaver_pool = BeaverPool::new_3_of_4(INITIAL_BEAVER_POOL_SIZE);
 
         // 3. Initialize live BB84 + Decoy-State QKD channel and perform genesis link calibration.
@@ -274,7 +336,7 @@ impl TestnetState {
         let mut init_qkd = qkd_channel
             .exchange_key(32)
             .map_err(|e| format!("genesis BB84 QKD check failed: {e}"))?;
-        let last_qber = init_qkd.qber;
+        let mut last_qber = init_qkd.qber;
         zeroize_slice(&mut init_qkd.alice_key);
         zeroize_slice(&mut init_qkd.bob_key);
 
@@ -292,6 +354,29 @@ impl TestnetState {
         // 5. Initialize Proof-of-Personhood Web-of-Trust registry (V0..V3, 1-human = 1-vote).
         let wot_registry = WebOfTrustRegistry::for_bft_config(&bft_config);
 
+        let (express_txs, shielded_txs, blocks_finalized, next_page_id, recent_events, restored_flag) =
+            if let Some(snap) = loaded_snapshot {
+                let q = f64::from_bits(snap.last_qber_bits);
+                if q.is_finite() && (0.0..=1.0).contains(&q) {
+                    last_qber = q;
+                }
+                let mut evs = snap.recent_events;
+                if evs.len() > MAX_RECENT_EVENTS {
+                    let excess = evs.len() - MAX_RECENT_EVENTS;
+                    evs.drain(0..excess);
+                }
+                (
+                    snap.express_txs,
+                    snap.shielded_txs,
+                    snap.blocks_finalized,
+                    snap.next_page_id.max(1),
+                    evs,
+                    true,
+                )
+            } else {
+                (0, 0, 0, 1, Vec::with_capacity(MAX_RECENT_EVENTS), false)
+            };
+
         let mut state = Self {
             config,
             bft,
@@ -301,24 +386,125 @@ impl TestnetState {
             tokenomics,
             pop_replay_registry: PopReplayRegistry::default(),
             wot_registry,
-            express_txs: 0,
-            shielded_txs: 0,
-            blocks_finalized: 0,
+            express_txs,
+            shielded_txs,
+            blocks_finalized,
             last_qber,
-            next_page_id: 1,
-            recent_events: Vec::with_capacity(MAX_RECENT_EVENTS),
-            sender_nonces: BTreeMap::new(),
+            next_page_id,
+            recent_events,
+            sender_nonces: restored_sender_nonces,
             external_peers: BTreeMap::new(),
+            store,
+            restored_blocks_base: blocks_finalized,
         };
 
-        state.push_event(format!(
-            "GENESIS: 4-validator BFT (V0..V3), {} shielded buckets ({} accounts), BB84 QBER={:.4}%",
-            state.config.num_buckets,
-            state.shielded_ledger.total_accounts(),
-            state.last_qber * 100.0
-        ));
+        if restored_flag {
+            state.push_event(format!(
+                "RECOVERED: restored crash-safe snapshot (height={}, express_txs={}, shielded_txs={}, pss_epoch={})",
+                state.blocks_finalized,
+                state.express_txs,
+                state.shielded_txs,
+                state.shielded_ledger.epoch()
+            ));
+        } else {
+            state.push_event(format!(
+                "GENESIS: 4-validator BFT (V0..V3), {} shielded buckets ({} accounts), BB84 QBER={:.4}%",
+                state.config.num_buckets,
+                state.shielded_ledger.total_accounts(),
+                state.last_qber * 100.0
+            ));
+            state.persist_snapshot();
+        }
 
         Ok(state)
+    }
+
+    /// Export a complete crash-safe snapshot of live Express, Shielded Shamir, and Tokenomics state.
+    pub fn export_snapshot(&self) -> PersistedChainSnapshot {
+        let mut express_accounts = Vec::with_capacity(self.config.max_accounts + 1);
+        for acct in 0..self.config.max_accounts as u32 {
+            let balance = self.bft.validators[0].ledger.balance_of(acct);
+            let nonce = self.sender_nonces.get(&acct).copied().unwrap_or(0);
+            if balance > 0 || nonce > 0 {
+                express_accounts.push(PersistedExpressAccount {
+                    account_id: acct,
+                    balance,
+                    nonce,
+                });
+            }
+        }
+        if let Some(&treasury_nonce) = self.sender_nonces.get(&TREASURY_ACCOUNT_ID)
+            && treasury_nonce > 0
+        {
+            express_accounts.push(PersistedExpressAccount {
+                account_id: TREASURY_ACCOUNT_ID,
+                balance: self.bft.validators[0].ledger.balance_of(TREASURY_ACCOUNT_ID),
+                nonce: treasury_nonce,
+            });
+        }
+
+        let num_buckets = self.shielded_ledger.num_buckets();
+        let bucket_size = self.shielded_ledger.bucket_size();
+        let mut shielded_slots = Vec::with_capacity(num_buckets * bucket_size);
+        for b in 0..num_buckets {
+            if let Ok(bucket) = self.shielded_ledger.bucket_shares(b) {
+                for (s, shares) in bucket.iter().enumerate() {
+                    shielded_slots.push(PersistedShieldedSlot {
+                        bucket_id: b as u32,
+                        slot_id: s as u32,
+                        shares: shares.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut validators = Vec::with_capacity(self.bft.validators.len());
+        for v in &self.bft.validators {
+            if let Some(vault) = self.tokenomics.vault(v.id as u64) {
+                let status_code = match vault.status {
+                    ValidatorStatus::Active => 0,
+                    ValidatorStatus::Offline => 1,
+                    ValidatorStatus::Jailed => 2,
+                    ValidatorStatus::Ejected => 3,
+                };
+                validators.push(PersistedValidatorVault {
+                    validator_id: v.id as u64,
+                    bond: vault.bond,
+                    reward_balance: vault.reward_balance,
+                    status_code,
+                    missed_epochs: 0,
+                });
+            }
+        }
+
+        PersistedChainSnapshot {
+            version: SNAPSHOT_FORMAT_VERSION,
+            blocks_finalized: self.blocks_finalized,
+            express_txs: self.express_txs,
+            shielded_txs: self.shielded_txs,
+            pss_epoch: self.shielded_ledger.epoch(),
+            tokenomics_epoch: self.tokenomics.current_epoch(),
+            circulating_supply: self.tokenomics.circulating_supply(),
+            total_burned: self.tokenomics.total_burned(),
+            total_fees_collected: 0,
+            next_page_id: self.next_page_id,
+            last_qber_bits: self.last_qber.to_bits(),
+            express_accounts,
+            shielded_slots,
+            validators,
+            recent_events: self.recent_events.clone(),
+        }
+    }
+
+    /// Persist the current node state atomically if on-disk persistence is configured.
+    pub fn persist_snapshot(&mut self) {
+        if self.store.is_none() {
+            return;
+        }
+        let snap = self.export_snapshot();
+        if let Some(ref mut store) = self.store {
+            let _ = store.save_snapshot(&snap);
+        }
     }
 
     /// Push a human-readable event into the capped ring buffer (`recent_events`, max 20 entries).
@@ -409,8 +595,8 @@ impl TestnetState {
                 .bft
                 .propose_and_finalize_batch(vec![tx])
                 .map_err(|e| format!("BFT faucet settlement failed: {e}"))?;
-            self.blocks_finalized = cert.height;
-            block_height = Some(cert.height);
+            self.blocks_finalized = self.restored_blocks_base.saturating_add(cert.height);
+            block_height = Some(self.blocks_finalized);
             self.record_online_validators_contribution(EpochContribution {
                 pad_pages_supplied: 1,
                 beaver_triples_contributed: 0,
@@ -438,6 +624,7 @@ impl TestnetState {
                 .map(|h| format!(" (BFT block #{h})"))
                 .unwrap_or_default()
         ));
+        self.persist_snapshot();
 
         Ok(FaucetReceipt {
             account_id,
@@ -495,7 +682,7 @@ impl TestnetState {
         });
 
         self.express_txs += 1;
-        self.blocks_finalized = cert.height;
+        self.blocks_finalized = self.restored_blocks_base.saturating_add(cert.height);
 
         let new_sender_bal = self.bft.validators[0].ledger.balance_of(sender);
         let new_recip_bal = self.bft.validators[0].ledger.balance_of(recipient);
@@ -503,14 +690,15 @@ impl TestnetState {
 
         self.push_event(format!(
             "EXPRESS BFT Block #{}: #{sender} -> #{recipient} ({amount} VRNM) | burned {} vern",
-            cert.height, fee.burn_share
+            self.blocks_finalized, fee.burn_share
         ));
+        self.persist_snapshot();
 
         Ok(ExpressTxReceipt {
             sender,
             recipient,
             amount,
-            block_height: cert.height,
+            block_height: self.blocks_finalized,
             leader_id: cert.leader_id,
             block_tag_hex,
             fee_vern: fee.total_fee,
@@ -622,6 +810,7 @@ impl TestnetState {
             "SHIELDED MPC: Acct #{sender} -> Bucket #{recipient_bucket} (recipient & amount blinded, {needed} triples) | burned {} vern",
             fee.burn_share
         ));
+        self.persist_snapshot();
 
         Ok(ShieldedTxReceipt {
             sender,
@@ -713,6 +902,7 @@ impl TestnetState {
             settlement.subsidy_minted,
             qber * 100.0
         ));
+        self.persist_snapshot();
 
         Ok(EpochRefreshReceipt {
             pss_epoch: new_pss_epoch,
@@ -785,6 +975,7 @@ impl TestnetState {
                 "\"num_buckets\":{},",
                 "\"bucket_size\":{},",
                 "\"max_accounts\":{},",
+                "\"persistence_enabled\":{},",
                 "\"validators\":{},",
                 "\"recent_events\":{}",
                 "}}"
@@ -805,6 +996,7 @@ impl TestnetState {
             self.shielded_ledger.num_buckets(),
             self.shielded_ledger.bucket_size(),
             self.config.max_accounts,
+            self.store.is_some(),
             validators_json,
             events_json,
         )
@@ -1931,7 +2123,7 @@ impl TestnetServer {
             ("GET", "/") => HttpResponse::html(VERNAM_EXPLORER_HTML.to_string()),
 
             ("GET", "/health") => HttpResponse::ok_json(
-                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"1.1.0\"}"
+                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"1.2.0\"}"
                     .to_string(),
             ),
 
@@ -2132,6 +2324,7 @@ impl TestnetServer {
                     report.settlement.subsidy_minted,
                     last_qber * 100.0
                 ));
+                guard.persist_snapshot();
                 HttpResponse::ok_json(format!(
                     "{{\"status\":\"mined\",\"epoch\":{},\"pss_epoch\":{},\"beacon_gamma\":\"0x{:032x}\",\"audited_validators\":{},\"passed_validators\":{},\"beaver_verified\":{},\"bilateral_receipts_verified\":{},\"beacon_paired_verified\":{},\"anti_replay_tracked_pads\":{},\"monobit_z\":{:.4},\"runs_z\":{:.4},\"qber\":{:.6},\"subsidy_minted_vern\":{},\"total_burned_vern\":{},\"circulating_supply_vern\":{}}}",
                     report.settlement.epoch,
@@ -2450,6 +2643,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 4,
             max_accounts: 64,
+            data_dir: None,
         };
         let server = TestnetServer::bind(config).expect("bind TestnetServer on ephemeral port");
         let addr = server.local_addr().expect("local_addr");
@@ -2465,7 +2659,7 @@ mod tests {
         assert!(headers.contains("Access-Control-Allow-Origin: *"));
         assert_eq!(
             body,
-            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"1.1.0"}"#
+            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"1.2.0"}"#
         );
 
         // 2. GET / (Dark-mode interactive explorer HTML)
@@ -2582,6 +2776,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 4,
             max_accounts: 64,
+            data_dir: None,
         };
         let mut state = TestnetState::new(config).expect("init TestnetState");
 
@@ -2624,6 +2819,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 4,
             max_accounts: 64,
+            data_dir: None,
         };
         let server = TestnetServer::bind(config).expect("bind server");
         let addr = server.local_addr().expect("local_addr");
@@ -2644,6 +2840,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 4,
             max_accounts: 64,
+            data_dir: None,
         };
         let state = Arc::new(Mutex::new(TestnetState::new(config).expect("init state")));
 
@@ -2741,6 +2938,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 2,
             max_accounts: 32,
+            data_dir: None,
         };
         let server = TestnetServer::bind(config).expect("bind server");
         let addr = server.local_addr().expect("local_addr");
@@ -2877,6 +3075,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 2,
             max_accounts: 32,
+            data_dir: None,
         };
         let server = TestnetServer::bind(config).expect("bind server");
         server.set_rate_limit(2);
@@ -2898,6 +3097,7 @@ mod tests {
             bind_addr: "127.0.0.1:0".to_string(),
             num_buckets: 2,
             max_accounts: 32,
+            data_dir: None,
         };
         let state = Arc::new(Mutex::new(TestnetState::new(config).expect("init state")));
 
@@ -2976,5 +3176,61 @@ mod tests {
             },
         );
         assert_eq!(resp_ssrf.status_code, 400);
+    }
+
+    #[test]
+    fn test_testnet_state_crash_safe_persistence_across_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "vernam_testnet_persist_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = TestnetConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            num_buckets: 4,
+            max_accounts: 64,
+            data_dir: Some(dir.clone()),
+        };
+
+        let (v0_share_before, v1_share_before) = {
+            let mut st = TestnetState::new(cfg.clone()).expect("init persistent testnet");
+            assert!(st.status_json().contains("\"persistence_enabled\":true"));
+            st.faucet(1, 1000, 500).expect("faucet acct 1");
+            st.express_transfer(1, 2, 250).expect("express 1->2");
+            st.shielded_transfer(1, 0, 2, 120).expect("shielded 1->2");
+            st.refresh_epoch().expect("refresh epoch");
+            let snap2 = st.account_balance(2).unwrap();
+            assert_eq!(snap2.express_balance, 250);
+            assert_eq!(snap2.shielded_balance, 120);
+            assert_eq!(snap2.epoch, 2);
+            (snap2.v0_shamir_share, snap2.v1_shamir_share)
+        }; // Simulated full server crash / process exit!
+
+        // Reopen from disk — balances, Shamir shares, heights, and PSS epoch MUST survive!
+        let mut recovered = TestnetState::new(cfg).expect("recover persistent testnet");
+        assert_eq!(recovered.blocks_finalized, 2);
+        assert_eq!(recovered.express_txs, 1);
+        assert_eq!(recovered.shielded_txs, 1);
+        let acct1 = recovered.account_balance(1).unwrap();
+        let acct2 = recovered.account_balance(2).unwrap();
+        assert_eq!(acct1.express_balance, 750);
+        assert_eq!(acct1.shielded_balance, 380);
+        assert_eq!(acct2.express_balance, 250);
+        assert_eq!(acct2.shielded_balance, 120);
+        assert_eq!(acct2.epoch, 2);
+        assert_eq!(acct2.v0_shamir_share, v0_share_before);
+        assert_eq!(acct2.v1_shamir_share, v1_share_before);
+
+        // Post-recovery BFT transfer must continue cleanly with monotonic height!
+        let tx = recovered
+            .express_transfer(2, 3, 50)
+            .expect("post-recovery express tx");
+        assert_eq!(tx.block_height, 3);
+        assert_eq!(recovered.account_balance(3).unwrap().express_balance, 50);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
