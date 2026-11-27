@@ -44,6 +44,8 @@ COMMANDS:
                                         Start an independent decentralized P2P validator node
                                         (auto-discovers all peers via seed gossip & syncs blocks)
   pop-mine                              Run a standalone verified Proof-of-Pad (PoP) audit demo
+  miner   [--id 0] [--cores 1] [--node <url>] [--rounds 1] [--interval 15] [--pages 16] [--triples 32]
+                                        Run a 1-core (or N-core) Proof-of-Pad entropy & Beaver miner
   wallet create  --name <n> [--id <u32>] [--pages 16] [--node <url>] [--dir <path>]
   wallet status  [--name <n>] [--node <url>] [--dir <path>]
   wallet peers   [--node <url>]         Auto-discover all active peer nodes from any single seed
@@ -240,6 +242,112 @@ fn cmd_pop_mine() -> Result<(), String> {
         fmt_vrnm(report.settlement.subsidy_minted),
         report.settlement.payouts.len()
     );
+    Ok(())
+}
+
+fn cmd_miner(args: &[String]) -> Result<(), String> {
+    let validator_id: u64 = match get_flag(args, "--id") {
+        Some(s) => s.parse::<u64>().map_err(|_| "invalid --id <u64>")?,
+        None => 0,
+    };
+    let cores: usize = match get_flag(args, "--cores") {
+        Some(s) => s.parse::<usize>().map_err(|_| "invalid --cores <usize>")?,
+        None => 1,
+    };
+    if cores == 0 {
+        return Err("--cores must be >= 1".to_string());
+    }
+    let pages: usize = match get_flag(args, "--pages") {
+        Some(s) => s.parse::<usize>().map_err(|_| "invalid --pages <usize>")?,
+        None => 16,
+    };
+    let triples: usize = match get_flag(args, "--triples") {
+        Some(s) => s.parse::<usize>().map_err(|_| "invalid --triples <usize>")?,
+        None => 32,
+    };
+    let rounds: usize = match get_flag(args, "--rounds") {
+        Some(s) => s.parse::<usize>().map_err(|_| "invalid --rounds <usize>")?,
+        None => 0, // 0 = run forever until Ctrl+C
+    };
+    let interval_secs: u64 = match get_flag(args, "--interval") {
+        Some(s) => s.parse::<u64>().map_err(|_| "invalid --interval <u64>")?,
+        None => 15,
+    };
+    let node_url = resolve_node_url(args, None);
+    let rpc = WalletRpcClient::new(&node_url).map_err(|e| format!("rpc: {e}"))?;
+
+    println!("========================================================================");
+    println!("  VERNAM (VRNM) PROOF-OF-PAD (PoP) ENTROPY MINER");
+    println!("  Validator ID : V{validator_id} | Worker Cores : {cores} (pinned 1-thread mode={})", cores == 1);
+    println!("  Target Node  : {node_url}");
+    println!("  Batch Size   : {pages} OTP pages ({} B) + {triples} Beaver triples / round", pages * FRAME_BYTES);
+    println!("========================================================================");
+
+    let mut round: usize = 0;
+    loop {
+        round += 1;
+        let t0 = Instant::now();
+        // Strictly single-threaded 1-core execution when cores == 1 (or parallel workers if > 1).
+        let (rcpt, total_pages, total_triples) = if cores == 1 {
+            let batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
+                .map_err(|e| format!("PoP mine failed: {e}"))?;
+            let challenge = PopAuditor::issue_challenge(validator_id, round as u64);
+            let proof = PopMiner::answer_challenge(&batch, &challenge).with_liveness(1, 1);
+            let rcpt = PopAuditor::verify_proof(&challenge, &proof)
+                .map_err(|e| format!("self-audit failed: {e}"))?;
+            (rcpt, pages, triples)
+        } else {
+            let mut results = Vec::with_capacity(cores);
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(cores);
+                for c in 0..cores {
+                    handles.push(s.spawn(move || -> Result<_, String> {
+                        let batch = PopMiner::mine_pad_batch(validator_id, pages, triples)
+                            .map_err(|e| format!("worker {c}: {e}"))?;
+                        let ch = PopAuditor::issue_challenge(validator_id, round as u64);
+                        let pr = PopMiner::answer_challenge(&batch, &ch).with_liveness(1, 1);
+                        PopAuditor::verify_proof(&ch, &pr).map_err(|e| format!("worker {c}: {e}"))
+                    }));
+                }
+                for h in handles {
+                    results.push(h.join().map_err(|_| "miner worker panicked".to_string())?);
+                }
+                Ok::<(), String>(())
+            })?;
+            let first = results.into_iter().next().unwrap()?;
+            (first, pages * cores, triples * cores)
+        };
+        let mine_ms = t0.elapsed().as_secs_f64() * 1_000.0;
+        let pads_per_sec = total_pages as f64 / (mine_ms / 1_000.0);
+        let triples_per_sec = total_triples as f64 / (mine_ms / 1_000.0);
+
+        let t_net = Instant::now();
+        let node_resp = rpc.mine_pop_epoch();
+        let net_ms = t_net.elapsed().as_secs_f64() * 1_000.0;
+
+        match node_resp {
+            Ok(json) => {
+                println!(
+                    "[Round #{round}] Local 1-core mine: {mine_ms:.1} ms ({pads_per_sec:.0} pads/s, {triples_per_sec:.0} triples/s) | \
+                     QBER={:.2}% monobit_z={:.2} runs_z={:.2} | Node submit: {net_ms:.1} ms -> {json}",
+                    rcpt.qkd_telemetry.qber * 100.0,
+                    rcpt.entropy_stats.monobit_z_score,
+                    rcpt.entropy_stats.runs_z_score,
+                );
+            }
+            Err(e) => {
+                println!(
+                    "[Round #{round}] Local mine OK ({mine_ms:.1} ms, QBER={:.2}%), node submit warning: {e}",
+                    rcpt.qkd_telemetry.qber * 100.0
+                );
+            }
+        }
+
+        if rounds > 0 && round >= rounds {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+    }
     Ok(())
 }
 
@@ -710,6 +818,7 @@ fn main() {
         "testnet" => cmd_testnet(rest),
         "node" => cmd_node(rest),
         "pop-mine" => cmd_pop_mine(),
+        "miner" => cmd_miner(rest),
         "wallet" => cmd_wallet(rest),
         "help" | "-h" | "--help" => {
             print_help();
