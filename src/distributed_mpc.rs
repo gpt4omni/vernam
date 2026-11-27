@@ -91,8 +91,26 @@ const FRAME_MAC_LEN: usize = 16;
 /// Maximum accepted binary wire frame payload size (4 MiB guard against malformed frames).
 const MAX_FRAME_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
+/// Maximum upfront buffer allocation before reading body bytes over TCP (prevents OOM from spoofed headers).
+const INITIAL_FRAME_ALLOC_CAP: usize = 8192;
+
+/// Maximum accepted payload length on unauthenticated initial handshake frames.
+const MAX_HANDSHAKE_PAYLOAD_BYTES: usize = 64;
+
+/// Maximum accepted payload length on authenticated client request frames.
+const MAX_CLIENT_PAYLOAD_BYTES: usize = 1024;
+
+/// Maximum accepted payload length on daemon-to-client reply frames.
+const MAX_DAEMON_REPLY_PAYLOAD_BYTES: usize = 64;
+
 /// Maximum simultaneous client worker threads per validator daemon.
 const MAX_CONCURRENT_CLIENTS: usize = 32;
+
+/// Maximum total simultaneous TCP connection worker threads per daemon (peers + clients + headroom).
+const MAX_TOTAL_CONNS: usize = DIST_NUM_VALIDATORS + MAX_CONCURRENT_CLIENTS + 16;
+
+/// Maximum pending in-flight rendezvous mailboxes per daemon (prevents memory exhaustion from rogue peers).
+const MAX_PENDING_MAILBOXES: usize = 1024;
 
 /// Socket read poll timeout allowing fast clean shutdown without busy-spinning.
 const SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(25);
@@ -545,6 +563,19 @@ impl OtpPadTape {
         Ok(())
     }
 
+    /// Burn `len` single-use OTP bytes in place via volatile zeroization with ZERO heap allocation.
+    fn burn_pad_bytes(&mut self, len: usize) {
+        let avail = self.remaining_pad_bytes();
+        let to_burn = len.min(avail);
+        if to_burn == 0 {
+            return;
+        }
+        let start = self.pad_pos;
+        let end = start + to_burn;
+        zeroize_slice(&mut self.pad_bytes[start..end]);
+        self.pad_pos = end;
+    }
+
     /// Allocate the next monotonic frame sequence number (sender side).
     fn next_send_seq(&mut self) -> u64 {
         let seq = self.next_seq;
@@ -587,6 +618,30 @@ pub struct WireFrameHeader {
     pub payload_len: u32,
 }
 
+/// Return the strict protocol upper bound on payload bytes for each valid wire `msg_type`,
+/// rejecting unknown message types immediately before any body buffer allocation.
+fn max_payload_for_msg_type(msg_type: u8) -> Result<usize, DistributedMpcError> {
+    match msg_type {
+        MSG_PEER_HELLO | MSG_CLIENT_HELLO => Ok(MAX_HANDSHAKE_PAYLOAD_BYTES),
+        MSG_PEER_RTT1 => Ok(Rtt1Payload::BYTE_LEN),
+        MSG_PEER_RTT2A => Ok(Rtt2aPayload::BYTE_LEN),
+        MSG_PEER_RTT2B => Ok(Rtt2bPayload::BYTE_LEN),
+        MSG_PEER_ABORT => Ok(16),
+        MSG_PEER_PSS_DELTA => Ok(MAX_FRAME_PAYLOAD_BYTES),
+        MSG_CLIENT_MINT => Ok(64),
+        MSG_CLIENT_TRANSFER => Ok(MAX_CLIENT_PAYLOAD_BYTES),
+        MSG_CLIENT_QUERY_BALANCE | MSG_CLIENT_PSS_REFRESH => Ok(32),
+        MSG_DAEMON_MINT_ACK
+        | MSG_DAEMON_TX_REPLY
+        | MSG_DAEMON_BALANCE_REPLY
+        | MSG_DAEMON_PSS_ACK
+        | MSG_DAEMON_ERROR => Ok(MAX_DAEMON_REPLY_PAYLOAD_BYTES),
+        _ => Err(DistributedMpcError::ProtocolError(format!(
+            "unknown wire frame msg_type 0x{msg_type:02x}"
+        ))),
+    }
+}
+
 impl WireFrameHeader {
     fn encode(&self) -> [u8; FRAME_HEADER_LEN] {
         let mut h = [0u8; FRAME_HEADER_LEN];
@@ -605,14 +660,17 @@ impl WireFrameHeader {
                 "invalid binary frame magic".to_string(),
             ));
         }
+        let msg_type = h[4];
+        let type_max = max_payload_for_msg_type(msg_type)?;
         let payload_len = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
-        if (payload_len as usize) > MAX_FRAME_PAYLOAD_BYTES {
+        let payload_len_usize = payload_len as usize;
+        if payload_len_usize > MAX_FRAME_PAYLOAD_BYTES || payload_len_usize > type_max {
             return Err(DistributedMpcError::ProtocolError(
                 "frame payload exceeds limit".to_string(),
             ));
         }
         Ok(Self {
-            msg_type: h[4],
+            msg_type,
             sender_id: h[5],
             flags: u16::from_le_bytes([h[6], h[7]]),
             seq_id: u64::from_le_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]),
@@ -674,8 +732,8 @@ pub fn encrypt_and_mac_frame(
     Ok(frame)
 }
 
-/// Verify sequence number and constant-time Carter-Wegman MAC on a raw binary wire frame,
-/// then decrypt its payload with the matching single-use OTP pad slice.
+/// Verify sequence number and constant-time Carter-Wegman MAC on a raw binary wire frame
+/// BEFORE allocating the decrypted payload buffer, then decrypt with the matching single-use OTP slice.
 pub fn verify_and_decrypt_frame(
     tape: &mut OtpPadTape,
     raw_frame: &[u8],
@@ -688,31 +746,49 @@ pub fn verify_and_decrypt_frame(
     let mut header_bytes = [0u8; FRAME_HEADER_LEN];
     header_bytes.copy_from_slice(&raw_frame[..FRAME_HEADER_LEN]);
     let header = WireFrameHeader::decode(&header_bytes)?;
-    let expected_total = FRAME_HEADER_LEN + (header.payload_len as usize) + FRAME_MAC_LEN;
+    let payload_len = header.payload_len as usize;
+    let body_end = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| DistributedMpcError::ProtocolError("frame length overflow".to_string()))?;
+    let expected_total = body_end
+        .checked_add(FRAME_MAC_LEN)
+        .ok_or_else(|| DistributedMpcError::ProtocolError("frame length overflow".to_string()))?;
     if raw_frame.len() != expected_total {
         return Err(DistributedMpcError::ProtocolError(
             "wire frame length mismatch".to_string(),
         ));
     }
+    if tape.remaining_mac_keys() == 0 {
+        return Err(DistributedMpcError::OtpPadExhausted {
+            needed: 1,
+            available: 0,
+        });
+    }
 
     tape.verify_and_advance_recv_seq(header.seq_id)?;
 
-    let body_end = FRAME_HEADER_LEN + (header.payload_len as usize);
     let mut received_tag = [0u8; FRAME_MAC_LEN];
     received_tag.copy_from_slice(&raw_frame[body_end..expected_total]);
 
-    // Consume MAC key and verify in constant time BEFORE decrypting (Encrypt-then-MAC).
+    // Consume MAC key and verify in constant time BEFORE allocating or decrypting (Encrypt-then-MAC).
     let (mut mac_r, mut mac_s) = tape.consume_mac_key()?;
     let computed_tag = carter_wegman_mac(mac_r, mac_s, &raw_frame[..body_end]);
     zeroize_u128(&mut mac_r);
     zeroize_u128(&mut mac_s);
 
     if !ct_eq_16(&computed_tag, &received_tag) {
-        // Burn the corresponding pad bytes anyway so a failed frame can never desync/reuse pad.
-        let mut burn = vec![0u8; header.payload_len as usize];
-        let _ = tape.apply_and_burn_pad(&mut burn);
-        zeroize_slice(&mut burn);
+        // Burn the corresponding pad bytes in place (zero heap allocation) so a failed frame
+        // can never desync or reuse pad material.
+        tape.burn_pad_bytes(payload_len);
         return Err(DistributedMpcError::MacVerificationFailed);
+    }
+
+    let avail = tape.remaining_pad_bytes();
+    if payload_len > avail {
+        return Err(DistributedMpcError::OtpPadExhausted {
+            needed: payload_len,
+            available: avail,
+        });
     }
 
     let mut payload = raw_frame[FRAME_HEADER_LEN..body_end].to_vec();
@@ -720,23 +796,41 @@ pub fn verify_and_decrypt_frame(
     Ok((header, payload))
 }
 
-/// Read one complete binary wire frame from a `TcpStream`, respecting `shutdown` on poll timeouts.
+/// Read one complete binary wire frame from a `TcpStream` with:
+/// - strict per-connection `max_payload` and per-`msg_type` header validation BEFORE allocating body memory,
+/// - incremental chunked allocation capped at `INITIAL_FRAME_ALLOC_CAP` (never upfront-allocates untrusted sizes),
+/// - per-frame `frame_timeout` activated as soon as byte #1 arrives so stalled/Slowloris peers cannot hang threads.
 ///
 /// Returns `Ok(None)` on clean EOF or shutdown before any bytes of the next frame were read.
 fn read_raw_frame(
     stream: &mut TcpStream,
     shutdown: Option<&AtomicBool>,
     deadline: Option<Instant>,
+    frame_timeout: Option<Duration>,
+    max_payload: usize,
 ) -> Result<Option<Vec<u8>>, DistributedMpcError> {
     let mut header_buf = [0u8; FRAME_HEADER_LEN];
     let mut got = 0usize;
+    let mut frame_deadline: Option<Instant> = None;
+
+    let effective_deadline = |dl: Option<Instant>, fdl: Option<Instant>| match (dl, fdl) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
     while got < FRAME_HEADER_LEN {
         if let Some(flag) = shutdown
             && flag.load(Ordering::Acquire)
         {
-            return Ok(None);
+            return if got == 0 {
+                Ok(None)
+            } else {
+                Err(DistributedMpcError::Shutdown)
+            };
         }
-        if let Some(dl) = deadline
+        if let Some(dl) = effective_deadline(deadline, frame_deadline)
             && Instant::now() >= dl
         {
             return Err(DistributedMpcError::Timeout("socket read frame header"));
@@ -750,7 +844,14 @@ fn read_raw_frame(
                     "unexpected EOF mid-header".to_string(),
                 ));
             }
-            Ok(n) => got += n,
+            Ok(n) => {
+                if got == 0
+                    && let Some(ft) = frame_timeout
+                {
+                    frame_deadline = Some(Instant::now() + ft);
+                }
+                got += n;
+            }
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock
                     || e.kind() == io::ErrorKind::TimedOut
@@ -763,30 +864,42 @@ fn read_raw_frame(
     }
 
     let header = WireFrameHeader::decode(&header_buf)?;
-    let rest_len = (header.payload_len as usize) + FRAME_MAC_LEN;
-    let mut frame = vec![0u8; FRAME_HEADER_LEN + rest_len];
-    frame[..FRAME_HEADER_LEN].copy_from_slice(&header_buf);
+    let payload_len = header.payload_len as usize;
+    if payload_len > max_payload {
+        return Err(DistributedMpcError::ProtocolError(
+            "frame payload exceeds connection limit".to_string(),
+        ));
+    }
+    let total = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|v| v.checked_add(FRAME_MAC_LEN))
+        .ok_or_else(|| DistributedMpcError::ProtocolError("frame length overflow".to_string()))?;
 
-    let mut off = FRAME_HEADER_LEN;
-    let total = frame.len();
-    while off < total {
+    // Cap upfront allocation so an unauthenticated peer cannot force multi-MiB allocation before sending bytes.
+    let mut frame = Vec::with_capacity(total.min(INITIAL_FRAME_ALLOC_CAP));
+    frame.extend_from_slice(&header_buf);
+
+    let mut chunk = [0u8; 4096];
+    while frame.len() < total {
         if let Some(flag) = shutdown
             && flag.load(Ordering::Acquire)
         {
             return Err(DistributedMpcError::Shutdown);
         }
-        if let Some(dl) = deadline
+        if let Some(dl) = effective_deadline(deadline, frame_deadline)
             && Instant::now() >= dl
         {
             return Err(DistributedMpcError::Timeout("socket read frame body"));
         }
-        match stream.read(&mut frame[off..]) {
+        let remaining = total - frame.len();
+        let to_read = remaining.min(chunk.len());
+        match stream.read(&mut chunk[..to_read]) {
             Ok(0) => {
                 return Err(DistributedMpcError::NetworkError(
                     "unexpected EOF mid-frame".to_string(),
                 ));
             }
-            Ok(n) => off += n,
+            Ok(n) => frame.extend_from_slice(&chunk[..n]),
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock
                     || e.kind() == io::ErrorKind::TimedOut
@@ -1398,6 +1511,7 @@ struct DaemonInner {
     peers_connected_in: AtomicUsize,
     peers_ready_mu: Mutex<()>,
     peers_ready_cv: Condvar,
+    active_conns: AtomicUsize,
     active_clients: AtomicUsize,
     epoch: AtomicU64,
     committed_txs: AtomicU64,
@@ -1501,6 +1615,7 @@ impl MpcValidatorDaemon {
             peers_connected_in: AtomicUsize::new(0),
             peers_ready_mu: Mutex::new(()),
             peers_ready_cv: Condvar::new(),
+            active_conns: AtomicUsize::new(0),
             active_clients: AtomicUsize::new(0),
             epoch: AtomicU64::new(1),
             committed_txs: AtomicU64::new(0),
@@ -1539,6 +1654,7 @@ impl MpcValidatorDaemon {
             let mut stream = TcpStream::connect_timeout(&addr, self.inner.io_timeout)
                 .map_err(|e| DistributedMpcError::NetworkError(e.to_string()))?;
             let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(SOCKET_POLL_TIMEOUT));
             let _ = stream.set_write_timeout(Some(self.inner.io_timeout));
 
             let link_mu = self.inner.peer_out_links[peer_id]
@@ -1695,6 +1811,38 @@ impl Drop for MpcValidatorDaemon {
 // Daemon Networking & MPC Protocol Execution
 // ============================================================================
 
+struct DaemonConnGuard {
+    inner: Arc<DaemonInner>,
+}
+
+impl Drop for DaemonConnGuard {
+    fn drop(&mut self) {
+        self.inner.active_conns.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_daemon_conn(inner: &Arc<DaemonInner>) -> Option<DaemonConnGuard> {
+    let mut cur = inner.active_conns.load(Ordering::Acquire);
+    loop {
+        if cur >= MAX_TOTAL_CONNS {
+            return None;
+        }
+        match inner.active_conns.compare_exchange_weak(
+            cur,
+            cur + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(DaemonConnGuard {
+                    inner: Arc::clone(inner),
+                });
+            }
+            Err(obs) => cur = obs,
+        }
+    }
+}
+
 fn daemon_accept_loop(
     listener: TcpListener,
     inner: Arc<DaemonInner>,
@@ -1707,6 +1855,10 @@ fn daemon_accept_loop(
                     let _ = stream.shutdown(Shutdown::Both);
                     break;
                 }
+                let Some(conn_guard) = try_acquire_daemon_conn(&inner) else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
                 let _ = stream.set_nodelay(true);
                 let _ = stream.set_read_timeout(Some(SOCKET_POLL_TIMEOUT));
                 let _ = stream.set_write_timeout(Some(inner.io_timeout));
@@ -1715,11 +1867,15 @@ fn daemon_accept_loop(
                 if let Ok(h) = thread::Builder::new()
                     .name(format!("vernam-v{}-conn", inner.validator_id))
                     .spawn(move || {
+                        let _guard = conn_guard;
                         handle_incoming_connection(stream, conn_inner);
                     })
                     && let Ok(mut list) = worker_handles.lock()
                 {
                     list.push(h);
+                    if list.len() >= 16 {
+                        list.retain(|jh| !jh.is_finished());
+                    }
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1734,11 +1890,14 @@ fn daemon_accept_loop(
 }
 
 fn handle_incoming_connection(mut stream: TcpStream, inner: Arc<DaemonInner>) {
-    // Read first frame to identify peer link vs wallet client session.
+    // Read first frame to identify peer link vs wallet client session, strictly capped at
+    // MAX_HANDSHAKE_PAYLOAD_BYTES (64 B) so an unauthenticated peer cannot allocate large buffers.
     let first_raw = match read_raw_frame(
         &mut stream,
         Some(&inner.shutdown),
         Some(Instant::now() + inner.io_timeout),
+        Some(inner.io_timeout),
+        MAX_HANDSHAKE_PAYLOAD_BYTES,
     ) {
         Ok(Some(raw)) => raw,
         _ => return,
@@ -1816,9 +1975,24 @@ fn run_peer_reader_loop(mut stream: TcpStream, inner: Arc<DaemonInner>, peer_id:
     let tape_mu = inner.peer_in_tapes[peer_id]
         .as_ref()
         .expect("peer_in_tape must exist");
+    let max_pss_payload = 12usize.saturating_add(
+        inner
+            .num_buckets
+            .saturating_mul(DIST_BUCKET_SIZE)
+            .saturating_mul(16),
+    );
+    let max_peer_payload = max_pss_payload
+        .max(Rtt1Payload::BYTE_LEN)
+        .min(MAX_FRAME_PAYLOAD_BYTES);
 
     while !inner.shutdown.load(Ordering::Acquire) {
-        let raw = match read_raw_frame(&mut stream, Some(&inner.shutdown), None) {
+        let raw = match read_raw_frame(
+            &mut stream,
+            Some(&inner.shutdown),
+            None,
+            Some(inner.io_timeout),
+            max_peer_payload,
+        ) {
             Ok(Some(raw)) => raw,
             Ok(None) => break,
             Err(_) => break,
@@ -1905,12 +2079,18 @@ fn run_peer_reader_loop(mut stream: TcpStream, inner: Arc<DaemonInner>, peer_id:
                                 .pss_mailboxes
                                 .lock()
                                 .expect("pss_mailboxes poisoned");
-                            let mb = map.entry(refresh_id).or_insert_with(PssMailbox::new);
-                            if mb.deltas[peer_id].is_none() {
-                                mb.deltas[peer_id] = Some(deltas);
-                                mb.count += 1;
+                            if map.len() < MAX_PENDING_MAILBOXES || map.contains_key(&refresh_id) {
+                                let mb = map.entry(refresh_id).or_insert_with(PssMailbox::new);
+                                if mb.deltas[peer_id].is_none() {
+                                    mb.deltas[peer_id] = Some(deltas);
+                                    mb.count += 1;
+                                } else {
+                                    zeroize_u128_slice(&mut deltas);
+                                }
+                                inner.pss_cv.notify_all();
+                            } else {
+                                zeroize_u128_slice(&mut deltas);
                             }
-                            inner.pss_cv.notify_all();
                         } else {
                             zeroize_u128_slice(&mut deltas);
                         }
@@ -1932,6 +2112,9 @@ fn deposit_peer_round_msg(
     msg: PeerRoundMsg,
 ) {
     let mut map = inner.mailboxes.lock().expect("mailboxes poisoned");
+    if map.len() >= MAX_PENDING_MAILBOXES && !map.contains_key(&(tx_id, round)) {
+        return;
+    }
     let mb = map.entry((tx_id, round)).or_insert_with(RoundMailbox::new);
     if let PeerRoundMsg::Abort(code) = msg {
         mb.aborted = Some(code);
@@ -2013,7 +2196,13 @@ fn wait_for_peer_round(
 /// Persistent client session loop on daemon `V_i`.
 fn run_client_session_loop(mut stream: TcpStream, inner: Arc<DaemonInner>, client_id: usize) {
     while !inner.shutdown.load(Ordering::Acquire) {
-        let raw = match read_raw_frame(&mut stream, Some(&inner.shutdown), None) {
+        let raw = match read_raw_frame(
+            &mut stream,
+            Some(&inner.shutdown),
+            None,
+            Some(inner.io_timeout),
+            MAX_CLIENT_PAYLOAD_BYTES,
+        ) {
             Ok(Some(raw)) => raw,
             Ok(None) => break,
             Err(_) => break,
@@ -3224,7 +3413,13 @@ impl DistributedWalletClient {
             .stream
             .as_mut()
             .ok_or(DistributedMpcError::NetworkError("daemon disconnected".to_string()))?;
-        let raw = match read_raw_frame(stream, None, Some(deadline))? {
+        let raw = match read_raw_frame(
+            stream,
+            None,
+            Some(deadline),
+            Some(self.io_timeout),
+            MAX_DAEMON_REPLY_PAYLOAD_BYTES,
+        )? {
             Some(r) => r,
             None => {
                 link.stream = None;
@@ -4194,5 +4389,135 @@ mod tests {
             report.num_buckets * DIST_BUCKET_SIZE,
             report.inter_validator_wire_bytes_per_tx,
         );
+    }
+
+    #[test]
+    fn test_adversarial_tcp_hostile_oversized_truncated_and_stalled_frames() {
+        // 1. WireFrameHeader::decode rejects bad magic, unknown msg_type, and oversized payloads
+        //    BEFORE any body buffer allocation.
+        let mut bad_magic = [0u8; FRAME_HEADER_LEN];
+        bad_magic[0..4].copy_from_slice(b"EVIL");
+        bad_magic[4] = MSG_CLIENT_HELLO;
+        assert!(WireFrameHeader::decode(&bad_magic).is_err());
+
+        let unknown_type = WireFrameHeader {
+            msg_type: 0xEE,
+            sender_id: 0,
+            flags: 0,
+            seq_id: 0,
+            payload_len: 2,
+        }
+        .encode();
+        assert!(WireFrameHeader::decode(&unknown_type).is_err());
+
+        let oversized_hello = WireFrameHeader {
+            msg_type: MSG_CLIENT_HELLO,
+            sender_id: 0xFF,
+            flags: 0,
+            seq_id: 0,
+            payload_len: (MAX_HANDSHAKE_PAYLOAD_BYTES as u32) + 1,
+        }
+        .encode();
+        assert!(WireFrameHeader::decode(&oversized_hello).is_err());
+
+        let huge_payload = WireFrameHeader {
+            msg_type: MSG_PEER_PSS_DELTA,
+            sender_id: 0,
+            flags: 0,
+            seq_id: 0,
+            payload_len: u32::MAX,
+        }
+        .encode();
+        assert!(WireFrameHeader::decode(&huge_payload).is_err());
+
+        // 2. verify_and_decrypt_frame rejects truncated frames & forged MAC without panicking or OOM.
+        let (mut tx_tape, mut rx_tape) = OtpPadTape::generate_pair(256, 4);
+        assert!(verify_and_decrypt_frame(&mut rx_tape, &[0u8; 10]).is_err());
+        let valid = encrypt_and_mac_frame(&mut tx_tape, MSG_CLIENT_MINT, 0xFF, 0, &[1u8; 21]).unwrap();
+        assert!(verify_and_decrypt_frame(&mut rx_tape, &valid[..valid.len() - 1]).is_err());
+        let mut forged = valid.clone();
+        forged[FRAME_HEADER_LEN] ^= 0xFF;
+        let pad_before = rx_tape.remaining_pad_bytes();
+        assert_eq!(
+            verify_and_decrypt_frame(&mut rx_tape, &forged),
+            Err(DistributedMpcError::MacVerificationFailed)
+        );
+        // Zero-allocation in-place pad burn consumed exactly 21 bytes on MAC failure.
+        assert_eq!(rx_tape.remaining_pad_bytes(), pad_before - 21);
+
+        // 3. Live 4-daemon cluster survives raw hostile TCP attacks (oversized header, bad magic,
+        //    truncated frame, stalled Slowloris partial header) without crashing, OOMing, or hanging.
+        let config = DistributedClusterConfig {
+            num_buckets: 1,
+            beaver_tx_capacity: 8,
+            num_clients: 1,
+            io_timeout: Duration::from_millis(250),
+        };
+        let (cluster, mut clients) = DistributedMpcCluster::spawn(config).unwrap();
+        let v0_addr = cluster.peer_addrs()[0];
+
+        // Attack A: Spoofed 4 GiB payload_len header over live TCP.
+        {
+            let mut s = TcpStream::connect(v0_addr).unwrap();
+            let _ = s.write_all(&huge_payload);
+            let _ = s.flush();
+            let mut sink = [0u8; 16];
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = s.read(&mut sink);
+        }
+
+        // Attack B: Oversized MSG_CLIENT_HELLO claiming 2 MiB payload.
+        {
+            let mut s = TcpStream::connect(v0_addr).unwrap();
+            let hdr = WireFrameHeader {
+                msg_type: MSG_CLIENT_HELLO,
+                sender_id: 0xFF,
+                flags: 0,
+                seq_id: 0,
+                payload_len: 2_000_000,
+            }
+            .encode();
+            let _ = s.write_all(&hdr);
+            let _ = s.flush();
+        }
+
+        // Attack C: Truncated mid-header and truncated mid-body frames.
+        {
+            let mut s1 = TcpStream::connect(v0_addr).unwrap();
+            let _ = s1.write_all(b"VRNM\x02\x00\x00");
+            let _ = s1.flush();
+
+            let mut s2 = TcpStream::connect(v0_addr).unwrap();
+            let hdr = WireFrameHeader {
+                msg_type: MSG_CLIENT_HELLO,
+                sender_id: 0xFF,
+                flags: 0,
+                seq_id: 0,
+                payload_len: 16,
+            }
+            .encode();
+            let _ = s2.write_all(&hdr);
+            let _ = s2.write_all(&[0xAA; 4]); // truncated body + missing MAC
+            let _ = s2.flush();
+        }
+
+        // Attack D: Slowloris stalled partial frame held open -> daemon times out cleanly in ~250ms.
+        let stalled_stream = {
+            let mut s = TcpStream::connect(v0_addr).unwrap();
+            let _ = s.write_all(b"VRNM\x02");
+            let _ = s.flush();
+            s
+        };
+
+        // Cluster MUST remain completely responsive and execute a real shielded transfer!
+        let client = &mut clients[0];
+        client.mint_split_shares(0, 0, 1_000).unwrap();
+        let rcpt = client.send_shielded(0, 0, 1_000, 3, 250).unwrap();
+        assert_eq!(rcpt.committed_validators, 4);
+        assert_eq!(client.query_balance(0, 0).unwrap(), 750);
+        assert_eq!(client.query_balance(0, 3).unwrap(), 250);
+
+        drop(stalled_stream);
+        cluster.stop_all();
     }
 }

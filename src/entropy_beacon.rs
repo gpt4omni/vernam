@@ -84,11 +84,7 @@ impl BeaconConfig {
         }
         let max_faults = (num_validators - 1) / 3;
         let threshold = num_validators - max_faults;
-        Ok(Self {
-            threshold,
-            num_validators,
-            max_faults,
-        })
+        Self::new(threshold, num_validators)
     }
 
     /// Custom `(threshold, num_validators)` configuration with `1 <= threshold <= num_validators`.
@@ -98,10 +94,27 @@ impl BeaconConfig {
                 "num_validators must be >= 1".to_string(),
             ));
         }
+        if num_validators > u32::MAX as usize {
+            return Err(BeaconError::InvalidConfig(format!(
+                "num_validators ({num_validators}) exceeds u32::MAX"
+            )));
+        }
         if threshold == 0 || threshold > num_validators {
             return Err(BeaconError::InvalidConfig(format!(
                 "threshold ({threshold}) must satisfy 1 <= threshold <= num_validators ({num_validators})"
             )));
+        }
+        // Guard against overflow in bivariate matrix allocation and share payload serialization.
+        if threshold.checked_mul(threshold).is_none()
+            || num_validators
+                .checked_mul(6)
+                .and_then(|v| v.checked_add(threshold))
+                .and_then(|v| v.checked_mul(16))
+                .is_none()
+        {
+            return Err(BeaconError::InvalidConfig(
+                "beacon config dimensions overflow usize".to_string(),
+            ));
         }
         let max_faults = num_validators - threshold;
         Ok(Self {
@@ -671,23 +684,40 @@ pub struct IcVerifierKey {
 
 impl IcVerifierKey {
     /// Verify a revealed/recovered share `y` against its holder's `tag_y`.
+    ///
+    /// Strictly rejects degenerate zero MAC keys (`r == 0`) and non-canonical field elements (`>= PRIME_P`).
     #[inline]
     pub fn verify_share_tag(&self, share_y: u128, tag_y: u128) -> bool {
-        let expected = add_mod(mul_mod(self.r, reduce(share_y)), self.a1);
+        if self.r == 0 || self.r >= PRIME_P || share_y >= PRIME_P || tag_y >= PRIME_P {
+            return false;
+        }
+        let expected = add_mod(mul_mod(self.r, share_y), self.a1);
         let a_bytes = expected.to_le_bytes();
-        let b_bytes = reduce(tag_y).to_le_bytes();
+        let b_bytes = tag_y.to_le_bytes();
         ct_eq_16(&a_bytes, &b_bytes)
     }
 
     /// Verify a Commit-phase zero-knowledge masked response `(m, tag_m)` for challenge `c`.
+    ///
+    /// Strictly rejects degenerate zero MAC keys (`r == 0`), zero challenges, and non-canonical
+    /// field elements (`>= PRIME_P`).
     #[inline]
     pub fn verify_masked_response(&self, challenge_c: u128, masked_m: u128, tag_m: u128) -> bool {
+        if self.r == 0
+            || self.r >= PRIME_P
+            || challenge_c == 0
+            || challenge_c >= PRIME_P
+            || masked_m >= PRIME_P
+            || tag_m >= PRIME_P
+        {
+            return false;
+        }
         let rhs = add_mod(
-            mul_mod(self.r, reduce(masked_m)),
-            add_mod(mul_mod(reduce(challenge_c), self.a1), self.a2),
+            mul_mod(self.r, masked_m),
+            add_mod(mul_mod(challenge_c, self.a1), self.a2),
         );
         let a_bytes = rhs.to_le_bytes();
-        let b_bytes = reduce(tag_m).to_le_bytes();
+        let b_bytes = tag_m.to_le_bytes();
         ct_eq_16(&a_bytes, &b_bytes)
     }
 }
@@ -754,8 +784,12 @@ impl SecretContribution {
 
     /// Construct a symmetric bivariate polynomial of degree `(t-1, t-1)` hiding `secret`.
     pub fn from_secret(epoch: u64, dealer_id: u32, threshold: usize, secret: u128) -> Self {
+        assert!(threshold >= 1, "threshold must be >= 1");
+        let matrix_len = threshold
+            .checked_mul(threshold)
+            .expect("bivariate polynomial threshold^2 overflow");
         let secret = reduce(secret);
-        let mut coeffs = vec![0u128; threshold * threshold];
+        let mut coeffs = vec![0u128; matrix_len];
         coeffs[0] = secret;
         for a in 0..threshold {
             for b in a..threshold {
@@ -897,6 +931,7 @@ impl SecretShareRecord {
             buf.copy_from_slice(&bytes[*off..(*off + 16)]);
             *off += 16;
             let v = u128::from_le_bytes(buf);
+            zeroize_slice(&mut buf);
             if v >= PRIME_P {
                 return Err(BeaconError::CorruptedPayload {
                     dealer: dealer_id,
@@ -924,6 +959,13 @@ impl SecretShareRecord {
             let r = read_elem(&mut offset)?;
             let a1 = read_elem(&mut offset)?;
             let a2 = read_elem(&mut offset)?;
+            // Reject degenerate r == 0 IC-MAC keys which would authenticate any forged share.
+            if r == 0 {
+                return Err(BeaconError::CorruptedPayload {
+                    dealer: dealer_id,
+                    recipient: recipient_id,
+                });
+            }
             ic_verifier_keys.push(IcVerifierKey { r, a1, a2 });
         }
 
@@ -1056,6 +1098,20 @@ pub struct EpochBeaconOutput {
 }
 
 impl EpochBeaconOutput {
+    /// Validate that this beacon output contains a canonical non-zero scalar `0 < gamma < PRIME_P`
+    /// and a non-empty qualified validator committee.
+    pub fn validate(&self) -> Result<(), BeaconError> {
+        if self.gamma == 0 || self.gamma >= PRIME_P {
+            return Err(BeaconError::InvalidEvaluationPoint(
+                "beacon output gamma must satisfy 0 < gamma < PRIME_P".to_string(),
+            ));
+        }
+        if self.qualified_validators.is_empty() {
+            return Err(BeaconError::InsufficientQualifiedDealers { have: 0, need: 1 });
+        }
+        Ok(())
+    }
+
     /// Derive a uniform field element in `[0, PRIME_P)` for `(domain, subject, counter)`
     /// using purely algebraic bijective polynomial mixing in `F_(2^127 - 1)`.
     #[inline]
@@ -1166,8 +1222,12 @@ pub struct VernamBeacon {
     local_complaints: Vec<CommitComplaint>,
     /// All known complaints per dealer: `dealer_id -> set of accuser_ids`.
     complaints_by_dealer: BTreeMap<u32, BTreeSet<u32>>,
-    /// Approved resolutions: `(dealer_id, target_id) -> (row_poly, set of approving voters)`.
-    resolution_votes: BTreeMap<(u32, u32), (Vec<u128>, BTreeSet<u32>)>,
+    /// Approved resolutions keyed per candidate `row_poly` so a Byzantine first-writer
+    /// cannot poison honest resolution votes for `(dealer_id, target_id)`.
+    resolution_votes: BTreeMap<(u32, u32), BTreeMap<Vec<u128>, BTreeSet<u32>>>,
+    /// Per `(dealer_id, target_id)` set of voters who have already cast a valid resolution vote
+    /// (bounds candidate entries per complaint to at most `num_validators`).
+    resolution_voters: BTreeMap<(u32, u32), BTreeSet<u32>>,
     /// Publicly resolved shares (when a dealer resolved a complaint by publishing a row).
     public_resolved_shares: BTreeMap<(u32, u32), u128>,
 
@@ -1200,6 +1260,7 @@ impl VernamBeacon {
             local_complaints: Vec::new(),
             complaints_by_dealer: BTreeMap::new(),
             resolution_votes: BTreeMap::new(),
+            resolution_voters: BTreeMap::new(),
             public_resolved_shares: BTreeMap::new(),
             qualified_dealers: BTreeSet::new(),
             disqualified_dealers: BTreeSet::new(),
@@ -1287,6 +1348,11 @@ impl VernamBeacon {
         outgoing_keys: &[(u32, &OtpChannelKey)],
     ) -> Result<Vec<ShareEnvelope>, BeaconError> {
         self.require_phase(BeaconPhase::Commit)?;
+        if secret >= PRIME_P {
+            return Err(BeaconError::InvalidEvaluationPoint(
+                "dealer secret must be canonical (< PRIME_P)".to_string(),
+            ));
+        }
         let n = self.config.num_validators;
         if outgoing_keys.len() != n {
             return Err(BeaconError::InvalidConfig(format!(
@@ -1346,6 +1412,7 @@ impl VernamBeacon {
         }
 
         let mut envelopes = Vec::with_capacity(n);
+        let mut seal_err: Option<BeaconError> = None;
         for j in 0..n {
             let recipient_id = j as u32;
             let record = SecretShareRecord {
@@ -1358,19 +1425,34 @@ impl VernamBeacon {
             };
             let mut encoded = record.encode();
             let key = key_map[&recipient_id];
-            let env = ShareEnvelope::seal(
+            let env_res = ShareEnvelope::seal(
                 self.epoch,
                 self.validator_id,
                 recipient_id,
                 &encoded,
                 key,
-            )?;
+            );
             zeroize_slice(&mut encoded);
-            envelopes.push(env);
+            match env_res {
+                Ok(env) => envelopes.push(env),
+                Err(err) => {
+                    seal_err = Some(err);
+                    break;
+                }
+            }
         }
 
+        for row in &mut row_polys {
+            for c in row {
+                zeroize_u128(c);
+            }
+        }
         for y in &mut shares_y {
             zeroize_u128(y);
+        }
+
+        if let Some(err) = seal_err {
+            return Err(err);
         }
 
         self.local_contribution = Some(contrib);
@@ -1481,7 +1563,7 @@ impl VernamBeacon {
             return Ok(false);
         };
         let expected = record.eval_at_peer(check.from_id);
-        if expected == reduce(check.eval_point) {
+        if check.eval_point < PRIME_P && expected == check.eval_point {
             Ok(true)
         } else {
             self.record_local_complaint(
@@ -1529,12 +1611,12 @@ impl VernamBeacon {
                 num_validators: self.config.num_validators,
             });
         }
-        let c = reduce(challenge.challenge_c);
-        if c == 0 {
+        if challenge.challenge_c == 0 || challenge.challenge_c >= PRIME_P {
             return Err(BeaconError::InvalidEvaluationPoint(
-                "IC challenge scalar c must be non-zero".to_string(),
+                "IC challenge scalar c must satisfy 0 < c < PRIME_P".to_string(),
             ));
         }
+        let c = challenge.challenge_c;
 
         let record = self
             .received_shares
@@ -1704,17 +1786,22 @@ impl VernamBeacon {
                 reason: "resolution vote target mismatch".to_string(),
             });
         }
-        if resolution.row_poly.len() != self.config.threshold {
+        if resolution.row_poly.len() != self.config.threshold
+            || resolution.row_poly.iter().any(|&c| c >= PRIME_P)
+        {
             return Ok(());
         }
 
         if vote.valid {
-            let entry = self
-                .resolution_votes
-                .entry((resolution.dealer_id, resolution.target_id))
-                .or_insert_with(|| (resolution.row_poly.clone(), BTreeSet::new()));
-            if entry.0 == resolution.row_poly {
-                entry.1.insert(vote.voter_id);
+            let key = (resolution.dealer_id, resolution.target_id);
+            let voters_seen = self.resolution_voters.entry(key).or_default();
+            if voters_seen.insert(vote.voter_id) {
+                self.resolution_votes
+                    .entry(key)
+                    .or_default()
+                    .entry(resolution.row_poly.clone())
+                    .or_default()
+                    .insert(vote.voter_id);
             }
         }
         Ok(())
@@ -1744,8 +1831,17 @@ impl VernamBeacon {
             if dealer_ok {
                 if let Some(accuser_set) = accusers {
                     for &accuser_id in accuser_set {
-                        match self.resolution_votes.get(&(dealer_id, accuser_id)) {
-                            Some((row_poly, voters)) if voters.len() >= self.config.threshold => {
+                        let approved_row = self
+                            .resolution_votes
+                            .get(&(dealer_id, accuser_id))
+                            .and_then(|candidates| {
+                                candidates
+                                    .iter()
+                                    .find(|(_, voters)| voters.len() >= self.config.threshold)
+                                    .map(|(row_poly, _)| row_poly)
+                            });
+                        match approved_row {
+                            Some(row_poly) => {
                                 self.public_resolved_shares
                                     .insert((dealer_id, accuser_id), row_poly[0]);
                                 // If we were the accuser and received a bad share, adopt the
@@ -1756,7 +1852,7 @@ impl VernamBeacon {
                                     }
                                 }
                             }
-                            _ => {
+                            None => {
                                 dealer_ok = false;
                                 break;
                             }
@@ -2040,6 +2136,13 @@ impl VernamBeacon {
             gamma = add_mod(gamma, dealer_secret);
         }
 
+        // In the 1 / (2^127 - 1) event of exact zero-sum cancellation, deterministically
+        // fold the epoch and domain constant via the x -> x^5 bijection so the finalized
+        // beacon ALWAYS satisfies canonical `0 < gamma < PRIME_P` without aborting.
+        if gamma == 0 {
+            gamma = pow5_mod(add_mod(reduce(self.epoch as u128), MIX_K1));
+        }
+
         let output = EpochBeaconOutput {
             epoch: self.epoch,
             gamma,
@@ -2055,6 +2158,16 @@ impl VernamBeacon {
         self.phase = BeaconPhase::Finalized;
         self.finalized_output = Some(output.clone());
         Ok(output)
+    }
+}
+
+impl Drop for VernamBeacon {
+    fn drop(&mut self) {
+        self.local_contribution = None;
+        self.received_shares.clear();
+        for c in self.sent_ic_challenges.values_mut() {
+            zeroize_u128(c);
+        }
     }
 }
 
@@ -2155,7 +2268,7 @@ impl AutonomousEpochClock {
     }
 
     pub fn blocks_until_next_epoch(&self) -> u64 {
-        self.blocks_per_epoch - self.blocks_in_epoch
+        self.blocks_per_epoch.saturating_sub(self.blocks_in_epoch)
     }
 
     pub fn last_finalized_height(&self) -> Option<u64> {
@@ -2235,6 +2348,7 @@ impl AutonomousEpochClock {
                 got: output.epoch,
             });
         }
+        output.validate()?;
         self.current_beacon_output = Some(output);
         self.stage = EpochPipelineStage::AwaitingPopAudit;
         Ok(())
@@ -2987,7 +3101,7 @@ mod tests {
         // Epoch 2 beacon produces distinct PoP challenge for the same validator_id.
         let beacon_ep2 = EpochBeaconOutput {
             epoch: 2,
-            gamma: random_field_elem(),
+            gamma: random_nonzero_field_elem(),
             qualified_validators: vec![0, 1, 2, 3],
             reconstructed_validators: vec![],
             disqualified_validators: vec![],
@@ -3015,5 +3129,208 @@ mod tests {
         let beacon = VernamBeacon::new(config, 1, 0).unwrap();
         let dbg_beacon = format!("{beacon:?}");
         assert!(dbg_beacon.contains("VernamBeacon"));
+    }
+
+    #[test]
+    fn test_non_canonical_inputs_zero_r_ic_mac_zero_gamma_and_resolution_equivocation() {
+        // 1. IcVerifierKey rejects r == 0 and non-canonical >= PRIME_P inputs.
+        let zero_r_key = IcVerifierKey { r: 0, a1: 42, a2: 99 };
+        assert!(!zero_r_key.verify_share_tag(12345, 42));
+        assert!(!zero_r_key.verify_masked_response(7, 100, add_mod(mul_mod(7, 42), 99)));
+
+        let valid_key = IcVerifierKey { r: 17, a1: 5, a2: 9 };
+        let valid_tag = add_mod(mul_mod(17, 10), 5);
+        assert!(valid_key.verify_share_tag(10, valid_tag));
+        assert!(!valid_key.verify_share_tag(10 + PRIME_P, valid_tag));
+        assert!(!valid_key.verify_share_tag(10, valid_tag + PRIME_P));
+        assert!(!valid_key.verify_masked_response(0, 1, 1));
+        assert!(!valid_key.verify_masked_response(PRIME_P + 1, 1, 1));
+
+        // 2. SecretShareRecord::decode rejects r == 0 in IC verifier keys.
+        let config = BeaconConfig::bft(4).unwrap();
+        let mut raw_payload = vec![0u8; config.share_payload_bytes()];
+        // All zeros has r == 0 -> must fail decode!
+        assert!(matches!(
+            SecretShareRecord::decode(1, 0, 1, &config, &raw_payload),
+            Err(BeaconError::CorruptedPayload { dealer: 0, recipient: 1 })
+        ));
+        raw_payload.fill(0xFF); // >= PRIME_P -> must also fail decode!
+        assert!(matches!(
+            SecretShareRecord::decode(1, 0, 1, &config, &raw_payload),
+            Err(BeaconError::CorruptedPayload { dealer: 0, recipient: 1 })
+        ));
+
+        // 3. AutonomousEpochClock rejects gamma == 0, gamma >= PRIME_P, and empty committees.
+        let mut clock = AutonomousEpochClock::new(5).unwrap();
+        clock.on_block_finalized(5).unwrap();
+        let zero_gamma_out = EpochBeaconOutput {
+            epoch: 1,
+            gamma: 0,
+            qualified_validators: vec![0, 1, 2, 3],
+            reconstructed_validators: vec![],
+            disqualified_validators: vec![],
+        };
+        assert!(matches!(
+            clock.complete_beacon_round(zero_gamma_out),
+            Err(BeaconError::InvalidEvaluationPoint(_))
+        ));
+        let non_canon_out = EpochBeaconOutput {
+            epoch: 1,
+            gamma: PRIME_P + 7,
+            qualified_validators: vec![0, 1, 2, 3],
+            reconstructed_validators: vec![],
+            disqualified_validators: vec![],
+        };
+        assert!(matches!(
+            clock.complete_beacon_round(non_canon_out),
+            Err(BeaconError::InvalidEvaluationPoint(_))
+        ));
+        let empty_committee_out = EpochBeaconOutput {
+            epoch: 1,
+            gamma: 42,
+            qualified_validators: vec![],
+            reconstructed_validators: vec![],
+            disqualified_validators: vec![],
+        };
+        assert!(matches!(
+            clock.complete_beacon_round(empty_committee_out),
+            Err(BeaconError::InsufficientQualifiedDealers { have: 0, need: 1 })
+        ));
+
+        // 4. Zero-sum cancellation across dealers still yields deterministic non-zero canonical gamma.
+        let cancel_secrets = vec![100u128, PRIME_P - 100, 55, PRIME_P - 55];
+        let (sk_c, rk_c) = make_pairwise_otp_matrix(&config);
+        let mut nodes_c: Vec<VernamBeacon> = (0..4u32)
+            .map(|id| VernamBeacon::new(config, 9, id).unwrap())
+            .collect();
+        run_honest_commit_phase(&mut nodes_c, &cancel_secrets, &sk_c, &rk_c);
+        let revs_c: Vec<SecretReveal> = nodes_c.iter().map(|n| n.generate_reveal().unwrap()).collect();
+        let mut outs_c = Vec::new();
+        for node in &mut nodes_c {
+            for r in &revs_c {
+                assert!(node.receive_reveal(r).unwrap());
+            }
+            outs_c.push(node.finalize_epoch().unwrap());
+        }
+        for out in &outs_c {
+            assert!(out.gamma > 0 && out.gamma < PRIME_P);
+            assert_eq!(out.gamma, outs_c[0].gamma);
+            out.validate().unwrap();
+        }
+
+        // 5. Byzantine first-writer-wins fake resolution vote CANNOT poison an honest dealer!
+        let secrets = vec![11u128, 22, 33, 44];
+        let (sk, rk) = make_pairwise_otp_matrix(&config);
+        let mut nodes: Vec<VernamBeacon> = (0..4u32)
+            .map(|id| VernamBeacon::new(config, 12, id).unwrap())
+            .collect();
+        let mut all_envs = Vec::new();
+        for d in 0..4 {
+            let refs: Vec<(u32, &OtpChannelKey)> =
+                (0..4).map(|r| (r as u32, &sk[d][r])).collect();
+            all_envs.push(
+                nodes[d]
+                    .generate_commit_envelopes_with_secret(secrets[d], &refs)
+                    .unwrap(),
+            );
+        }
+        for r in 0..4 {
+            for d in 0..4 {
+                nodes[r]
+                    .receive_commit_envelope(&all_envs[d][r], &rk[r][d])
+                    .unwrap();
+            }
+        }
+        // Non-canonical pairwise eval_point >= PRIME_P is rejected!
+        let mut bad_pw = nodes[1].generate_pairwise_checks()[0].clone();
+        bad_pw.eval_point += PRIME_P;
+        let target_idx = bad_pw.to_id as usize;
+        assert!(!nodes[target_idx].verify_pairwise_check(&bad_pw).unwrap());
+        // Clear local complaint side-effect by running fresh nodes for equivocation test.
+        let mut nodes_eq: Vec<VernamBeacon> = (0..4u32)
+            .map(|id| VernamBeacon::new(config, 13, id).unwrap())
+            .collect();
+        let (sk_eq, rk_eq) = make_pairwise_otp_matrix(&config);
+        let mut envs_eq = Vec::new();
+        for d in 0..4 {
+            let refs: Vec<(u32, &OtpChannelKey)> =
+                (0..4).map(|r| (r as u32, &sk_eq[d][r])).collect();
+            envs_eq.push(
+                nodes_eq[d]
+                    .generate_commit_envelopes_with_secret(secrets[d], &refs)
+                    .unwrap(),
+            );
+        }
+        for r in 0..4 {
+            for d in 0..4 {
+                nodes_eq[r]
+                    .receive_commit_envelope(&envs_eq[d][r], &rk_eq[r][d])
+                    .unwrap();
+            }
+        }
+        // Byzantine V3 files false complaint against honest V0 AND pre-stuffs a FAKE resolution vote first!
+        let complaint = CommitComplaint {
+            epoch: 13,
+            dealer_id: 0,
+            accuser_id: 3,
+            reason: ComplaintReason::InvalidEnvelopeMac,
+        };
+        let fake_res = DealerResolution {
+            epoch: 13,
+            dealer_id: 0,
+            target_id: 3,
+            row_poly: vec![999, 888, 777],
+        };
+        let fake_vote = ResolutionVote {
+            epoch: 13,
+            dealer_id: 0,
+            target_id: 3,
+            voter_id: 3,
+            valid: true,
+        };
+        let real_res = nodes_eq[0].generate_complaint_resolution(3).unwrap();
+        for node in &mut nodes_eq {
+            node.register_complaint(complaint.clone()).unwrap();
+            // Byzantine pre-stuff arrives BEFORE honest votes!
+            node.register_resolution_vote(&fake_res, fake_vote.clone()).unwrap();
+        }
+        let honest_votes: Vec<ResolutionVote> = (0..3)
+            .map(|h| nodes_eq[h].verify_complaint_resolution(&real_res).unwrap())
+            .collect();
+        assert!(honest_votes.iter().all(|v| v.valid));
+        for h in 0..3 {
+            for v in &honest_votes {
+                nodes_eq[h].register_resolution_vote(&real_res, v.clone()).unwrap();
+            }
+            let qualified = nodes_eq[h].lock_commit_phase().unwrap();
+            assert_eq!(qualified, vec![0, 1, 2, 3], "honest V0 must survive Byzantine first-writer resolution poisoning");
+        }
+    }
+
+    #[test]
+    fn test_committee_size_edge_cases_n2_and_n16() {
+        for n in [2usize, 16usize] {
+            let config = BeaconConfig::bft(n).unwrap();
+            let epoch = n as u64;
+            let secrets: Vec<u128> = (0..n).map(|_| random_nonzero_field_elem()).collect();
+            let (sk, rk) = make_pairwise_otp_matrix(&config);
+            let mut nodes: Vec<VernamBeacon> = (0..n as u32)
+                .map(|id| VernamBeacon::new(config, epoch, id).unwrap())
+                .collect();
+            run_honest_commit_phase(&mut nodes, &secrets, &sk, &rk);
+            let reveals: Vec<SecretReveal> = nodes.iter().map(|node| node.generate_reveal().unwrap()).collect();
+            let mut outputs = Vec::with_capacity(n);
+            for node in &mut nodes {
+                for r in &reveals {
+                    assert!(node.receive_reveal(r).unwrap());
+                }
+                outputs.push(node.finalize_epoch().unwrap());
+            }
+            for out in &outputs {
+                assert!(out.gamma > 0 && out.gamma < PRIME_P);
+                assert_eq!(out.gamma, outputs[0].gamma);
+                assert_eq!(out.qualified_validators.len(), n);
+            }
+        }
     }
 }

@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::field::{PRIME_P, add_mod, mul_mod, reduce, zeroize_slice};
 use crate::qkd::{Bb84Channel, Bb84Config, OsEntropySource};
+pub use crate::testnet_server::{DEFAULT_RATE_LIMIT_PER_SEC, IpRateLimiter, MAX_TRACKED_IPS};
 
 /// Dedicated treasury account ID used by `/faucet` so faucet credits flow through
 /// real P2P block propagation and consensus validation.
@@ -41,6 +42,10 @@ const MAX_CONCURRENT_CONNS: usize = 64;
 /// Maximum number of remote peers retained in the P2P peer table.
 const MAX_PEERS: usize = 64;
 
+/// Maximum peers permitted from any single non-loopback IPv4 `/24` (or IPv6 `/48`) subnet
+/// to defeat P2P eclipse attacks.
+pub const MAX_PEERS_PER_SUBNET: usize = 4;
+
 /// Maximum pending jobs buffered in the asynchronous gossip queue.
 const MAX_GOSSIP_QUEUE: usize = 256;
 
@@ -55,6 +60,9 @@ const HTTP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum accepted HTTP request/response header size (16 KiB).
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+
+/// Maximum accepted HTTP header count per request.
+const MAX_HTTP_HEADERS: usize = 64;
 
 /// Maximum accepted HTTP request/response body size (4 MiB).
 const MAX_HTTP_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -585,6 +593,52 @@ pub struct P2pNodeState {
     pub recent_events: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerSubnetKey {
+    V4([u8; 3]),
+    V6([u16; 3]),
+    Host(String),
+}
+
+/// Extract a `/24` IPv4 (or `/48` IPv6 / lowercase hostname) eclipse-defense subnet key for
+/// `norm_addr`, returning `None` for loopback (`127.0.0.0/8`, `::1`, `localhost`) so local
+/// multi-node deployments and tests remain unaffected.
+fn peer_subnet_key(norm_addr: &str) -> Option<PeerSubnetKey> {
+    let (host, _) = parse_host_port(norm_addr).ok()?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                if v4.is_loopback() {
+                    None
+                } else {
+                    let o = v4.octets();
+                    Some(PeerSubnetKey::V4([o[0], o[1], o[2]]))
+                }
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() {
+                    None
+                } else if let Some(mapped) = v6.to_ipv4_mapped() {
+                    if mapped.is_loopback() {
+                        None
+                    } else {
+                        let o = mapped.octets();
+                        Some(PeerSubnetKey::V4([o[0], o[1], o[2]]))
+                    }
+                } else {
+                    let s = v6.segments();
+                    Some(PeerSubnetKey::V6([s[0], s[1], s[2]]))
+                }
+            }
+        };
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        None
+    } else {
+        Some(PeerSubnetKey::Host(host.to_ascii_lowercase()))
+    }
+}
+
 impl P2pNodeState {
     /// Initialize a fresh P2P node state at genesis with real BB84 QKD calibration.
     pub fn new(config: P2pNodeConfig, local_addr: SocketAddr) -> Result<Self, String> {
@@ -679,7 +733,8 @@ impl P2pNodeState {
     }
 
     /// Register or update a peer in the local peer table (ignoring self, SSRF targets, and malformed addresses).
-    /// Caps the peer table at `MAX_PEERS` (64), evicting an unhealthy peer if full.
+    /// Caps the peer table at `MAX_PEERS` (64) and enforces per-`/24` IPv4 (and `/48` IPv6) subnet
+    /// diversity (`MAX_PEERS_PER_SUBNET = 4`, exempting loopback) to prevent eclipse attacks.
     /// Returns `Ok(true)` if a brand-new peer was added, `Ok(false)` if updated or self-ignored.
     pub fn upsert_peer(&mut self, mut info: PeerInfo) -> Result<bool, String> {
         let norm_addr = normalize_addr(&info.addr)?;
@@ -696,18 +751,43 @@ impl P2pNodeState {
             info.qber = 0.0;
         }
         let is_new = !self.peers.contains_key(&norm_addr);
-        if is_new && self.peers.len() >= MAX_PEERS {
-            // Try evicting the stalest unhealthy peer before rejecting new peers.
-            let stale_unhealthy = self
-                .peers
-                .iter()
-                .filter(|(_, p)| !p.healthy)
-                .min_by_key(|(_, p)| p.last_seen_secs)
-                .map(|(k, _)| k.clone());
-            if let Some(evict_key) = stale_unhealthy {
-                self.peers.remove(&evict_key);
-            } else {
-                return Err(format!("peer table full (max {MAX_PEERS} peers)"));
+        if is_new {
+            // Eclipse-attack defense: cap peers per non-loopback /24 IPv4 (or /48 IPv6) subnet.
+            if let Some(subnet) = peer_subnet_key(&norm_addr) {
+                let same_subnet_count = self
+                    .peers
+                    .keys()
+                    .filter(|k| peer_subnet_key(k).as_ref() == Some(&subnet))
+                    .count();
+                if same_subnet_count >= MAX_PEERS_PER_SUBNET {
+                    let stale_in_subnet = self
+                        .peers
+                        .iter()
+                        .filter(|(k, p)| !p.healthy && peer_subnet_key(k).as_ref() == Some(&subnet))
+                        .min_by_key(|(_, p)| p.last_seen_secs)
+                        .map(|(k, _)| k.clone());
+                    if let Some(evict_key) = stale_in_subnet {
+                        self.peers.remove(&evict_key);
+                    } else {
+                        return Err(format!(
+                            "eclipse protection: per-subnet peer cap ({MAX_PEERS_PER_SUBNET}) reached"
+                        ));
+                    }
+                }
+            }
+            if self.peers.len() >= MAX_PEERS {
+                // Try evicting the stalest unhealthy peer before rejecting new peers.
+                let stale_unhealthy = self
+                    .peers
+                    .iter()
+                    .filter(|(_, p)| !p.healthy)
+                    .min_by_key(|(_, p)| p.last_seen_secs)
+                    .map(|(k, _)| k.clone());
+                if let Some(evict_key) = stale_unhealthy {
+                    self.peers.remove(&evict_key);
+                } else {
+                    return Err(format!("peer table full (max {MAX_PEERS} peers)"));
+                }
             }
         }
         self.peers.insert(norm_addr.clone(), info);
@@ -1049,6 +1129,7 @@ pub struct P2pNode {
     local_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     gossip_queue: Arc<GossipQueue>,
+    rate_limiter: Arc<Mutex<IpRateLimiter>>,
     gossip_worker_started: AtomicBool,
     sync_loop_started: AtomicBool,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -1079,10 +1160,19 @@ impl P2pNode {
             local_addr,
             shutdown: Arc::new(AtomicBool::new(false)),
             gossip_queue: Arc::new(GossipQueue::new()),
+            rate_limiter: Arc::new(Mutex::new(IpRateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC))),
             gossip_worker_started: AtomicBool::new(false),
             sync_loop_started: AtomicBool::new(false),
             threads: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Configure the per-IP inbound HTTP/P2P request rate limit (requests per 1-second window).
+    pub fn set_rate_limit(&self, max_requests_per_sec: u32) {
+        self.rate_limiter
+            .lock()
+            .expect("rate limiter mutex poisoned")
+            .set_limit(max_requests_per_sec);
     }
 
     /// Return the actual bound local TCP socket address.
@@ -1187,10 +1277,11 @@ impl P2pNode {
 
         let state = Arc::clone(&self.state);
         let queue = Arc::clone(&self.gossip_queue);
+        let rate_limiter = Arc::clone(&self.rate_limiter);
         let shutdown = Arc::clone(&self.shutdown);
 
         let handle = thread::spawn(move || {
-            serve_accept_loop(listener, state, queue, shutdown);
+            serve_accept_loop(listener, state, queue, rate_limiter, shutdown);
         });
 
         self.threads
@@ -1265,6 +1356,7 @@ impl P2pNode {
             listener,
             Arc::clone(&self.state),
             Arc::clone(&self.gossip_queue),
+            Arc::clone(&self.rate_limiter),
             Arc::clone(&self.shutdown),
         );
         self.stop();
@@ -1330,30 +1422,53 @@ fn try_acquire_conn_slot(active: &Arc<AtomicUsize>) -> Option<ConnSlotGuard> {
     }
 }
 
-/// Non-blocking accept loop with bounded concurrency (`MAX_CONCURRENT_CONNS`), returning HTTP 503
-/// immediately when saturated instead of spawning unbounded threads.
+fn write_early_error_and_close(stream: &mut TcpStream, resp: &[u8]) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.write_all(resp);
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+    let mut drain = [0u8; 2048];
+    let _ = stream.read(&mut drain);
+}
+
+/// Non-blocking accept loop with per-IP rate limiting and bounded concurrency (`MAX_CONCURRENT_CONNS`),
+/// returning HTTP 429 or HTTP 503 immediately instead of spawning unbounded threads.
 fn serve_accept_loop(
     listener: TcpListener,
     state: Arc<Mutex<P2pNodeState>>,
     queue: Arc<GossipQueue>,
+    rate_limiter: Arc<Mutex<IpRateLimiter>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let active_conns = Arc::new(AtomicUsize::new(0));
     let mut conn_handles: Vec<JoinHandle<()>> = Vec::new();
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((mut stream, _peer_addr)) => {
+            Ok((mut stream, peer_addr)) => {
                 let _ = stream.set_nonblocking(false);
+                let allowed = rate_limiter
+                    .lock()
+                    .expect("rate limiter mutex poisoned")
+                    .allow(peer_addr.ip());
+                if !allowed {
+                    let resp = HttpResponse::err_json(
+                        429,
+                        "Too Many Requests",
+                        "per-IP rate limit exceeded",
+                    )
+                    .to_http_bytes();
+                    write_early_error_and_close(&mut stream, &resp);
+                    continue;
+                }
                 let Some(slot_guard) = try_acquire_conn_slot(&active_conns) else {
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
                     let resp = HttpResponse::err_json(
                         503,
                         "Service Unavailable",
                         "server saturated: too many concurrent connections",
                     )
                     .to_http_bytes();
-                    let _ = stream.write_all(&resp);
-                    let _ = stream.flush();
+                    write_early_error_and_close(&mut stream, &resp);
                     continue;
                 };
                 let st = Arc::clone(&state);
@@ -2002,10 +2117,24 @@ pub fn http_request(
     }
     let _ = stream.flush();
 
+    let deadline = Instant::now() + timeout;
     let mut raw = Vec::with_capacity(1024);
     let mut chunk = [0u8; 4096];
     let max_total = MAX_HTTP_HEADER_BYTES + MAX_HTTP_BODY_BYTES;
     loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            if raw.is_empty() {
+                return Err(format!("HTTP read timeout from {host_header}"));
+            }
+            break;
+        };
+        if remaining.is_zero() {
+            if raw.is_empty() {
+                return Err(format!("HTTP read timeout from {host_header}"));
+            }
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -2028,6 +2157,12 @@ pub fn http_request(
 
     let header_end = find_header_end(&raw)
         .ok_or_else(|| "malformed HTTP response: missing header terminator".to_string())?;
+    if header_end > MAX_HTTP_HEADER_BYTES {
+        return Err("HTTP response headers exceed maximum allowed size".to_string());
+    }
+    if raw[..header_end].contains(&0) {
+        return Err("HTTP response headers contain NUL byte".to_string());
+    }
     let header_str = std::str::from_utf8(&raw[..header_end])
         .map_err(|_| "HTTP response headers are not valid UTF-8".to_string())?;
     let status_line = header_str
@@ -2138,6 +2273,38 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b > 0x20
+                && b < 0x7f
+                && !matches!(
+                    b,
+                    b'(' | b')'
+                        | b'<'
+                        | b'>'
+                        | b'@'
+                        | b','
+                        | b';'
+                        | b':'
+                        | b'\\'
+                        | b'"'
+                        | b'/'
+                        | b'['
+                        | b']'
+                        | b'?'
+                        | b'='
+                        | b'{'
+                        | b'}'
+                )
+        })
+}
+
+fn has_disallowed_header_value_bytes(val: &str) -> bool {
+    val.bytes()
+        .any(|b| b == 0 || (b < 0x20 && b != b'\t') || b == 0x7f)
+}
+
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let deadline = Instant::now() + HTTP_READ_DEADLINE;
     let mut raw = Vec::with_capacity(1024);
@@ -2145,6 +2312,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
 
     let header_end = loop {
         if let Some(pos) = find_header_end(&raw) {
+            if pos > MAX_HTTP_HEADER_BYTES {
+                return Err("HTTP headers exceed maximum allowed size".to_string());
+            }
             break pos;
         }
         if raw.len() > MAX_HTTP_HEADER_BYTES {
@@ -2166,38 +2336,98 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         raw.extend_from_slice(&chunk[..n]);
     };
 
+    if raw[..header_end].contains(&0) {
+        return Err("HTTP headers contain NUL byte".to_string());
+    }
     let header_str = std::str::from_utf8(&raw[..header_end])
         .map_err(|_| "HTTP headers contain invalid UTF-8".to_string())?;
     let mut lines = header_str.split("\r\n");
     let request_line = lines
         .next()
         .ok_or_else(|| "missing HTTP request line".to_string())?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
+    if request_line.is_empty()
+        || request_line.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err("malformed HTTP request line".to_string());
+    }
+    let mut parts = request_line.split(' ');
+    let method_str = parts
         .next()
-        .ok_or_else(|| "missing HTTP method".to_string())?
-        .to_string();
+        .ok_or_else(|| "missing HTTP method".to_string())?;
     let raw_target = parts
         .next()
         .ok_or_else(|| "missing HTTP request target".to_string())?;
+    let version = parts
+        .next()
+        .ok_or_else(|| "missing HTTP version".to_string())?;
+    if parts.next().is_some() {
+        return Err("malformed HTTP request line: unexpected trailing tokens".to_string());
+    }
+    if method_str.is_empty()
+        || method_str.len() > 16
+        || !method_str.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err("invalid HTTP method".to_string());
+    }
+    if raw_target.is_empty()
+        || (!raw_target.starts_with('/') && !(method_str == "OPTIONS" && raw_target == "*"))
+    {
+        return Err("invalid HTTP request target".to_string());
+    }
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err("unsupported HTTP version".to_string());
+    }
+    let method = method_str.to_string();
     let (path, query) = match raw_target.split_once('?') {
         Some((p, q)) => (p.to_string(), Some(q.to_string())),
         None => (raw_target.to_string(), None),
     };
 
     let mut content_length: usize = 0;
+    let mut seen_content_length = false;
+    let mut seen_transfer_encoding = false;
+    let mut header_count: usize = 0;
     let mut content_type: Option<String> = None;
     for line in lines {
-        if let Some((name, val)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                content_length = val
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| "invalid Content-Length header".to_string())?;
-            } else if name.trim().eq_ignore_ascii_case("content-type") {
-                content_type = Some(val.trim().to_string());
-            }
+        header_count += 1;
+        if header_count > MAX_HTTP_HEADERS {
+            return Err("too many HTTP headers".to_string());
         }
+        if line.is_empty() || line.contains('\r') || line.contains('\n') {
+            return Err("malformed HTTP header line".to_string());
+        }
+        let Some((name, val)) = line.split_once(':') else {
+            return Err("malformed HTTP header: missing colon".to_string());
+        };
+        if !is_valid_http_header_name(name) {
+            return Err("malformed HTTP header name".to_string());
+        }
+        if has_disallowed_header_value_bytes(val) {
+            return Err("HTTP header contains disallowed control bytes".to_string());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if seen_content_length {
+                return Err("duplicate Content-Length header".to_string());
+            }
+            seen_content_length = true;
+            let trimmed_val = val.trim();
+            if trimmed_val.is_empty() || !trimmed_val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid Content-Length header".to_string());
+            }
+            content_length = trimmed_val
+                .parse::<usize>()
+                .map_err(|_| "invalid Content-Length header".to_string())?;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            seen_transfer_encoding = true;
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(val.trim().to_string());
+        }
+    }
+    if seen_transfer_encoding && seen_content_length {
+        return Err("conflicting Transfer-Encoding and Content-Length headers".to_string());
+    }
+    if seen_transfer_encoding {
+        return Err("Transfer-Encoding request header is not supported".to_string());
     }
     if content_length > MAX_HTTP_BODY_BYTES {
         return Err("HTTP body exceeds maximum allowed size".to_string());
@@ -2224,7 +2454,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             .read(&mut chunk[..to_read])
             .map_err(|e| format!("failed to read HTTP body: {e}"))?;
         if n == 0 {
-            break;
+            return Err("truncated HTTP request body".to_string());
         }
         body.extend_from_slice(&chunk[..n]);
     }
@@ -2481,6 +2711,9 @@ impl<'a> JsonParser<'a> {
         while self.pos < self.src.len() {
             let b = self.src[self.pos];
             self.pos += 1;
+            if b < 0x20 {
+                return Err("unescaped control byte inside JSON string".to_string());
+            }
             if b == b'"' {
                 return Ok(out);
             }
@@ -2508,18 +2741,19 @@ impl<'a> JsonParser<'a> {
                         let code = u32::from_str_radix(hex, 16)
                             .map_err(|_| "invalid hex in \\u escape".to_string())?;
                         self.pos += 4;
-                        if let Some(ch) = char::from_u32(code) {
-                            out.push(ch);
-                        }
+                        let ch = char::from_u32(code)
+                            .ok_or_else(|| "invalid Unicode scalar in \\u escape".to_string())?;
+                        out.push(ch);
                     }
-                    other => out.push(other as char),
+                    _ => return Err("invalid JSON escape sequence".to_string()),
                 }
             } else {
-                // Collect contiguous plain UTF-8 bytes up to next quote/backslash.
+                // Collect contiguous plain UTF-8 bytes up to next quote/backslash/control byte.
                 let start = self.pos - 1;
                 while self.pos < self.src.len()
                     && self.src[self.pos] != b'"'
                     && self.src[self.pos] != b'\\'
+                    && self.src[self.pos] >= 0x20
                 {
                     self.pos += 1;
                 }
@@ -2545,8 +2779,12 @@ impl<'a> JsonParser<'a> {
         }
         if self.peek() == Some(b'.') {
             self.pos += 1;
+            let frac_start = self.pos;
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
                 self.pos += 1;
+            }
+            if self.pos == frac_start {
+                return Err("invalid JSON fractional number".to_string());
             }
         }
         if matches!(self.peek(), Some(b'e' | b'E')) {
@@ -2554,8 +2792,12 @@ impl<'a> JsonParser<'a> {
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.pos += 1;
             }
+            let exp_start = self.pos;
             while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
                 self.pos += 1;
+            }
+            if self.pos == exp_start {
+                return Err("invalid JSON exponent".to_string());
             }
         }
         let s = std::str::from_utf8(&self.src[start..self.pos])
@@ -3166,5 +3408,155 @@ mod tests {
         q.push(GossipJob::CatchUpSync);
         q.push(GossipJob::CatchUpSync);
         assert_eq!(q.jobs.lock().unwrap().len(), 1);
+    }
+
+    fn send_raw_p2p_bytes(addr: SocketAddr, payload: &[u8]) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect P2pNode");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream.write_all(payload).expect("write raw payload");
+        stream.flush().expect("flush");
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).expect("read response");
+        let resp_str = String::from_utf8_lossy(&resp).into_owned();
+        let status_line = resp_str.lines().next().unwrap_or("");
+        let code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        (code, resp_str)
+    }
+
+    #[test]
+    fn test_adversarial_p2p_http_smuggling_rate_limit_json_and_subnet_eclipse() {
+        // 1. Live TCP HTTP smuggling & malformed header attacks -> 400 Bad Request.
+        let node = spawn_node(10, vec![]);
+        let addr = node.local_addr();
+
+        let mut many_headers = String::from("GET /health HTTP/1.1\r\nHost: localhost\r\n");
+        for i in 0..65 {
+            many_headers.push_str(&format!("X-H-{i}: v\r\n"));
+        }
+        many_headers.push_str("\r\n");
+
+        let hostile: Vec<Vec<u8>> = vec![
+            b"POST /faucet HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            b"POST /faucet HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            b"GET /health\x00evil HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\nX-Bad: \x07\r\n\r\n".to_vec(),
+            many_headers.into_bytes(),
+            b"GET /health HTTP/1.1 EXTRA\r\nHost: localhost\r\n\r\n".to_vec(),
+        ];
+        for (i, payload) in hostile.iter().enumerate() {
+            let (code, resp) = send_raw_p2p_bytes(addr, payload);
+            assert_eq!(code, 400, "hostile P2P request #{i} expected 400, got {code}: {resp}");
+        }
+
+        // 2. Per-IP rate limiter returns HTTP 429 when burst exceeded.
+        let rl_node = spawn_node(11, vec![]);
+        rl_node.set_rate_limit(2);
+        let rl_addr = rl_node.advertise_addr();
+        assert_eq!(http_get(&rl_addr, "/health").unwrap().0, 200);
+        assert_eq!(http_get(&rl_addr, "/health").unwrap().0, 200);
+        assert_eq!(http_get(&rl_addr, "/health").unwrap().0, 429);
+        rl_node.stop();
+        node.stop();
+
+        // 3. JSON parser adversarial checks: key-substring spoofing, escaped quotes, nesting, u64 overflow.
+        let v1 = parse_json(r#"{"not_account_id": 1}"#).unwrap();
+        assert_eq!(v1.get_u64("account_id"), None);
+        let v2 = parse_json(r#"{"not_account_id": 1, "account_id": 2, "a": "foo\\", "b": "x\\\"y"}"#).unwrap();
+        assert_eq!(v2.get_u64("account_id"), Some(2));
+        assert_eq!(v2.get_str("a"), Some(r"foo\"));
+        assert_eq!(v2.get_str("b"), Some("x\\\"y"));
+        let v_ov = parse_json(r#"{"account_id": 99999999999999999999999}"#).unwrap();
+        assert_eq!(v_ov.get_u64("account_id"), None);
+        let deep = format!("{}{}", "[".repeat(MAX_JSON_DEPTH + 5), "]".repeat(MAX_JSON_DEPTH + 5));
+        assert!(parse_json(&deep).is_err());
+        assert!(parse_json("{\"a\": \"bad\x00str\"}").is_err());
+
+        // 4. P2P /24 subnet eclipse-attack defense on P2pNodeState::upsert_peer.
+        let mut st = P2pNodeState::new(
+            P2pNodeConfig {
+                node_id: 0,
+                bind_addr: "127.0.0.1:0".to_string(),
+                advertise_addr: "127.0.0.1:18081".to_string(),
+                seeds: vec![],
+                gossip_interval_ms: 1000,
+            },
+            "127.0.0.1:18081".parse().unwrap(),
+        )
+        .expect("init state");
+
+        for i in 1..=(MAX_PEERS_PER_SUBNET as u64) {
+            st.upsert_peer(PeerInfo {
+                node_id: i,
+                addr: format!("203.0.113.{i}:8080"),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: i,
+                healthy: true,
+            })
+            .expect("peer within /24 subnet cap");
+        }
+        // 5th peer in same /24 MUST be rejected.
+        let eclipse_err = st
+            .upsert_peer(PeerInfo {
+                node_id: 5,
+                addr: "203.0.113.5:8080".to_string(),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: 5,
+                healthy: true,
+            })
+            .expect_err("5th peer in same /24 must be rejected");
+        assert!(eclipse_err.contains("eclipse"), "unexpected error: {eclipse_err}");
+
+        // IPv4-mapped IPv6 in same /24 cannot bypass subnet cap.
+        assert!(
+            st.upsert_peer(PeerInfo {
+                node_id: 6,
+                addr: "[::ffff:203.0.113.6]:8080".to_string(),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: 6,
+                healthy: true,
+            })
+            .is_err()
+        );
+
+        // Peer in a different /24 subnet succeeds.
+        assert!(
+            st.upsert_peer(PeerInfo {
+                node_id: 7,
+                addr: "203.0.114.1:8080".to_string(),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: 7,
+                healthy: true,
+            })
+            .is_ok()
+        );
+
+        // Marking one peer in 203.0.113.0/24 unhealthy allows eviction and replacement.
+        st.set_peer_health("203.0.113.1:8080", false);
+        assert!(
+            st.upsert_peer(PeerInfo {
+                node_id: 8,
+                addr: "203.0.113.8:8080".to_string(),
+                height: 0,
+                pop_score: 10,
+                qber: 0.01,
+                last_seen_secs: 8,
+                healthy: true,
+            })
+            .is_ok()
+        );
     }
 }

@@ -305,16 +305,19 @@ pub fn carter_wegman_mac(data: &[u8], r: u128, s: u128) -> [u8; MAC_TAG_BYTES] {
     let s = reduce(s);
 
     let mut acc: u128 = 0;
+    let mut buf = [0u8; 16];
     for chunk in data.chunks(15) {
-        let mut buf = [0u8; 16];
+        buf = [0u8; 16];
         buf[..chunk.len()].copy_from_slice(chunk);
         buf[chunk.len()] = 0x01;
         let block = u128::from_le_bytes(buf);
         // `block < 2^121 < PRIME_P` and `acc < PRIME_P`, satisfying `add_mod` preconditions.
         acc = mul_mod(add_mod(acc, block), r);
     }
+    zeroize_slice(&mut buf);
 
     let tag_val = add_mod(acc, s);
+    zeroize_u128(&mut acc);
     debug_assert!(tag_val < PRIME_P);
     tag_val.to_be_bytes()
 }
@@ -322,8 +325,10 @@ pub fn carter_wegman_mac(data: &[u8], r: u128, s: u128) -> [u8; MAC_TAG_BYTES] {
 /// Constant-time verification of a Carter-Wegman MAC tag using `ct_eq_16`.
 #[inline]
 pub fn verify_mac(data: &[u8], r: u128, s: u128, tag: &[u8; MAC_TAG_BYTES]) -> bool {
-    let expected = carter_wegman_mac(data, r, s);
-    ct_eq_16(&expected, tag)
+    let mut expected = carter_wegman_mac(data, r, s);
+    let ok = ct_eq_16(&expected, tag);
+    zeroize_slice(&mut expected);
+    ok
 }
 
 /// Pack a variable-length payload (`<= MAX_PAYLOAD_BYTES`) into a fixed `FRAME_BYTES` buffer:
@@ -363,7 +368,11 @@ pub fn unpack_frame(frame: &[u8]) -> Result<Vec<u8>, OtpError> {
         });
     }
 
-    if frame[2 + declared..].iter().any(|&b| b != 0) {
+    let mut pad_or: u8 = 0;
+    for &b in &frame[2 + declared..] {
+        pad_or |= b;
+    }
+    if pad_or != 0 {
         return Err(OtpError::InvalidFramePadding);
     }
 
@@ -797,7 +806,12 @@ impl WalPadBook {
 
         let mut needs_data_sync = false;
         if valid_len != data_len {
-            // Truncate incomplete trailing record from an interrupted append.
+            // Overwrite any incomplete trailing record bytes with zeros before truncating
+            // so partial key bytes from an interrupted append cannot linger on disk.
+            let tail_len = (data_len - valid_len) as usize;
+            let zeros = vec![0u8; tail_len];
+            data_file.seek(SeekFrom::Start(valid_len))?;
+            data_file.write_all(&zeros)?;
             data_file.set_len(valid_len)?;
             needs_data_sync = true;
         }
@@ -808,12 +822,19 @@ impl WalPadBook {
         let mut burned = BTreeSet::new();
         let mut next_id: u64 = 0;
 
-        let mut rec_buf = vec![0u8; record_size];
+        struct ZeroizeBuf(Vec<u8>);
+        impl Drop for ZeroizeBuf {
+            fn drop(&mut self) {
+                zeroize_slice(&mut self.0);
+            }
+        }
+        let mut rec_guard = ZeroizeBuf(vec![0u8; record_size]);
         let mut slots_needing_wipe: Vec<u64> = Vec::new();
 
         data_file.seek(SeekFrom::Start(PAD_HEADER_LEN))?;
         for slot_idx in 0..total_slots {
-            data_file.read_exact(&mut rec_buf)?;
+            data_file.read_exact(&mut rec_guard.0)?;
+            let rec_buf = &rec_guard.0;
             let page_id = u64::from_be_bytes(rec_buf[0..8].try_into().unwrap());
             let state = rec_buf[8];
             let next = page_id.saturating_add(1);
@@ -823,6 +844,11 @@ impl WalPadBook {
 
             match state {
                 PAGE_STATE_BURNED => {
+                    if burned.contains(&page_id) || pages.contains_key(&page_id) {
+                        return Err(OtpError::CorruptStorage(format!(
+                            "duplicate page_id {page_id} in pad file"
+                        )));
+                    }
                     burned.insert(page_id);
                     // Defense-in-depth: if any key byte in a burned slot is non-zero, wipe it.
                     if rec_buf[9..].iter().any(|&b| b != 0) {
@@ -831,27 +857,30 @@ impl WalPadBook {
                 }
                 PAGE_STATE_ACTIVE => {
                     if burned.contains(&page_id) || pages.contains_key(&page_id) {
-                        zeroize_slice(&mut rec_buf);
                         return Err(OtpError::CorruptStorage(format!(
                             "duplicate page_id {page_id} in pad file"
                         )));
                     }
                     let mac_r = u128::from_be_bytes(rec_buf[9..25].try_into().unwrap());
                     let mac_s = u128::from_be_bytes(rec_buf[25..41].try_into().unwrap());
+                    if mac_r >= PRIME_P || mac_s >= PRIME_P {
+                        return Err(OtpError::CorruptStorage(format!(
+                            "non-canonical MAC key scalar at slot {slot_idx}"
+                        )));
+                    }
                     let enc_key = rec_buf[41..41 + enc_key_bytes].to_vec();
                     let page = PadPage::from_raw(page_id, enc_key, mac_r, mac_s);
                     pages.insert(page_id, page);
                     slot_map.insert(page_id, slot_idx);
                 }
                 other => {
-                    zeroize_slice(&mut rec_buf);
                     return Err(OtpError::CorruptStorage(format!(
                         "invalid page state byte 0x{other:02x} at slot {slot_idx}"
                     )));
                 }
             }
         }
-        zeroize_slice(&mut rec_buf);
+        drop(rec_guard);
 
         // Open and replay the WAL. If data file already has slots (`total_slots > 0`), a missing
         // or empty WAL could mask previously burned pages (catastrophic two-time-pad risk) and
@@ -897,6 +926,7 @@ impl WalPadBook {
 
             let wal_body = wal_len - WAL_HEADER_LEN;
             let num_wal_recs = wal_body / WAL_RECORD_LEN as u64;
+            let has_trailing_partial = wal_body % (WAL_RECORD_LEN as u64) != 0;
             let mut valid_wal_end = WAL_HEADER_LEN;
             let mut wal_rec = [0u8; WAL_RECORD_LEN];
 
@@ -908,8 +938,8 @@ impl WalPadBook {
                 if op == WAL_OP_BURN && pid_inv == !pid {
                     wal_burned.insert(pid);
                     valid_wal_end = WAL_HEADER_LEN + (i + 1) * WAL_RECORD_LEN as u64;
-                } else if i + 1 == num_wal_recs {
-                    // Only tolerate a torn tail at the very last WAL record.
+                } else if i + 1 == num_wal_recs && !has_trailing_partial {
+                    // Only tolerate a torn tail at the very last WAL record when no bytes follow it.
                     break;
                 } else {
                     return Err(OtpError::CorruptStorage(format!(
@@ -1110,7 +1140,18 @@ impl WalPadBook {
         }
 
         let record_size = Self::record_size_for(self.enc_key_bytes);
-        let mut buf = vec![0u8; record_size * pages.len()];
+        let new_total_slots = self
+            .total_slots
+            .checked_add(pages.len() as u64)
+            .ok_or_else(|| OtpError::CorruptStorage("pad slot count overflow".into()))?;
+        let _end_offset = new_total_slots
+            .checked_mul(record_size as u64)
+            .and_then(|v| PAD_HEADER_LEN.checked_add(v))
+            .ok_or_else(|| OtpError::CorruptStorage("pad file size overflow".into()))?;
+        let buf_len = record_size
+            .checked_mul(pages.len())
+            .ok_or_else(|| OtpError::CorruptStorage("append batch size overflow".into()))?;
+        let mut buf = vec![0u8; buf_len];
         for (i, page) in pages.iter().enumerate() {
             let base = i * record_size;
             buf[base..base + 8].copy_from_slice(&page.page_id.to_be_bytes());
@@ -1598,6 +1639,111 @@ mod tests {
             WalPadBook::open(&path),
             Err(OtpError::CorruptStorage(_))
         ));
+
+        cleanup_wal_files(&path);
+    }
+
+    #[test]
+    fn test_wal_pad_book_edge_corruptions_and_trailing_wipe() {
+        let path = unique_temp_path("edge_corrupt");
+        cleanup_wal_files(&path);
+
+        // 1. Active slot followed by Burned slot with duplicate page_id MUST be rejected.
+        {
+            let book = WalPadBook::create(
+                &path,
+                FRAME_BYTES,
+                vec![PadPage::generate(7, FRAME_BYTES)],
+            )
+            .unwrap();
+            drop(book);
+        }
+        let rec_size = PAGE_META_BYTES + FRAME_BYTES;
+        {
+            // Append a second slot with the SAME page_id = 7 in BURNED state.
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            let mut dup_burned = vec![0u8; rec_size];
+            dup_burned[0..8].copy_from_slice(&7u64.to_be_bytes());
+            dup_burned[8] = PAGE_STATE_BURNED;
+            f.write_all(&dup_burned).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(matches!(
+            WalPadBook::open(&path),
+            Err(OtpError::CorruptStorage(_))
+        ));
+        cleanup_wal_files(&path);
+
+        // 2. Non-canonical MAC scalar (>= PRIME_P) on disk MUST be rejected as CorruptStorage.
+        {
+            let book = WalPadBook::create(
+                &path,
+                FRAME_BYTES,
+                vec![PadPage::generate(0, FRAME_BYTES)],
+            )
+            .unwrap();
+            drop(book);
+        }
+        {
+            let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            // Flip MSB of mac_r (offset PAD_HEADER_LEN + 9) so mac_r >= PRIME_P.
+            f.seek(SeekFrom::Start(PAD_HEADER_LEN + 9)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert!(matches!(
+            WalPadBook::open(&path),
+            Err(OtpError::CorruptStorage(_))
+        ));
+        cleanup_wal_files(&path);
+
+        // 3. Corrupt full WAL record followed by trailing partial bytes MUST be rejected.
+        {
+            let book = WalPadBook::create(
+                &path,
+                FRAME_BYTES,
+                vec![PadPage::generate(0, FRAME_BYTES)],
+            )
+            .unwrap();
+            drop(book);
+        }
+        {
+            let wal_path = WalPadBook::wal_path_for(&path);
+            let mut f = open_secret_file(&wal_path, true).unwrap();
+            f.write_all(WAL_MAGIC).unwrap();
+            f.write_all(&[0xFF; WAL_RECORD_LEN]).unwrap(); // corrupt full record
+            f.write_all(&[0x01, 0x02, 0x03]).unwrap(); // trailing bytes after corrupt record
+            f.sync_all().unwrap();
+        }
+        assert!(matches!(
+            WalPadBook::open(&path),
+            Err(OtpError::CorruptStorage(_))
+        ));
+        cleanup_wal_files(&path);
+
+        // 4. Incomplete trailing data record is truncated cleanly and valid pages remain usable.
+        {
+            let book = WalPadBook::create(
+                &path,
+                FRAME_BYTES,
+                vec![PadPage::generate(0, FRAME_BYTES)],
+            )
+            .unwrap();
+            drop(book);
+        }
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xAB; 19]).unwrap();
+            f.sync_all().unwrap();
+        }
+        {
+            let reopened = WalPadBook::open(&path).unwrap();
+            assert_eq!(reopened.remaining(), 1);
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                PAD_HEADER_LEN + rec_size as u64
+            );
+        }
 
         cleanup_wal_files(&path);
     }

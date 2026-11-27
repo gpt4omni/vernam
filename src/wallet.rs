@@ -12,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -35,6 +35,15 @@ pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum HTTP response size accepted by `WalletRpcClient` (4 MiB).
 pub const MAX_RPC_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum HTTP response header block size accepted by `WalletRpcClient` (16 KiB).
+const MAX_RPC_HEADER_BYTES: usize = 16 * 1024;
+
+/// Maximum HTTP response headers accepted by `WalletRpcClient`.
+const MAX_RPC_HEADERS: usize = 64;
+
+/// Maximum JSON nesting depth accepted by wallet JSON helpers.
+const MAX_JSON_DEPTH: usize = 32;
 
 /// Maximum permitted wallet name length in ASCII characters.
 pub const MAX_WALLET_NAME_LEN: usize = 64;
@@ -1129,25 +1138,7 @@ impl WalletRpcClient {
     /// `GET /p2p/peers` — auto-discover all active peer node addresses from a single seed node.
     pub fn discover_peers(&self) -> Result<Vec<String>, WalletError> {
         let raw = self.request("GET", "/p2p/peers", None)?;
-        let mut addrs = Vec::new();
-        let needle = "\"addr\":\"";
-        let mut slice = raw.as_str();
-        while let Some(pos) = slice.find(needle) {
-            let after = &slice[pos + needle.len()..];
-            if let Some(end) = after.find('"') {
-                let addr = after[..end].trim();
-                let valid_peer = !addr.is_empty()
-                    && !addr.chars().any(|c| c.is_whitespace() || c.is_control())
-                    && parse_http_endpoint(addr).is_ok();
-                if valid_peer && !addrs.iter().any(|a| a == addr) {
-                    addrs.push(addr.to_string());
-                }
-                slice = &after[end + 1..];
-            } else {
-                break;
-            }
-        }
-        Ok(addrs)
+        Ok(extract_peer_addrs_from_json(&raw))
     }
 
     /// Query `GET /status` with automatic peer failover across discovered P2P nodes.
@@ -1232,9 +1223,21 @@ impl WalletRpcClient {
         stream.write_all(req.as_bytes())?;
         stream.flush()?;
 
+        let deadline = Instant::now() + self.timeout;
         let mut raw_resp = Vec::with_capacity(4096);
         let mut buf = [0u8; 4096];
         loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(WalletError::RpcError(
+                    "HTTP response read deadline exceeded".into(),
+                ));
+            };
+            if remaining.is_zero() {
+                return Err(WalletError::RpcError(
+                    "HTTP response read deadline exceeded".into(),
+                ));
+            }
+            let _ = stream.set_read_timeout(Some(remaining));
             let n = stream.read(&mut buf)?;
             if n == 0 {
                 break;
@@ -1346,6 +1349,17 @@ fn parse_http_response(raw: &[u8]) -> Result<String, WalletError> {
         ));
     };
 
+    if header_bytes.len() > MAX_RPC_HEADER_BYTES {
+        return Err(WalletError::RpcError(
+            "HTTP response headers exceed maximum allowed size".into(),
+        ));
+    }
+    if header_bytes.contains(&0) {
+        return Err(WalletError::RpcError(
+            "HTTP response headers contain NUL byte".into(),
+        ));
+    }
+
     let header_str = std::str::from_utf8(header_bytes)
         .map_err(|_| WalletError::RpcError("HTTP response headers are not valid UTF-8".into()))?;
 
@@ -1353,6 +1367,11 @@ fn parse_http_response(raw: &[u8]) -> Result<String, WalletError> {
     let status_line = lines
         .next()
         .ok_or_else(|| WalletError::RpcError("empty HTTP status line".into()))?;
+    if status_line.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(WalletError::RpcError(
+            "HTTP status line contains disallowed control bytes".into(),
+        ));
+    }
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
@@ -1361,13 +1380,57 @@ fn parse_http_response(raw: &[u8]) -> Result<String, WalletError> {
         .map_err(|_| WalletError::RpcError(format!("invalid HTTP status in '{status_line}'")))?;
 
     let mut is_chunked = false;
+    let mut seen_content_length = false;
+    let mut seen_transfer_encoding = false;
+    let mut header_count: usize = 0;
     for line in lines {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("transfer-encoding")
-            && v.to_ascii_lowercase().contains("chunked")
-        {
-            is_chunked = true;
+        header_count += 1;
+        if header_count > MAX_RPC_HEADERS {
+            return Err(WalletError::RpcError(
+                "HTTP response has too many headers".into(),
+            ));
         }
+        if line
+            .bytes()
+            .any(|b| b == 0 || (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return Err(WalletError::RpcError(
+                "HTTP response header contains disallowed control bytes".into(),
+            ));
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            return Err(WalletError::RpcError(
+                "malformed HTTP response header: missing colon".into(),
+            ));
+        };
+        let key = k.trim();
+        if key.eq_ignore_ascii_case("content-length") {
+            if seen_content_length {
+                return Err(WalletError::RpcError(
+                    "duplicate Content-Length header in HTTP response".into(),
+                ));
+            }
+            seen_content_length = true;
+            let trimmed = v.trim();
+            if trimmed.is_empty()
+                || !trimmed.bytes().all(|b| b.is_ascii_digit())
+                || trimmed.parse::<usize>().is_err()
+            {
+                return Err(WalletError::RpcError(
+                    "invalid Content-Length header in HTTP response".into(),
+                ));
+            }
+        } else if key.eq_ignore_ascii_case("transfer-encoding") {
+            seen_transfer_encoding = true;
+            if v.to_ascii_lowercase().contains("chunked") {
+                is_chunked = true;
+            }
+        }
+    }
+    if seen_transfer_encoding && seen_content_length {
+        return Err(WalletError::RpcError(
+            "conflicting Transfer-Encoding and Content-Length in HTTP response".into(),
+        ));
     }
 
     let decoded_body = if is_chunked {
@@ -1413,6 +1476,11 @@ fn decode_chunked_body(mut data: &[u8]) -> Result<Vec<u8>, WalletError> {
                 "chunked HTTP body shorter than declared chunk length".into(),
             ));
         }
+        if &data[chunk_len..needed] != b"\r\n" {
+            return Err(WalletError::RpcError(
+                "missing CRLF chunk terminator in chunked HTTP response".into(),
+            ));
+        }
         if out.len().saturating_add(chunk_len) > MAX_RPC_RESPONSE_BYTES {
             return Err(WalletError::RpcError(format!(
                 "decoded chunked HTTP body exceeded maximum size ({MAX_RPC_RESPONSE_BYTES} bytes)"
@@ -1422,6 +1490,295 @@ fn decode_chunked_body(mut data: &[u8]) -> Result<Vec<u8>, WalletError> {
         data = &data[needed..];
     }
     Ok(out)
+}
+
+fn scan_json_string(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if start >= len || bytes[start] != b'"' {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < len {
+        let b = bytes[i];
+        if b < 0x20 {
+            return None;
+        }
+        if b == b'\\' {
+            i += 1;
+            if i >= len {
+                return None;
+            }
+            match bytes[i] {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => i += 1,
+                b'u' => {
+                    if i + 5 > len {
+                        return None;
+                    }
+                    for &hx in &bytes[i + 1..i + 5] {
+                        if !hx.is_ascii_hexdigit() {
+                            return None;
+                        }
+                    }
+                    i += 5;
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        if b == b'"' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn unescape_json_string_literal(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let end = scan_json_string(bytes, 0)?;
+    let inner = &raw[1..end - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if (ch as u32) < 0x20 {
+            return None;
+        }
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let mut hex = [0u8; 4];
+                for slot in &mut hex {
+                    let c = chars.next()?;
+                    if !c.is_ascii_hexdigit() {
+                        return None;
+                    }
+                    *slot = c as u8;
+                }
+                let hex_str = std::str::from_utf8(&hex).ok()?;
+                let code = u32::from_str_radix(hex_str, 16).ok()?;
+                out.push(char::from_u32(code)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if start >= len {
+        return None;
+    }
+    match bytes[start] {
+        b'"' => scan_json_string(bytes, start),
+        b'{' | b'[' => {
+            let mut stack = [0u8; MAX_JSON_DEPTH];
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < len {
+                match bytes[i] {
+                    b'"' => i = scan_json_string(bytes, i)?,
+                    b'{' => {
+                        if depth >= MAX_JSON_DEPTH {
+                            return None;
+                        }
+                        stack[depth] = b'}';
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'[' => {
+                        if depth >= MAX_JSON_DEPTH {
+                            return None;
+                        }
+                        stack[depth] = b']';
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' => {
+                        if depth == 0 || stack[depth - 1] != bytes[i] {
+                            return None;
+                        }
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    b if b < 0x20 && !matches!(b, b' ' | b'\t' | b'\r' | b'\n') => return None,
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < len && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+            {
+                if bytes[i] < 0x20 {
+                    return None;
+                }
+                i += 1;
+            }
+            if i == start { None } else { Some(i) }
+        }
+    }
+}
+
+fn find_json_value_start<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = json.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= len || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1;
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] == b'}' {
+            return None;
+        }
+        if bytes[i] != b'"' {
+            return None;
+        }
+        let key_end = scan_json_string(bytes, i)?;
+        let raw_key_inner = &json[i + 1..key_end - 1];
+        let matched = if !raw_key_inner.contains('\\') {
+            raw_key_inner == key
+        } else {
+            unescape_json_string_literal(&json[i..key_end]).as_deref() == Some(key)
+        };
+        i = key_end;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] != b':' {
+            return None;
+        }
+        i += 1;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            return None;
+        }
+        if matched {
+            return Some(&json[i..]);
+        }
+        i = skip_json_value(bytes, i)?;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] == b'}' {
+            return None;
+        }
+        if bytes[i] != b',' {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+/// Hardened top-level JSON unsigned 64-bit integer extractor (immune to key-substring spoofing,
+/// escaped-quote edge cases, deep nesting, and u64 overflow).
+pub fn parse_json_u64(json: &str, key: &str) -> Option<u64> {
+    let rest = find_json_value_start(json, key)?;
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+    let mut end = 0;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end < bytes.len() {
+        let next = bytes[end];
+        if !matches!(next, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n') {
+            return None;
+        }
+    }
+    rest[..end].parse::<u64>().ok()
+}
+
+/// Hardened top-level JSON string extractor (immune to key-substring spoofing, escaped quotes,
+/// and deep nesting).
+pub fn parse_json_str(json: &str, key: &str) -> Option<String> {
+    let rest = find_json_value_start(json, key)?;
+    let bytes = rest.as_bytes();
+    let end = scan_json_string(bytes, 0)?;
+    let mut k = end;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k < bytes.len() && !matches!(bytes[k], b',' | b'}' | b']') {
+        return None;
+    }
+    unescape_json_string_literal(&rest[..end])
+}
+
+/// Structurally parse a JSON array of peer objects (`[{"addr":"..."}, ...]`), ignoring
+/// spoofed keys like `"fake_addr"`, embedded strings, and malformed entries.
+fn extract_peer_addrs_from_json(raw: &str) -> Vec<String> {
+    let mut addrs = Vec::new();
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= len || bytes[i] != b'[' {
+        return addrs;
+    }
+    i += 1;
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] == b']' {
+            break;
+        }
+        let Some(elem_end) = skip_json_value(bytes, i) else {
+            break;
+        };
+        if bytes[i] == b'{'
+            && let Some(addr_val) = parse_json_str(&raw[i..elem_end], "addr")
+        {
+            let addr = addr_val.trim();
+            let valid_peer = !addr.is_empty()
+                && !addr.chars().any(|c| c.is_whitespace() || c.is_control())
+                && parse_http_endpoint(addr).is_ok();
+            if valid_peer && !addrs.iter().any(|a| a == addr) {
+                addrs.push(addr.to_string());
+            }
+        }
+        i = elem_end;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] == b']' {
+            break;
+        }
+        if bytes[i] != b',' {
+            break;
+        }
+        i += 1;
+    }
+    addrs
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1910,5 +2267,65 @@ mod tests {
             let dir_mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode, 0o700, "wallet directory must be 0700 on Unix");
         }
+    }
+
+    #[test]
+    fn test_wallet_adversarial_json_and_http_response_hardening() {
+        // 1. JSON key-substring spoofing, embedded strings, nested objects, escaped quotes, overflow.
+        assert_eq!(parse_json_u64(r#"{"not_account_id": 1}"#, "account_id"), None);
+        assert_eq!(
+            parse_json_u64(r#"{"not_account_id": 1, "account_id": 2}"#, "account_id"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_json_u64(r#"{"memo": "\"account_id\": 99", "account_id": 5}"#, "account_id"),
+            Some(5)
+        );
+        assert_eq!(
+            parse_json_u64(r#"{"nested": {"account_id": 99}}"#, "account_id"),
+            None
+        );
+        let escaped = r#"{"a": "foo\\", "b": "bar\\\"baz", "account_id": 77}"#;
+        assert_eq!(parse_json_str(escaped, "a").as_deref(), Some(r"foo\"));
+        assert_eq!(parse_json_str(escaped, "b").as_deref(), Some("bar\\\"baz"));
+        assert_eq!(parse_json_u64(escaped, "account_id"), Some(77));
+        assert_eq!(
+            parse_json_u64(r#"{"account_id": 99999999999999999999999}"#, "account_id"),
+            None
+        );
+        let deep = format!(
+            "{{\"nested\": {}{}, \"account_id\": 1}}",
+            "{".repeat(128),
+            "}".repeat(128)
+        );
+        assert_eq!(parse_json_u64(&deep, "account_id"), None);
+
+        // 2. Peer discovery JSON extractor resists key-substring and string-embedded spoofing.
+        let peers_raw = r#"[
+            {"fake_addr": "1.2.3.4:8080", "memo": "\"addr\":\"5.6.7.8:8080\""},
+            {"node_id": 0, "addr": "127.0.0.1:8080"},
+            {"node_id": 1, "addr": "127.0.0.1:8081"}
+        ]"#;
+        let peers = extract_peer_addrs_from_json(peers_raw);
+        assert_eq!(peers, vec!["127.0.0.1:8080", "127.0.0.1:8081"]);
+
+        // 3. HTTP response parser rejects smuggling (duplicate Content-Length, TE+CL, NUL, > 64 headers).
+        assert!(parse_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}"
+        )
+        .is_err());
+        assert!(parse_http_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n0\r\n\r\n"
+        )
+        .is_err());
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nX-Null: a\x00b\r\n\r\n{}").is_err());
+        let mut too_many = String::from("HTTP/1.1 200 OK\r\n");
+        for i in 0..65 {
+            too_many.push_str(&format!("X-H-{i}: v\r\n"));
+        }
+        too_many.push_str("\r\n{}");
+        assert!(parse_http_response(too_many.as_bytes()).is_err());
+        // Missing CRLF after chunk payload rejected.
+        assert!(decode_chunked_body(b"4\r\nabcdXX0\r\n\r\n").is_err());
     }
 }

@@ -271,11 +271,11 @@ pub fn random_nonzero_challenge() -> u128 {
 fn fill_random_field_elems(out: &mut [u128]) {
     const CHUNK_ELEMS: usize = 2048;
     let mut raw = [0u8; CHUNK_ELEMS * 16];
+    let mut b = [0u8; 16];
     for chunk in out.chunks_mut(CHUNK_ELEMS) {
         let byte_len = chunk.len() * 16;
         fill_os_random_fast(&mut raw[..byte_len]);
         for (dst, bytes_slice) in chunk.iter_mut().zip(raw[..byte_len].chunks_exact(16)) {
-            let mut b = [0u8; 16];
             b.copy_from_slice(bytes_slice);
             let cand = u128::from_le_bytes(b) & PRIME_P;
             *dst = if cand < PRIME_P {
@@ -285,6 +285,7 @@ fn fill_random_field_elems(out: &mut [u128]) {
             };
         }
     }
+    zeroize_slice(&mut b);
     zeroize_slice(&mut raw);
 }
 
@@ -370,13 +371,14 @@ const fn add_unreduced(a: u128, b: u128) -> u128 {
     (s & PRIME_P) + (s >> 127)
 }
 
-/// Canonicalize an unreduced element `x <= PRIME_P` into `[0, PRIME_P)`.
+/// Branchlessly canonicalize an unreduced element `x <= PRIME_P` into `[0, PRIME_P)`.
 #[inline(always)]
 const fn canon_le_p(x: u128) -> u128 {
-    if x == PRIME_P { 0 } else { x }
+    let carry = (x + 1) >> 127;
+    (x + carry) & PRIME_P
 }
 
-/// Exact canonical `(a * b) mod PRIME_P` for canonical `a, b <= PRIME_P` (single branch).
+/// Exact branchless canonical `(a * b) mod PRIME_P` for `a, b <= PRIME_P`.
 #[inline(always)]
 const fn mul_mod_fast(a: u128, b: u128) -> u128 {
     canon_le_p(mul_unreduced(a, b))
@@ -863,22 +865,31 @@ impl TurboBeaverBank {
     /// Compact any vector whose consumed prefix has reached at least half its capacity.
     #[inline]
     fn compact_if_half_consumed(&mut self) {
-        if self.sq_pos > 0 && self.sq_pos * 2 >= self.squares.capacity() {
+        if self.sq_pos > 0 && self.sq_pos.saturating_mul(2) >= self.squares.capacity() {
             self.compact_squares();
         }
-        if self.star_pos > 0 && self.star_pos * 2 >= self.stars.capacity() {
+        if self.star_pos > 0 && self.star_pos.saturating_mul(2) >= self.stars.capacity() {
             self.compact_stars();
         }
-        if self.triple_pos > 0 && self.triple_pos * 2 >= self.triples.capacity() {
+        if self.triple_pos > 0 && self.triple_pos.saturating_mul(2) >= self.triples.capacity() {
             self.compact_triples();
         }
     }
 
     /// Refill correlated randomness for `tx_count` additional confidential transfers.
     pub fn refill_for_txs(&mut self, tx_count: usize) {
-        self.refill_squares(tx_count * SQUARES_PER_TURBO_TX);
-        self.refill_stars(tx_count * STARS_PER_TURBO_TX);
-        self.refill_triples(tx_count * TRIPLES_PER_TURBO_TX);
+        let need_sq = tx_count
+            .checked_mul(SQUARES_PER_TURBO_TX)
+            .expect("tx_count overflow for Beaver squares");
+        let need_stars = tx_count
+            .checked_mul(STARS_PER_TURBO_TX)
+            .expect("tx_count overflow for Beaver stars");
+        let need_triples = tx_count
+            .checked_mul(TRIPLES_PER_TURBO_TX)
+            .expect("tx_count overflow for Beaver triples");
+        self.refill_squares(need_sq);
+        self.refill_stars(need_stars);
+        self.refill_triples(need_triples);
     }
 
     /// Pre-generate `count` fresh single-use [`BeaverSquare`] pairs in parallel.
@@ -1074,7 +1085,9 @@ impl TurboBeaverBank {
     ) -> Result<(&mut [BeaverSquare], &mut [BeaverStar16], &mut [BeaverTriple4]), TurboShieldedError>
     {
         self.compact_if_half_consumed();
-        let need_sq = tx_count * SQUARES_PER_TURBO_TX;
+        let need_sq = tx_count
+            .checked_mul(SQUARES_PER_TURBO_TX)
+            .ok_or(TurboShieldedError::InvalidParameters("tx_count overflow"))?;
         let avail_sq = self.available_squares();
         if avail_sq < need_sq {
             return Err(TurboShieldedError::BeaverSquaresExhausted {
@@ -1082,7 +1095,9 @@ impl TurboBeaverBank {
                 available: avail_sq,
             });
         }
-        let need_stars = tx_count * STARS_PER_TURBO_TX;
+        let need_stars = tx_count
+            .checked_mul(STARS_PER_TURBO_TX)
+            .ok_or(TurboShieldedError::InvalidParameters("tx_count overflow"))?;
         let avail_stars = self.available_stars();
         if avail_stars < need_stars {
             return Err(TurboShieldedError::BeaverStarsExhausted {
@@ -1090,7 +1105,9 @@ impl TurboBeaverBank {
                 available: avail_stars,
             });
         }
-        let need_triples = tx_count * TRIPLES_PER_TURBO_TX;
+        let need_triples = tx_count
+            .checked_mul(TRIPLES_PER_TURBO_TX)
+            .ok_or(TurboShieldedError::InvalidParameters("tx_count overflow"))?;
         let avail_triples = self.available_triples();
         if avail_triples < need_triples {
             return Err(TurboShieldedError::BeaverTriplesExhausted {
@@ -1266,7 +1283,7 @@ impl TurboTransferRequest {
             ));
         }
 
-        let remainder = sender_balance - amount;
+        let mut remainder = sender_balance - amount;
         const TOTAL_POLYS: usize = SQUARES_PER_TURBO_TX;
         let mut rands = [0u128; TOTAL_POLYS * 2];
         fill_random_field_elems(&mut rands);
@@ -1292,6 +1309,7 @@ impl TurboTransferRequest {
             idx += 2;
         }
 
+        zeroize_u128(&mut remainder);
         zeroize_u128_slice(&mut rands);
         Ok(Self {
             bucket_id,
@@ -1350,24 +1368,27 @@ fn accumulate_bool_square_rlc(
 
     // Branchless Horner step across all 4 independent validator lanes:
     // z[i] = z[i] * gamma + (2*d - 1) * a[i] + a_sq[i]  (all values stay <= PRIME_P).
-    let a = sq.a;
-    let a_sq = sq.a_sq;
-    z[0] = add_unreduced(
-        add_unreduced(mul_unreduced(z[0], gamma), mul_unreduced(two_d_minus_1, a[0])),
-        a_sq[0],
-    );
-    z[1] = add_unreduced(
-        add_unreduced(mul_unreduced(z[1], gamma), mul_unreduced(two_d_minus_1, a[1])),
-        a_sq[1],
-    );
-    z[2] = add_unreduced(
-        add_unreduced(mul_unreduced(z[2], gamma), mul_unreduced(two_d_minus_1, a[2])),
-        a_sq[2],
-    );
-    z[3] = add_unreduced(
-        add_unreduced(mul_unreduced(z[3], gamma), mul_unreduced(two_d_minus_1, a[3])),
-        a_sq[3],
-    );
+    // Borrow `sq.a` and `sq.a_sq` directly to avoid creating unzeroized stack copies.
+    {
+        let a = &sq.a;
+        let a_sq = &sq.a_sq;
+        z[0] = add_unreduced(
+            add_unreduced(mul_unreduced(z[0], gamma), mul_unreduced(two_d_minus_1, a[0])),
+            a_sq[0],
+        );
+        z[1] = add_unreduced(
+            add_unreduced(mul_unreduced(z[1], gamma), mul_unreduced(two_d_minus_1, a[1])),
+            a_sq[1],
+        );
+        z[2] = add_unreduced(
+            add_unreduced(mul_unreduced(z[2], gamma), mul_unreduced(two_d_minus_1, a[2])),
+            a_sq[2],
+        );
+        z[3] = add_unreduced(
+            add_unreduced(mul_unreduced(z[3], gamma), mul_unreduced(two_d_minus_1, a[3])),
+            a_sq[3],
+        );
+    }
     *z_const = add_unreduced(mul_unreduced(*z_const, gamma), d_dm1);
 
     // Immediately wipe consumed square pair while still hot in L1 cache.
@@ -1419,6 +1440,14 @@ pub fn execute_transfer_in_bucket(
             available: squares.len(),
         });
     }
+    // Validate ALL 16 bucket balance slots are canonical `< PRIME_P` upfront so no subsequent
+    // `add_unreduced(bal[i], t_i)` can ever overflow on corrupted non-sender slots.
+    for slot in balances.iter() {
+        if slot[0] >= PRIME_P || slot[1] >= PRIME_P || slot[2] >= PRIME_P || slot[3] >= PRIME_P {
+            wipe_remaining_tx_beaver(squares, 0, star, blind_triple);
+            return Err(TurboShieldedError::FieldElementOutOfRange);
+        }
+    }
 
     let mut z: Share4 = [0u128; 4];
     let mut z_const: u128 = 0u128;
@@ -1434,6 +1463,7 @@ pub fn execute_transfer_in_bucket(
             &mut z_const,
         ) {
             wipe_remaining_tx_beaver(squares, sq_idx, star, blind_triple);
+            zeroize_u128(&mut z_const);
             zeroize_share4(&mut z);
             return Err(e);
         }
@@ -1450,6 +1480,7 @@ pub fn execute_transfer_in_bucket(
             &mut z_const,
         ) {
             wipe_remaining_tx_beaver(squares, sq_idx, star, blind_triple);
+            zeroize_u128(&mut z_const);
             zeroize_share4(&mut z);
             return Err(e);
         }
@@ -1464,6 +1495,7 @@ pub fn execute_transfer_in_bucket(
             accumulate_bool_square_rlc(s_k, &mut squares[sq_idx], gamma, &mut z, &mut z_const)
         {
             wipe_remaining_tx_beaver(squares, sq_idx, star, blind_triple);
+            zeroize_u128(&mut z_const);
             zeroize_share4(&mut z);
             zeroize_share4(&mut sum_s);
             return Err(e);
@@ -1480,31 +1512,25 @@ pub fn execute_transfer_in_bucket(
     let mut v_shares = compose_bits_16(&req.v_bits);
     let mut r_shares = compose_bits_16(&req.r_bits);
     let sender_bal = &balances[req.sender_slot];
-    if sender_bal[0] >= PRIME_P
-        || sender_bal[1] >= PRIME_P
-        || sender_bal[2] >= PRIME_P
-        || sender_bal[3] >= PRIME_P
-    {
-        star.wipe_in_place_nofence();
-        blind_triple.wipe_in_place_nofence();
-        zeroize_share4_nofence(&mut v_shares);
-        zeroize_share4_nofence(&mut r_shares);
-        zeroize_share4_nofence(&mut sum_s);
-        zeroize_share4(&mut z);
-        return Err(TurboShieldedError::FieldElementOutOfRange);
-    }
 
     // Check #49: eq = B_sender - v - r.
-    let eq0 = sub_mod(sub_mod(sender_bal[0], v_shares[0]), r_shares[0]);
-    let eq1 = sub_mod(sub_mod(sender_bal[1], v_shares[1]), r_shares[1]);
-    let eq2 = sub_mod(sub_mod(sender_bal[2], v_shares[2]), r_shares[2]);
-    let eq3 = sub_mod(sub_mod(sender_bal[3], v_shares[3]), r_shares[3]);
+    z[0] = add_unreduced(
+        mul_unreduced(z[0], gamma),
+        sub_mod(sub_mod(sender_bal[0], v_shares[0]), r_shares[0]),
+    );
+    z[1] = add_unreduced(
+        mul_unreduced(z[1], gamma),
+        sub_mod(sub_mod(sender_bal[1], v_shares[1]), r_shares[1]),
+    );
+    z[2] = add_unreduced(
+        mul_unreduced(z[2], gamma),
+        sub_mod(sub_mod(sender_bal[2], v_shares[2]), r_shares[2]),
+    );
+    z[3] = add_unreduced(
+        mul_unreduced(z[3], gamma),
+        sub_mod(sub_mod(sender_bal[3], v_shares[3]), r_shares[3]),
+    );
     zeroize_share4_nofence(&mut r_shares);
-
-    z[0] = add_unreduced(mul_unreduced(z[0], gamma), eq0);
-    z[1] = add_unreduced(mul_unreduced(z[1], gamma), eq1);
-    z[2] = add_unreduced(mul_unreduced(z[2], gamma), eq2);
-    z[3] = add_unreduced(mul_unreduced(z[3], gamma), eq3);
     z_const = mul_unreduced(z_const, gamma);
 
     // Check #50: sum(s_k) - 1 (subtracting 1 folded into z_const via + (PRIME_P - 1)).
@@ -1523,10 +1549,11 @@ pub fn execute_transfer_in_bucket(
         canon_le_p(add_unreduced(z[2], z_const)),
         canon_le_p(add_unreduced(z[3], z_const)),
     ];
+    zeroize_u128(&mut z_const);
     zeroize_share4_nofence(&mut z);
 
     let mut rho = random_nonzero_share4_fast();
-    let d_r = match TurboLagrange3Of4::open_diff(&rho, &blind_triple.a) {
+    let mut d_r = match TurboLagrange3Of4::open_diff(&rho, &blind_triple.a) {
         Ok(v) => v,
         Err(e) => {
             star.wipe_in_place_nofence();
@@ -1537,18 +1564,19 @@ pub fn execute_transfer_in_bucket(
             return Err(e);
         }
     };
-    let e_z = match TurboLagrange3Of4::open_diff(&z_final, &blind_triple.b) {
+    let mut e_z = match TurboLagrange3Of4::open_diff(&z_final, &blind_triple.b) {
         Ok(v) => v,
         Err(e) => {
             star.wipe_in_place_nofence();
             blind_triple.wipe_in_place_nofence();
+            zeroize_u128(&mut d_r);
             zeroize_share4_nofence(&mut rho);
             zeroize_share4_nofence(&mut z_final);
             zeroize_share4(&mut v_shares);
             return Err(e);
         }
     };
-    let de = mul_mod_fast(d_r, e_z);
+    let mut de = mul_mod_fast(d_r, e_z);
     let mut z_blind: Share4 = [
         canon_le_p(add_unreduced(
             add_unreduced(blind_triple.c[0], mul_unreduced(d_r, blind_triple.b[0])),
@@ -1568,6 +1596,9 @@ pub fn execute_transfer_in_bucket(
         )),
     ];
     blind_triple.wipe_in_place_nofence();
+    zeroize_u128(&mut d_r);
+    zeroize_u128(&mut e_z);
+    zeroize_u128(&mut de);
     zeroize_share4_nofence(&mut rho);
     zeroize_share4_nofence(&mut z_final);
 
@@ -1591,7 +1622,7 @@ pub fn execute_transfer_in_bucket(
     // 5. Shared-Factor Beaver Star 16-slot blinded recipient update (1 + 16 = 17 openings):
     //    Open beta = v - b_v ONCE, then open alpha_k = s_k - a_k for k = 0..16, and apply
     //    credit_k = c_k + alpha_k * b_v + beta * a_k + alpha_k * beta directly into balances[k].
-    let beta = match TurboLagrange3Of4::open_diff(&v_shares, &star.b_v) {
+    let mut beta = match TurboLagrange3Of4::open_diff(&v_shares, &star.b_v) {
         Ok(b) => b,
         Err(e) => {
             star.wipe_in_place_nofence();
@@ -1600,13 +1631,13 @@ pub fn execute_transfer_in_bucket(
         }
     };
 
-    let bv = star.b_v;
     let mut alpha_buf = [0u128; TURBO_BUCKET_SIZE];
     for k in 0..TURBO_BUCKET_SIZE {
         match TurboLagrange3Of4::open_diff(&req.selector_shares[k], &star.a[k]) {
             Ok(ak) => alpha_buf[k] = ak,
             Err(e) => {
                 star.wipe_in_place_nofence();
+                zeroize_u128(&mut beta);
                 zeroize_share4_nofence(&mut v_shares);
                 zeroize_u128_slice(&mut alpha_buf);
                 return Err(e);
@@ -1622,38 +1653,43 @@ pub fn execute_transfer_in_bucket(
     sender[3] = sub_mod(sender[3], v_shares[3]);
 
     // Apply all 16 blinded credits in place (every slot's share re-randomizes via fresh [c_k]).
-    for k in 0..TURBO_BUCKET_SIZE {
-        let alpha_k = alpha_buf[k];
-        let ab = mul_unreduced(alpha_k, beta);
-        let ak = star.a[k];
-        let ck = star.c[k];
-        let bal = &mut balances[k];
+    // Borrow `star.b_v`, `star.a[k]`, `star.c[k]` by reference to avoid unzeroized stack copies.
+    {
+        let bv = &star.b_v;
+        for k in 0..TURBO_BUCKET_SIZE {
+            let alpha_k = alpha_buf[k];
+            let ab = mul_unreduced(alpha_k, beta);
+            let ak = &star.a[k];
+            let ck = &star.c[k];
+            let bal = &mut balances[k];
 
-        let t0 = add_unreduced(
-            add_unreduced(mul_unreduced(alpha_k, bv[0]), mul_unreduced(beta, ak[0])),
-            add_unreduced(ck[0], ab),
-        );
-        let t1 = add_unreduced(
-            add_unreduced(mul_unreduced(alpha_k, bv[1]), mul_unreduced(beta, ak[1])),
-            add_unreduced(ck[1], ab),
-        );
-        let t2 = add_unreduced(
-            add_unreduced(mul_unreduced(alpha_k, bv[2]), mul_unreduced(beta, ak[2])),
-            add_unreduced(ck[2], ab),
-        );
-        let t3 = add_unreduced(
-            add_unreduced(mul_unreduced(alpha_k, bv[3]), mul_unreduced(beta, ak[3])),
-            add_unreduced(ck[3], ab),
-        );
+            let t0 = add_unreduced(
+                add_unreduced(mul_unreduced(alpha_k, bv[0]), mul_unreduced(beta, ak[0])),
+                add_unreduced(ck[0], ab),
+            );
+            let t1 = add_unreduced(
+                add_unreduced(mul_unreduced(alpha_k, bv[1]), mul_unreduced(beta, ak[1])),
+                add_unreduced(ck[1], ab),
+            );
+            let t2 = add_unreduced(
+                add_unreduced(mul_unreduced(alpha_k, bv[2]), mul_unreduced(beta, ak[2])),
+                add_unreduced(ck[2], ab),
+            );
+            let t3 = add_unreduced(
+                add_unreduced(mul_unreduced(alpha_k, bv[3]), mul_unreduced(beta, ak[3])),
+                add_unreduced(ck[3], ab),
+            );
 
-        bal[0] = canon_le_p(add_unreduced(bal[0], t0));
-        bal[1] = canon_le_p(add_unreduced(bal[1], t1));
-        bal[2] = canon_le_p(add_unreduced(bal[2], t2));
-        bal[3] = canon_le_p(add_unreduced(bal[3], t3));
+            bal[0] = canon_le_p(add_unreduced(bal[0], t0));
+            bal[1] = canon_le_p(add_unreduced(bal[1], t1));
+            bal[2] = canon_le_p(add_unreduced(bal[2], t2));
+            bal[3] = canon_le_p(add_unreduced(bal[3], t3));
+        }
     }
 
     // Immediately wipe consumed star & stack secrets in L1 cache (single trailing fence).
     star.wipe_in_place_nofence();
+    zeroize_u128(&mut beta);
     zeroize_share4_nofence(&mut v_shares);
     zeroize_u128_slice(&mut alpha_buf);
     Ok(())
@@ -1922,8 +1958,17 @@ impl TurboShieldedCluster {
             ));
         }
 
-        let total_accounts = num_buckets * TURBO_BUCKET_SIZE;
-        let mut rands = vec![0u128; total_accounts * 2];
+        let total_accounts = num_buckets
+            .checked_mul(TURBO_BUCKET_SIZE)
+            .ok_or(TurboShieldedError::InvalidParameters(
+                "num_buckets overflow",
+            ))?;
+        let rands_len = total_accounts
+            .checked_mul(2)
+            .ok_or(TurboShieldedError::InvalidParameters(
+                "num_buckets overflow",
+            ))?;
+        let mut rands = vec![0u128; rands_len];
         fill_random_field_elems(&mut rands);
 
         let mut buckets = Vec::with_capacity(num_buckets);
@@ -2864,5 +2909,151 @@ mod tests {
         assert_eq!(*triples[0].a(), [0u128; 4]);
         assert_eq!(*triples[0].b(), [0u128; 4]);
         assert_eq!(*triples[0].c(), [0u128; 4]);
+    }
+
+    #[test]
+    fn test_adversarial_non_canonical_inputs_and_multi_bucket_fuzz_conservation() {
+        // 1. Exhaustive rejection of non-canonical >= PRIME_P inputs on all entrypoints.
+        for &bad_val in &[PRIME_P, PRIME_P + 1, 2 * PRIME_P, u128::MAX] {
+            assert_eq!(
+                TurboLagrange3Of4::split_secret(bad_val),
+                Err(TurboShieldedError::FieldElementOutOfRange)
+            );
+            let mut shares = TurboLagrange3Of4::split_secret(123).unwrap();
+            for lane in 0..4 {
+                let saved = shares[lane];
+                shares[lane] = bad_val;
+                assert_eq!(
+                    TurboLagrange3Of4::verify_degree2(&shares),
+                    Err(TurboShieldedError::FieldElementOutOfRange)
+                );
+                assert_eq!(
+                    TurboLagrange3Of4::reconstruct_and_verify(&shares),
+                    Err(TurboShieldedError::FieldElementOutOfRange)
+                );
+                shares[lane] = saved;
+            }
+
+            // Non-canonical balance in a NON-sender slot (e.g. slot 15) MUST be rejected cleanly
+            // without overflow panic or state mutation!
+            let mut bucket = [[0u128; 4]; TURBO_BUCKET_SIZE];
+            for slot in bucket.iter_mut() {
+                *slot = TurboLagrange3Of4::split_secret(100).unwrap();
+            }
+            bucket[15][2] = bad_val;
+            let req = TurboTransferRequest::new(0, 0, 100, 1, 10).unwrap();
+            let mut bank = TurboBeaverBank::new_for_txs(1);
+            let (sq, st, tr) = bank.reserve_for_txs(1).unwrap();
+            assert_eq!(
+                execute_transfer_in_bucket(&mut bucket, &req, sq, &mut st[0], &mut tr[0], 7),
+                Err(TurboShieldedError::FieldElementOutOfRange)
+            );
+            // Beaver material must also have been zeroized on error.
+            assert_eq!(*st[0].b_v(), [0u128; 4]);
+            assert_eq!(*tr[0].a(), [0u128; 4]);
+
+            // Non-canonical gamma >= PRIME_P rejected.
+            let mut clean_bucket = [[0u128; 4]; TURBO_BUCKET_SIZE];
+            let mut bank2 = TurboBeaverBank::new_for_txs(1);
+            let (sq2, st2, tr2) = bank2.reserve_for_txs(1).unwrap();
+            assert_eq!(
+                execute_transfer_in_bucket(
+                    &mut clean_bucket,
+                    &req,
+                    sq2,
+                    &mut st2[0],
+                    &mut tr2[0],
+                    bad_val
+                ),
+                Err(TurboShieldedError::InvalidParameters(
+                    "RLC challenge gamma must be in [1, PRIME_P)"
+                ))
+            );
+        }
+
+        // 2. Multi-bucket adversarial fuzz sequence: 20 parallel batches across 8 buckets with
+        //    random valid transfers, self-transfers, zero-value transfers, max-balance drains,
+        //    plus injected invalid batches verifying 100% atomic rollback & exact conservation.
+        let num_buckets = 8usize;
+        let mut cluster = TurboShieldedCluster::new(num_buckets).unwrap();
+        let mut expected = vec![[0u128; TURBO_BUCKET_SIZE]; num_buckets];
+        let mut bucket_supply = vec![0u128; num_buckets];
+
+        for b in 0..num_buckets {
+            for s in 0..TURBO_BUCKET_SIZE {
+                let init = 1_500 + (b as u128) * 19 + (s as u128) * 11;
+                cluster.mint_balance(b, s, init).unwrap();
+                expected[b][s] = init;
+                bucket_supply[b] += init;
+            }
+        }
+
+        let mut bank = TurboBeaverBank::new_for_txs(2_048);
+        let mut state: u64 = 0xCAFE_BABE_1234_5678;
+        let mut next_u64 = || -> u64 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            state
+        };
+
+        for round in 0..20usize {
+            let mut staged_exp = expected.clone();
+            let mut batch = Vec::with_capacity(num_buckets * 4);
+            for b in 0..num_buckets {
+                for _ in 0..4 {
+                    let sender = (next_u64() as usize) % TURBO_BUCKET_SIZE;
+                    let recipient = (next_u64() as usize) % TURBO_BUCKET_SIZE;
+                    let bal = staged_exp[b][sender];
+                    let amount = if bal == 0 {
+                        0
+                    } else if round % 5 == 0 {
+                        bal // full drain
+                    } else {
+                        (next_u64() as u128) % (bal + 1)
+                    };
+                    let req =
+                        TurboTransferRequest::new(b, sender, bal, recipient, amount).unwrap();
+                    staged_exp[b][sender] -= amount;
+                    staged_exp[b][recipient] += amount;
+                    batch.push(req);
+                }
+            }
+
+            if round % 4 == 3 {
+                // Corrupt one request in the batch with a non-canonical field element -> whole batch MUST roll back!
+                let victim = (next_u64() as usize) % batch.len();
+                match round % 3 {
+                    0 => batch[victim].v_bits[2][1] = PRIME_P,
+                    1 => batch[victim].r_bits[5][3] = u128::MAX,
+                    _ => batch[victim].selector_shares[7][0] = PRIME_P + 1,
+                }
+                assert_eq!(
+                    cluster.execute_parallel_batch(&batch, &mut bank),
+                    Err(TurboShieldedError::FieldElementOutOfRange)
+                );
+            } else {
+                let committed = cluster.execute_parallel_batch(&batch, &mut bank).unwrap();
+                assert_eq!(committed, batch.len());
+                expected = staged_exp;
+            }
+        }
+
+        for b in 0..num_buckets {
+            let mut sum = 0u128;
+            for s in 0..TURBO_BUCKET_SIZE {
+                let actual = cluster.reconstruct_balance(b, s).unwrap();
+                assert_eq!(
+                    actual, expected[b][s],
+                    "fuzz balance mismatch at bucket {b}, slot {s}"
+                );
+                sum += actual;
+            }
+            assert_eq!(
+                sum, bucket_supply[b],
+                "total supply not conserved in bucket {b}"
+            );
+        }
     }
 }

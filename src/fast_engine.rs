@@ -346,7 +346,10 @@ impl FastCwKey {
 
     /// Generate `count` independent single-use keys in a single batched OS entropy read.
     pub fn generate_batch(count: usize) -> Vec<Self> {
-        let mut elems = vec![0u128; count * 2];
+        let total_elems = count
+            .checked_mul(2)
+            .expect("FastCwKey batch size overflow");
+        let mut elems = vec![0u128; total_elems];
         fill_random_field_elems(&mut elems);
         let mut keys = Vec::with_capacity(count);
         for pair in elems.chunks_exact(2) {
@@ -454,16 +457,20 @@ impl CompactBatchProposal {
     /// Total number of transactions represented by this compact proposal.
     #[inline]
     pub fn tx_count(&self) -> usize {
-        self.short_ids.len() + self.prefilled_txs.len()
+        self.short_ids.len().saturating_add(self.prefilled_txs.len())
     }
 
     /// Exact wire byte length of this compact batch proposal.
     #[inline]
     pub fn wire_bytes(&self) -> usize {
         COMPACT_HEADER_SIZE
-            + 4 // prefilled_count
-            + self.short_ids.len() * 8
-            + self.prefilled_txs.len() * (4 + COMPACT_TX_SIZE)
+            .saturating_add(4)
+            .saturating_add(self.short_ids.len().saturating_mul(8))
+            .saturating_add(
+                self.prefilled_txs
+                    .len()
+                    .saturating_mul(4 + COMPACT_TX_SIZE),
+            )
     }
 
     /// Wire byte length of the equivalent full (non-compact) batch of [`CompactTx`] entries.
@@ -515,8 +522,22 @@ impl CompactBatchProposal {
         block_tag.copy_from_slice(&bytes[40..56]);
         let prefilled_count = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
 
-        let expected_len =
-            COMPACT_HEADER_SIZE + 4 + short_count * 8 + prefilled_count * (4 + COMPACT_TX_SIZE);
+        let short_bytes = short_count
+            .checked_mul(8)
+            .ok_or(FastEngineError::InvalidEncoding(
+                "compact proposal short_ids length overflow",
+            ))?;
+        let prefilled_bytes = prefilled_count
+            .checked_mul(4 + COMPACT_TX_SIZE)
+            .ok_or(FastEngineError::InvalidEncoding(
+                "compact proposal prefilled length overflow",
+            ))?;
+        let expected_len = (COMPACT_HEADER_SIZE + 4)
+            .checked_add(short_bytes)
+            .and_then(|v| v.checked_add(prefilled_bytes))
+            .ok_or(FastEngineError::InvalidEncoding(
+                "compact proposal total length overflow",
+            ))?;
         if bytes.len() != expected_len {
             return Err(FastEngineError::InvalidEncoding("compact proposal length mismatch"));
         }
@@ -699,7 +720,13 @@ impl FastMempool {
         proposal: &CompactBatchProposal,
         out: &mut Vec<CompactTx>,
     ) -> Result<(), Vec<usize>> {
-        let total = proposal.tx_count();
+        let Some(total) = proposal
+            .short_ids
+            .len()
+            .checked_add(proposal.prefilled_txs.len())
+        else {
+            return Err(vec![usize::MAX]);
+        };
         out.clear();
         out.reserve(total);
 
@@ -744,11 +771,11 @@ impl FastMempool {
                     missing.push(idx);
                 }
             }
+            for slot in slots {
+                out.push(slot.unwrap_or(CompactTx::new(0, 0, 0, 0)));
+            }
             if !missing.is_empty() {
                 return Err(missing);
-            }
-            for tx in slots.into_iter().flatten() {
-                out.push(tx);
             }
             Ok(())
         }
@@ -860,16 +887,25 @@ impl IndexedLedger {
                 "cannot stage_batch while a previous staged batch is still uncommitted",
             ));
         }
-        if height != self.height + 1 || !ct_eq_16(prev_tag, &self.tip_tag) {
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(FastEngineError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: height,
+            })?;
+        if height != expected_height || !ct_eq_16(prev_tag, &self.tip_tag) {
             return Err(FastEngineError::ChainLinkMismatch {
-                expected_height: self.height + 1,
+                expected_height,
                 got_height: height,
             });
         }
 
         let max_accounts = self.balances.len();
         self.undo_log.clear();
-        let needed_cap = txs.len() * 2;
+        let needed_cap = txs.len().checked_mul(2).ok_or(
+            FastEngineError::InvalidParameters("batch too large for undo log"),
+        )?;
         if self.undo_log.capacity() < needed_cap {
             self.undo_log.reserve(needed_cap - self.undo_log.len());
         }
@@ -1004,7 +1040,10 @@ impl FastLinkDeck {
         let mut out_slots = Vec::with_capacity(count);
         let mut in_slots = Vec::with_capacity(count);
         let cw_keys = FastCwKey::generate_batch(count);
-        let mut pads = vec![0u8; count * FAST_VOTE_PAYLOAD_LEN];
+        let pad_bytes = count
+            .checked_mul(FAST_VOTE_PAYLOAD_LEN)
+            .expect("FastLinkDeck pad buffer overflow");
+        let mut pads = vec![0u8; pad_bytes];
         fill_os_random(&mut pads);
 
         for (i, cw_a) in cw_keys.into_iter().enumerate() {
@@ -1044,12 +1083,15 @@ impl FastLinkDeck {
         payload: &[u8; FAST_VOTE_PAYLOAD_LEN],
     ) -> Result<FastVoteFrame, FastEngineError> {
         let idx = self.next_send_idx;
+        let next_idx = idx
+            .checked_add(1)
+            .ok_or(FastEngineError::OtpDeckExhausted)?;
         let slot = self
             .slots
             .get_mut(idx)
             .and_then(Option::take)
             .ok_or(FastEngineError::OtpDeckExhausted)?;
-        self.next_send_idx += 1;
+        self.next_send_idx = next_idx;
 
         let FastLinkSlot { otp_pad, cw_key } = slot;
         let mut ct = [0u8; FAST_VOTE_PAYLOAD_LEN];
@@ -1077,9 +1119,11 @@ impl FastLinkDeck {
         if frame.from != expected_from || frame.to != expected_to {
             return Err(FastEngineError::InvalidEncoding("vote endpoint mismatch"));
         }
+        let slot_idx =
+            usize::try_from(frame.slot_id).map_err(|_| FastEngineError::OtpDeckExhausted)?;
         let slot = self
             .slots
-            .get_mut(frame.slot_id as usize)
+            .get_mut(slot_idx)
             .and_then(Option::take)
             .ok_or(FastEngineError::OtpDeckExhausted)?;
 
@@ -1309,15 +1353,25 @@ impl FastExpressCluster {
     ///   invalid transaction (overdraft, replayed/non-monotonic `page_id`, zero amount, etc.).
     /// - Full pairwise OTP-encrypted, Carter-Wegman-authenticated Prepare and Commit vote frames.
     pub fn commit_batch(&mut self, txs: &[CompactTx]) -> Result<FastBlockCert, FastEngineError> {
-        let height = self.validators[0].ledger.height + 1;
+        let height = self.validators[0]
+            .ledger
+            .height
+            .checked_add(1)
+            .ok_or(FastEngineError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: u64::MAX,
+            })?;
         let view = self.current_view;
-        let leader_id = ((height as usize) + (view as usize)) % FAST_NUM_VALIDATORS;
+        let leader_id = (((height as u128) + (view as u128)) % (FAST_NUM_VALIDATORS as u128)) as usize;
         let prev_tag = self.validators[0].ledger.tip_tag;
-        let key_idx = ((height - 1) as usize) * VIEWS_PER_HEIGHT + (view as usize);
-
         if (view as usize) >= VIEWS_PER_HEIGHT {
             return Err(FastEngineError::MissingBlockSealKey { height });
         }
+        let key_idx = usize::try_from(height - 1)
+            .ok()
+            .and_then(|h| h.checked_mul(VIEWS_PER_HEIGHT))
+            .and_then(|v| v.checked_add(view as usize))
+            .ok_or(FastEngineError::MissingBlockSealKey { height })?;
 
         // Stage 1: Leader consumes its dedicated single-use sealing key and seals the batch.
         let leader_seal_key = self.validators[leader_id]
@@ -1342,7 +1396,7 @@ impl FastExpressCluster {
                 Ok(cert)
             }
             Err(e) => {
-                self.current_view += 1;
+                self.current_view = self.current_view.saturating_add(1);
                 Err(e)
             }
         }
@@ -1356,15 +1410,25 @@ impl FastExpressCluster {
         &mut self,
         txs: &[CompactTx],
     ) -> Result<(FastBlockCert, CompactBatchProposal), FastEngineError> {
-        let height = self.validators[0].ledger.height + 1;
+        let height = self.validators[0]
+            .ledger
+            .height
+            .checked_add(1)
+            .ok_or(FastEngineError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: u64::MAX,
+            })?;
         let view = self.current_view;
-        let leader_id = ((height as usize) + (view as usize)) % FAST_NUM_VALIDATORS;
+        let leader_id = (((height as u128) + (view as u128)) % (FAST_NUM_VALIDATORS as u128)) as usize;
         let prev_tag = self.validators[0].ledger.tip_tag;
-        let key_idx = ((height - 1) as usize) * VIEWS_PER_HEIGHT + (view as usize);
-
         if (view as usize) >= VIEWS_PER_HEIGHT {
             return Err(FastEngineError::MissingBlockSealKey { height });
         }
+        let key_idx = usize::try_from(height - 1)
+            .ok()
+            .and_then(|h| h.checked_mul(VIEWS_PER_HEIGHT))
+            .and_then(|v| v.checked_add(view as usize))
+            .ok_or(FastEngineError::MissingBlockSealKey { height })?;
 
         let leader_seal_key = self.validators[leader_id]
             .seal_keys
@@ -1394,7 +1458,7 @@ impl FastExpressCluster {
                 c
             }
             Err(e) => {
-                self.current_view += 1;
+                self.current_view = self.current_view.saturating_add(1);
                 return Err(e);
             }
         };
@@ -1424,7 +1488,12 @@ impl FastExpressCluster {
         compact_proposal: Option<&CompactBatchProposal>,
         fallback_txs: Option<&[CompactTx]>,
     ) -> Result<FastBlockCert, FastEngineError> {
-        let key_idx = ((height - 1) as usize) * VIEWS_PER_HEIGHT + (view as usize);
+        let key_idx = height
+            .checked_sub(1)
+            .and_then(|h| usize::try_from(h).ok())
+            .and_then(|h| h.checked_mul(VIEWS_PER_HEIGHT))
+            .and_then(|v| v.checked_add(view as usize))
+            .ok_or(FastEngineError::MissingBlockSealKey { height })?;
 
         // Phase 1 (Parallel across 4 validators):
         // - Followers reconstruct compact batch (if compact mode) & verify dedicated CW block seal.
@@ -1459,10 +1528,9 @@ impl FastExpressCluster {
                                     }
                                 } else {
                                     return Err(FastEngineError::MissingCompactTx {
-                                        short_id: prop
-                                            .short_ids
-                                            .get(missing[0])
-                                            .copied()
+                                        short_id: missing
+                                            .first()
+                                            .and_then(|&idx| prop.short_ids.get(idx).copied())
                                             .unwrap_or(0),
                                     });
                                 }
@@ -2335,8 +2403,13 @@ impl FastShieldedCluster {
         if num_buckets == 0 {
             return Err(FastEngineError::InvalidParameters("num_buckets must be >= 1"));
         }
-        let total_accounts = num_buckets * FAST_BUCKET_SIZE;
-        let mut rands = vec![0u128; total_accounts * 2];
+        let total_accounts = num_buckets
+            .checked_mul(FAST_BUCKET_SIZE)
+            .ok_or(FastEngineError::InvalidParameters("num_buckets overflow"))?;
+        let rand_len = total_accounts
+            .checked_mul(2)
+            .ok_or(FastEngineError::InvalidParameters("num_buckets overflow"))?;
+        let mut rands = vec![0u128; rand_len];
         fill_random_field_elems(&mut rands);
 
         let mut buckets = Vec::with_capacity(num_buckets);
@@ -2513,7 +2586,12 @@ impl FastShieldedCluster {
         }
 
         // 2. Verify aggregate Beaver triple availability before spawning threads.
-        let total_triples = requests.len() * TRIPLES_PER_SHIELDED_TX;
+        let total_triples = requests
+            .len()
+            .checked_mul(TRIPLES_PER_SHIELDED_TX)
+            .ok_or(FastEngineError::InvalidParameters(
+                "shielded batch request count overflow",
+            ))?;
         if pool.triples.len() < total_triples {
             return Err(FastEngineError::BeaverPoolExhausted {
                 needed: total_triples,
@@ -3128,5 +3206,44 @@ mod tests {
         assert!(report.cores_used >= 1);
         assert_eq!(report.express_txs_committed, 50_000);
         println!("{report}");
+    }
+
+    #[test]
+    fn test_compact_proposal_prefilled_miss_patching_and_overflow_decoding() {
+        // 1. Crafted overflowing header counts must fail cleanly without panic.
+        let mut malformed = vec![0u8; COMPACT_HEADER_SIZE + 4];
+        malformed[20..24].copy_from_slice(&u32::MAX.to_le_bytes()); // short_count
+        malformed[56..60].copy_from_slice(&u32::MAX.to_le_bytes()); // prefilled_count
+        assert!(matches!(
+            CompactBatchProposal::from_bytes(&malformed),
+            Err(FastEngineError::InvalidEncoding(_))
+        ));
+
+        // 2. Non-empty prefilled_txs + mempool miss populates `out` so patch_missing_txs works!
+        let key = RoundShortIdKey::generate();
+        let mut mp = FastMempool::new(key.duplicate_for_round());
+        let tx0 = CompactTx::new(0, 1, 10, 1);
+        let tx1 = CompactTx::new(1, 2, 20, 1);
+        let tx2 = CompactTx::new(2, 3, 30, 1);
+        // Only tx2 is in follower mempool; tx0 is prefilled; tx1 is a mempool miss.
+        mp.insert(tx2).unwrap();
+
+        let prop = CompactBatchProposal {
+            height: 1,
+            view: 0,
+            leader_id: 0,
+            prev_tag: FAST_GENESIS_TAG,
+            block_tag: [0u8; 16],
+            short_ids: vec![key.short_id(&tx1), key.short_id(&tx2)],
+            prefilled_txs: vec![(0, tx0)],
+        };
+        let mut out = Vec::new();
+        let missing = mp.reconstruct_batch(&prop, &mut out).unwrap_err();
+        assert_eq!(missing, vec![1]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], tx0);
+        assert_eq!(out[2], tx2);
+        mp.patch_missing_txs(&mut out, &[(1, tx1)]).unwrap();
+        assert_eq!(out, vec![tx0, tx1, tx2]);
     }
 }

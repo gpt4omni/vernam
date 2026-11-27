@@ -22,8 +22,8 @@
 use std::fmt;
 
 use crate::field::{
-    PRIME_P, add_mod, ct_eq_16, fill_os_random, inv_mod, mul_mod, random_field_elem, sub_mod,
-    zeroize_slice, zeroize_u128,
+    PRIME_P, add_mod, ct_eq_16, ct_eq_u128, fill_os_random, inv_mod, mul_mod, random_field_elem,
+    sub_mod, zeroize_slice, zeroize_u128,
 };
 
 /// Default Shamir threshold `t = 3` (tolerates up to `t - 1 = 2` colluding validators).
@@ -281,14 +281,16 @@ impl LagrangeCache {
             }
         }
 
+        let mut consistent = true;
         for (offset, row) in self.verify_rows.iter().enumerate() {
             let mut expected = 0u128;
             for (&coeff, &y) in row.iter().zip(shares.iter()) {
                 expected = add_mod(expected, mul_mod(coeff, y));
             }
-            if expected != shares[self.threshold + offset] {
-                return Err(MpcError::InconsistentShares);
-            }
+            consistent &= ct_eq_u128(expected, shares[self.threshold + offset]);
+        }
+        if !consistent {
+            return Err(MpcError::InconsistentShares);
         }
         Ok(())
     }
@@ -373,9 +375,16 @@ pub fn proactive_refresh_epoch(shares: &mut [u128], threshold: usize) -> Result<
     }
 
     let rand_coeffs_per_validator = threshold - 1;
-    let total_poly_rands = n * rand_coeffs_per_validator;
-    let total_otp_pads = n * n;
-    let mut entropy = vec![0u128; total_poly_rands + total_otp_pads];
+    let total_poly_rands = n
+        .checked_mul(rand_coeffs_per_validator)
+        .ok_or(MpcError::InvalidParameters("validator count overflow"))?;
+    let total_otp_pads = n
+        .checked_mul(n)
+        .ok_or(MpcError::InvalidParameters("validator count overflow"))?;
+    let total_entropy = total_poly_rands
+        .checked_add(total_otp_pads)
+        .ok_or(MpcError::InvalidParameters("entropy buffer size overflow"))?;
+    let mut entropy = vec![0u128; total_entropy];
     fill_random_field_elems(&mut entropy);
 
     let (poly_rands, otp_pads) = entropy.split_at(total_poly_rands);
@@ -445,11 +454,21 @@ pub fn proactive_refresh_epoch_batch(
 
     let n = num_validators;
     let rand_coeffs_per_validator = threshold - 1;
-    let per_secret_poly = n * rand_coeffs_per_validator;
-    let per_secret_pads = n * n;
-    let per_secret_total = per_secret_poly + per_secret_pads;
+    let per_secret_poly = n
+        .checked_mul(rand_coeffs_per_validator)
+        .ok_or(MpcError::InvalidParameters("validator count overflow"))?;
+    let per_secret_pads = n
+        .checked_mul(n)
+        .ok_or(MpcError::InvalidParameters("validator count overflow"))?;
+    let per_secret_total = per_secret_poly
+        .checked_add(per_secret_pads)
+        .ok_or(MpcError::InvalidParameters("entropy buffer size overflow"))?;
+    let total_entropy = share_vecs
+        .len()
+        .checked_mul(per_secret_total)
+        .ok_or(MpcError::InvalidParameters("batch entropy size overflow"))?;
 
-    let mut entropy = vec![0u128; share_vecs.len() * per_secret_total];
+    let mut entropy = vec![0u128; total_entropy];
     fill_random_field_elems(&mut entropy);
 
     let mut coeffs = vec![0u128; threshold];
@@ -796,7 +815,12 @@ pub fn mpc_mul(
     let mut d_shares = Vec::with_capacity(n);
     let mut e_shares = Vec::with_capacity(n);
     for i in 0..n {
-        if x[i] >= PRIME_P || y[i] >= PRIME_P {
+        if x[i] >= PRIME_P
+            || y[i] >= PRIME_P
+            || triple.a[i] >= PRIME_P
+            || triple.b[i] >= PRIME_P
+            || triple.c[i] >= PRIME_P
+        {
             zeroize_u128_slice(&mut d_shares);
             zeroize_u128_slice(&mut e_shares);
             return Err(MpcError::FieldElementOutOfRange);
@@ -908,7 +932,7 @@ impl ConfidentialTransferRequest {
             ));
         }
 
-        let remainder = sender_balance - amount;
+        let mut remainder = sender_balance - amount;
         let mut v_bits = Vec::with_capacity(bit_width);
         let mut r_bits = Vec::with_capacity(bit_width);
         for j in 0..bit_width {
@@ -917,6 +941,7 @@ impl ConfidentialTransferRequest {
             v_bits.push(split_secret(vb, threshold, num_validators)?);
             r_bits.push(split_secret(rb, threshold, num_validators)?);
         }
+        zeroize_u128(&mut remainder);
 
         let mut selector_shares = Vec::with_capacity(bucket_size);
         for k in 0..bucket_size {
@@ -948,9 +973,17 @@ impl ConfidentialTransferRequest {
         if bucket_size == 0 {
             return Err(MpcError::InvalidParameters("bucket_size must be >= 1"));
         }
+        // Unbiased rejection sampling over [0, bucket_size).
+        let bound = bucket_size as u64;
+        let zone = u64::MAX - (u64::MAX % bound);
         let mut raw = [0u8; 8];
-        fill_os_random(&mut raw);
-        let dummy_slot = (u64::from_le_bytes(raw) as usize) % bucket_size;
+        let dummy_slot = loop {
+            fill_os_random(&mut raw);
+            let sample = u64::from_le_bytes(raw);
+            if sample < zone {
+                break (sample % bound) as usize;
+            }
+        };
         zeroize_slice(&mut raw);
 
         Self::new(
@@ -1078,6 +1111,16 @@ impl ShardedPrivateLedger {
         if num_buckets == 0 || bucket_size == 0 || bit_width == 0 || bit_width > 64 {
             return Err(MpcError::InvalidParameters(
                 "require num_buckets >= 1, bucket_size >= 1, 1 <= bit_width <= 64",
+            ));
+        }
+        if num_buckets.checked_mul(bucket_size).is_none()
+            || bucket_size
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(2 * bit_width + 1))
+                .is_none()
+        {
+            return Err(MpcError::InvalidParameters(
+                "num_buckets * bucket_size overflow",
             ));
         }
         let cache = LagrangeCache::new(threshold, num_validators)?;
@@ -1322,42 +1365,63 @@ impl ShardedPrivateLedger {
         // 3. Recompose [v] and [r] linearly and enforce B_sender - v - r == 0 using a
         //    multiplicatively blinded zero-check [rho * eq_check] with uniform non-zero [rho]
         //    so a failed check leaks ZERO bits about B_sender or concurrent incoming credits.
-        let v_shares = self.compose_bits(&req.v_bits);
-        let mut r_shares = self.compose_bits(&req.r_bits);
-        let mut diff = mpc_sub(sender_balance_shares, &v_shares)?;
-        let mut eq_check = mpc_sub(&diff, &r_shares)?;
-        zeroize_u128_slice(&mut r_shares);
-        zeroize_u128_slice(&mut diff);
+        // RAII guards guarantee secret shares are volatile-zeroized on EVERY error path.
+        struct ZeroizeShareVec(Vec<u128>);
+        impl Drop for ZeroizeShareVec {
+            fn drop(&mut self) {
+                zeroize_u128_slice(&mut self.0);
+            }
+        }
+        struct ZeroizeShareMatrix(Vec<Vec<u128>>);
+        impl Drop for ZeroizeShareMatrix {
+            fn drop(&mut self) {
+                for row in &mut self.0 {
+                    zeroize_u128_slice(row);
+                }
+            }
+        }
+
+        let mut v_guard = ZeroizeShareVec(self.compose_bits(&req.v_bits));
+        let r_guard = ZeroizeShareVec(self.compose_bits(&req.r_bits));
+        let diff_guard = ZeroizeShareVec(mpc_sub(sender_balance_shares, &v_guard.0)?);
+        let eq_guard = ZeroizeShareVec(mpc_sub(&diff_guard.0, &r_guard.0)?);
+        drop(r_guard);
+        drop(diff_guard);
 
         let mut rho = random_nonzero_field_elem();
-        let mut rho_shares = split_secret(
+        let rho_res = split_secret(
             rho,
             self.cache.threshold(),
             self.cache.num_validators(),
-        )?;
+        );
         zeroize_u128(&mut rho);
+        let rho_guard = ZeroizeShareVec(rho_res?);
         let blind_triple = pool.pop()?;
-        let blind_res = mpc_mul(&rho_shares, &eq_check, blind_triple, &self.cache);
-        zeroize_u128_slice(&mut rho_shares);
-        zeroize_u128_slice(&mut eq_check);
-        let mut blinded_eq = blind_res?;
-        let opened_eq = self.cache.reconstruct_and_verify(&blinded_eq);
-        zeroize_u128_slice(&mut blinded_eq);
+        let blinded_eq_guard = ZeroizeShareVec(mpc_mul(
+            &rho_guard.0,
+            &eq_guard.0,
+            blind_triple,
+            &self.cache,
+        )?);
+        drop(rho_guard);
+        drop(eq_guard);
+        let opened_eq = self.cache.reconstruct_and_verify(&blinded_eq_guard.0);
+        drop(blinded_eq_guard);
         if opened_eq? != 0 {
             return Err(MpcError::BalanceCheckFailed);
         }
 
         // 4. Blinded one-hot recipient selector check: s_k in {0, 1} and sum(s_k) == 1.
         let n = self.cache.num_validators();
-        let mut sum_s = vec![0u128; n];
+        let mut sum_s_guard = ZeroizeShareVec(vec![0u128; n]);
         for s_k in &req.selector_shares {
             self.verify_bit_share(s_k, pool, MpcError::SelectorCheckFailed)?;
-            for (acc, &share) in sum_s.iter_mut().zip(s_k.iter()) {
+            for (acc, &share) in sum_s_guard.0.iter_mut().zip(s_k.iter()) {
                 *acc = add_mod(*acc, share);
             }
         }
-        let opened_sum = self.cache.reconstruct_and_verify(&sum_s);
-        zeroize_u128_slice(&mut sum_s);
+        let opened_sum = self.cache.reconstruct_and_verify(&sum_s_guard.0);
+        drop(sum_s_guard);
         if opened_sum? != 1 {
             return Err(MpcError::SelectorCheckFailed);
         }
@@ -1366,17 +1430,21 @@ impl ShardedPrivateLedger {
         // Because each Beaver triple carries fresh random polynomial masks, even non-recipients
         // (s_k = 0) receive a fresh random Shamir sharing of 0, re-randomizing every share in
         // the bucket so no coalition of < t validators can identify the recipient.
-        let mut credit_shares = Vec::with_capacity(self.bucket_size);
+        let mut credit_guard = ZeroizeShareMatrix(Vec::with_capacity(self.bucket_size));
         for s_k in &req.selector_shares {
             let triple = pool.pop()?;
-            credit_shares.push(mpc_mul(s_k, &v_shares, triple, &self.cache)?);
+            credit_guard
+                .0
+                .push(mpc_mul(s_k, &v_guard.0, triple, &self.cache)?);
         }
 
+        let debit_shares = std::mem::take(&mut v_guard.0);
+        let credit_shares = std::mem::take(&mut credit_guard.0);
         Ok(VerifiedTransferDelta {
             sender_bucket,
             sender_slot,
             recipient_bucket: req.recipient_bucket,
-            debit_shares: v_shares,
+            debit_shares,
             credit_shares,
         })
     }
@@ -1470,7 +1538,10 @@ impl ShardedPrivateLedger {
             seen[req_slot] = true;
         }
 
-        let needed = self.bucket_size * self.triples_per_transfer();
+        let needed = self
+            .bucket_size
+            .checked_mul(self.triples_per_transfer())
+            .ok_or(MpcError::InvalidParameters("lockstep triple count overflow"))?;
         if pool.len() < needed {
             return Err(MpcError::BeaverPoolExhausted {
                 needed,
@@ -1534,14 +1605,18 @@ fn compute_carter_wegman_tag(
     mac_s: u128,
 ) -> [u8; COVER_FRAME_TAG_SIZE] {
     let mut acc = 0u128;
+    let mut buf = [0u8; 16];
     // 240 / 15 = 16 chunks of 120 bits each (< 2^127 - 1, strictly injective in F_p).
     for chunk in body.chunks_exact(15) {
-        let mut buf = [0u8; 16];
+        buf = [0u8; 16];
         buf[..15].copy_from_slice(chunk);
         let elem = u128::from_le_bytes(buf);
         acc = mul_mod(add_mod(acc, elem), mac_r);
     }
-    add_mod(acc, mac_s).to_le_bytes()
+    zeroize_slice(&mut buf);
+    let tag = add_mod(acc, mac_s).to_le_bytes();
+    zeroize_u128(&mut acc);
+    tag
 }
 
 /// Single-use OTP encryption pad + Carter-Wegman universal MAC key for one [`CoverFrame`].
@@ -1570,8 +1645,8 @@ impl CoverFrameKey {
         fill_os_random(&mut otp_pad);
         let mut mac_elems = [0u128; 2];
         fill_random_field_elems(&mut mac_elems);
-        let mac_r = mac_elems[0];
-        let mac_s = mac_elems[1];
+        let mut mac_r = mac_elems[0];
+        let mut mac_s = mac_elems[1];
         zeroize_u128_slice(&mut mac_elems);
 
         let sender = Self {
@@ -1585,6 +1660,8 @@ impl CoverFrameKey {
             mac_s,
         };
         zeroize_slice(&mut otp_pad);
+        zeroize_u128(&mut mac_r);
+        zeroize_u128(&mut mac_s);
         (sender, receiver)
     }
 }
@@ -1676,9 +1753,10 @@ impl CoverFrame {
 
         let mut provided_tag = [0u8; COVER_FRAME_TAG_SIZE];
         provided_tag.copy_from_slice(&self.bytes[COVER_FRAME_BODY_SIZE..]);
-        let expected_tag = compute_carter_wegman_tag(&body, key.mac_r, key.mac_s);
-
-        if !ct_eq_16(&provided_tag, &expected_tag) {
+        let mut expected_tag = compute_carter_wegman_tag(&body, key.mac_r, key.mac_s);
+        let mac_ok = ct_eq_16(&provided_tag, &expected_tag);
+        zeroize_slice(&mut expected_tag);
+        if !mac_ok {
             return Err(MpcError::InvalidCoverFrame("Carter-Wegman MAC mismatch"));
         }
 
@@ -2294,5 +2372,165 @@ mod tests {
         let (k_tx, _k_rx) = CoverFrameKey::generate_pair();
         let key_dbg = format!("{k_tx:?}");
         assert!(key_dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_adversarial_non_canonical_rejection_and_balance_conservation_fuzz() {
+        let cache = LagrangeCache::new_3_of_4();
+
+        // 1. Exhaustive rejection of non-canonical >= PRIME_P inputs across every MPC primitive.
+        for &bad_val in &[PRIME_P, PRIME_P + 1, 2 * PRIME_P, u128::MAX] {
+            assert_eq!(
+                split_secret(bad_val, 3, 4),
+                Err(MpcError::FieldElementOutOfRange)
+            );
+            let mut shares = split_secret(42, 3, 4).unwrap();
+            for pos in 0..4 {
+                let saved = shares[pos];
+                shares[pos] = bad_val;
+                assert_eq!(cache.verify_shares(&shares), Err(MpcError::FieldElementOutOfRange));
+                assert_eq!(
+                    cache.reconstruct_and_verify(&shares),
+                    Err(MpcError::FieldElementOutOfRange)
+                );
+                let mut refresh_copy = shares.clone();
+                assert_eq!(
+                    proactive_refresh_epoch(&mut refresh_copy, 3),
+                    Err(MpcError::FieldElementOutOfRange)
+                );
+                let mut batch_copy = vec![shares.clone()];
+                assert_eq!(
+                    proactive_refresh_epoch_batch(&mut batch_copy, 3, 4),
+                    Err(MpcError::FieldElementOutOfRange)
+                );
+                let valid = split_secret(7, 3, 4).unwrap();
+                let mut pool = BeaverPool::new_3_of_4(2);
+                assert_eq!(
+                    mpc_mul(&shares, &valid, pool.pop().unwrap(), &cache),
+                    Err(MpcError::FieldElementOutOfRange)
+                );
+                assert_eq!(
+                    mpc_mul(&valid, &shares, pool.pop().unwrap(), &cache),
+                    Err(MpcError::FieldElementOutOfRange)
+                );
+                shares[pos] = saved;
+            }
+        }
+
+        // 2. Adversarial fuzz sequence: 60 rounds of mixed valid transfers, self-transfers,
+        //    zero transfers, overdrafts, non-canonical bit injections, and epoch refreshes.
+        let bucket_size = 8;
+        let num_buckets = 2;
+        let mut ledger = ShardedPrivateLedger::new(num_buckets, bucket_size, 16, 3, 4).unwrap();
+        let total_accounts = ledger.total_accounts();
+        let mut expected = vec![0u128; total_accounts];
+        for (acc, slot_bal) in expected.iter_mut().enumerate() {
+            let init = 1_000 + (acc as u128) * 50;
+            ledger.mint_initial_balance(acc, init).unwrap();
+            *slot_bal = init;
+        }
+        let initial_supply: u128 = expected.iter().sum();
+
+        let mut pool = BeaverPool::new_3_of_4(ledger.triples_per_transfer() * 120);
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_u64 = || -> u64 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            state
+        };
+
+        for step in 0..60usize {
+            let sender = (next_u64() as usize) % total_accounts;
+            let recip_bucket = (next_u64() as usize) % num_buckets;
+            let recip_slot = (next_u64() as usize) % bucket_size;
+            let recip = ledger.account_id(recip_bucket, recip_slot).unwrap();
+            let sender_bal = expected[sender];
+
+            if step % 5 == 0 {
+                // Inject adversarial non-canonical >= PRIME_P share into v_bits, r_bits, or selector.
+                let mut req = ConfidentialTransferRequest::new(
+                    sender,
+                    sender_bal,
+                    recip_bucket,
+                    recip_slot,
+                    sender_bal.min(10),
+                    bucket_size,
+                    16,
+                    3,
+                    4,
+                )
+                .unwrap();
+                match step % 3 {
+                    0 => req.v_bits[0][step % 4] = PRIME_P + (step as u128),
+                    1 => req.r_bits[1][step % 4] = u128::MAX,
+                    _ => req.selector_shares[0][step % 4] = PRIME_P,
+                }
+                assert_eq!(
+                    ledger.execute_sharded_transfer(&req, &mut pool),
+                    Err(MpcError::FieldElementOutOfRange)
+                );
+            } else if step % 7 == 0 {
+                // Inject overdraft attack (amount = sender_bal + 1).
+                let make_bits = |val: u128| -> Vec<Vec<u128>> {
+                    (0..16)
+                        .map(|j| split_secret((val >> j) & 1, 3, 4).unwrap())
+                        .collect()
+                };
+                let make_sel = |slot: usize| -> Vec<Vec<u128>> {
+                    (0..bucket_size)
+                        .map(|k| split_secret(u128::from(k == slot), 3, 4).unwrap())
+                        .collect()
+                };
+                let bad_req = ConfidentialTransferRequest::new_raw(
+                    sender,
+                    recip_bucket,
+                    make_bits(sender_bal + 1),
+                    make_bits(0),
+                    make_sel(recip_slot),
+                );
+                assert_eq!(
+                    ledger.execute_sharded_transfer(&bad_req, &mut pool),
+                    Err(MpcError::BalanceCheckFailed)
+                );
+            } else {
+                // Valid transfer (includes amount == 0, amount == sender_bal, and self-transfers).
+                let amount = if sender_bal == 0 {
+                    0
+                } else if step % 11 == 0 {
+                    sender_bal
+                } else {
+                    (next_u64() as u128) % (sender_bal + 1)
+                };
+                let req = ConfidentialTransferRequest::new(
+                    sender,
+                    sender_bal,
+                    recip_bucket,
+                    recip_slot,
+                    amount,
+                    bucket_size,
+                    16,
+                    3,
+                    4,
+                )
+                .unwrap();
+                ledger.execute_sharded_transfer(&req, &mut pool).unwrap();
+                expected[sender] -= amount;
+                expected[recip] += amount;
+            }
+
+            if step % 15 == 14 {
+                ledger.proactive_refresh_epoch().unwrap();
+            }
+        }
+
+        let mut actual_supply = 0u128;
+        for (acc, &exp) in expected.iter().enumerate() {
+            let bal = ledger.reconstruct_balance(acc).unwrap();
+            assert_eq!(bal, exp, "balance diverged for account {acc}");
+            actual_supply += bal;
+        }
+        assert_eq!(actual_supply, initial_supply, "total supply not conserved!");
     }
 }

@@ -132,6 +132,13 @@ pub enum DynamicQuorumError {
     },
     /// Epoch checkpoint chain or state root verification failed.
     CheckpointVerificationFailed(&'static str),
+    /// Per-epoch committee churn or takeover limit exceeded (`attempted > max_allowed`).
+    ChurnLimitExceeded {
+        attempted: usize,
+        max_allowed: usize,
+    },
+    /// Non-canonical field element (`>= PRIME_P`) injected into a share, secret, or envelope.
+    NonCanonicalFieldElement(u128),
 }
 
 impl fmt::Display for DynamicQuorumError {
@@ -208,6 +215,16 @@ impl fmt::Display for DynamicQuorumError {
             Self::CheckpointVerificationFailed(msg) => {
                 write!(f, "checkpoint verification failed: {msg}")
             }
+            Self::ChurnLimitExceeded {
+                attempted,
+                max_allowed,
+            } => write!(
+                f,
+                "per-epoch committee churn limit exceeded: attempted {attempted}, max allowed {max_allowed}"
+            ),
+            Self::NonCanonicalFieldElement(val) => {
+                write!(f, "non-canonical field element {val} (>= PRIME_P)")
+            }
         }
     }
 }
@@ -283,8 +300,11 @@ impl CwMacKey {
         tag: u128,
         context: &'static str,
     ) -> Result<(), DynamicQuorumError> {
+        if tag >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(tag));
+        }
         let expected = add_mod(poly_universal_hash(self.r, domain, elems), self.s);
-        let ok = ct_eq_16(&expected.to_le_bytes(), &reduce(tag).to_le_bytes());
+        let ok = ct_eq_16(&expected.to_le_bytes(), &tag.to_le_bytes());
         if ok {
             Ok(())
         } else {
@@ -306,8 +326,11 @@ impl CwMacKey {
         tag: u128,
         context: &'static str,
     ) -> Result<(), DynamicQuorumError> {
+        if tag >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(tag));
+        }
         let expected = add_mod(poly_universal_hash_bytes(self.r, domain, bytes), self.s);
-        let ok = ct_eq_16(&expected.to_le_bytes(), &reduce(tag).to_le_bytes());
+        let ok = ct_eq_16(&expected.to_le_bytes(), &tag.to_le_bytes());
         if ok {
             Ok(())
         } else {
@@ -323,8 +346,11 @@ impl CwMacKey {
         tag: u128,
         context: &'static str,
     ) -> Result<(), DynamicQuorumError> {
+        if tag >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(tag));
+        }
         let expected = add_mod(poly_universal_hash(self.r, domain, elems), self.s);
-        let ok = ct_eq_16(&expected.to_le_bytes(), &reduce(tag).to_le_bytes());
+        let ok = ct_eq_16(&expected.to_le_bytes(), &tag.to_le_bytes());
         if ok {
             Ok(())
         } else {
@@ -550,6 +576,11 @@ pub fn decrypt_subshare(
     envelope: &OtpSubShareEnvelope,
     key: PairwiseOtpKey,
 ) -> Result<SubSharePlaintext, DynamicQuorumError> {
+    if envelope.ciphertext >= PRIME_P {
+        return Err(DynamicQuorumError::NonCanonicalFieldElement(
+            envelope.ciphertext,
+        ));
+    }
     let mac_input = [
         envelope.epoch as u128,
         envelope.account_id as u128,
@@ -563,7 +594,7 @@ pub fn decrypt_subshare(
         envelope.cw_tag,
         "subshare_envelope",
     )?;
-    let plaintext = sub_mod(reduce(envelope.ciphertext), key.pad);
+    let plaintext = sub_mod(envelope.ciphertext, key.pad);
     Ok(SubSharePlaintext::new(
         envelope.from_validator,
         envelope.to_validator,
@@ -594,14 +625,25 @@ pub fn encrypt_subshare_batch(
         });
     }
 
+    let mac_cap = sub_shares
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(3))
+        .ok_or(DynamicQuorumError::InvalidConfig(
+            "sub-share batch length overflow",
+        ))?;
+
     let mut ciphertexts = Vec::with_capacity(sub_shares.len());
-    let mut mac_elems = Vec::with_capacity(3 + 2 * sub_shares.len());
+    let mut mac_elems = Vec::with_capacity(mac_cap);
     mac_elems.push(epoch as u128);
     mac_elems.push(from_validator as u128);
     mac_elems.push(to_validator as u128);
 
     for i in 0..sub_shares.len() {
-        let ct = add_mod(reduce(sub_shares[i]), key.pads[i]);
+        if sub_shares[i] >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(sub_shares[i]));
+        }
+        let ct = add_mod(sub_shares[i], key.pads[i]);
         ciphertexts.push(ct);
         mac_elems.push(account_ids[i] as u128);
         mac_elems.push(ct);
@@ -639,11 +681,25 @@ pub fn decrypt_subshare_batch(
         });
     }
 
-    let mut mac_elems = Vec::with_capacity(3 + 2 * envelope.ciphertexts.len());
+    let mac_cap = envelope
+        .ciphertexts
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(3))
+        .ok_or(DynamicQuorumError::InvalidConfig(
+            "batch envelope length overflow",
+        ))?;
+
+    let mut mac_elems = Vec::with_capacity(mac_cap);
     mac_elems.push(envelope.epoch as u128);
     mac_elems.push(envelope.from_validator as u128);
     mac_elems.push(envelope.to_validator as u128);
     for i in 0..envelope.ciphertexts.len() {
+        if envelope.ciphertexts[i] >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(
+                envelope.ciphertexts[i],
+            ));
+        }
         mac_elems.push(envelope.account_ids[i] as u128);
         mac_elems.push(envelope.ciphertexts[i]);
     }
@@ -657,7 +713,7 @@ pub fn decrypt_subshare_batch(
 
     let mut out = Vec::with_capacity(envelope.ciphertexts.len());
     for i in 0..envelope.ciphertexts.len() {
-        let pt = sub_mod(reduce(envelope.ciphertexts[i]), key.pads[i]);
+        let pt = sub_mod(envelope.ciphertexts[i], key.pads[i]);
         out.push(SubSharePlaintext::new(
             envelope.from_validator,
             envelope.to_validator,
@@ -680,12 +736,15 @@ pub struct Share {
 }
 
 impl Share {
-    /// Construct a new validated share `(x, y mod p)` with `x >= 1`.
+    /// Construct a new validated share `(x, y)` with `x >= 1` and canonical `y < PRIME_P`.
     pub fn new(x: ValidatorId, y: u128) -> Result<Self, DynamicQuorumError> {
         if x == 0 {
             return Err(DynamicQuorumError::InvalidValidatorCoordinate(0));
         }
-        Ok(Self { x, y: reduce(y) })
+        if y >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(y));
+        }
+        Ok(Self { x, y })
     }
 
     /// Access the share y-value in `F_(2^127 - 1)`.
@@ -783,6 +842,9 @@ pub fn split_secret(
     threshold: usize,
     xs: &[ValidatorId],
 ) -> Result<Vec<Share>, DynamicQuorumError> {
+    if secret >= PRIME_P {
+        return Err(DynamicQuorumError::NonCanonicalFieldElement(secret));
+    }
     if threshold == 0 || threshold > xs.len() {
         return Err(DynamicQuorumError::InvalidThreshold {
             threshold,
@@ -838,10 +900,18 @@ fn lagrange_eval_at(points: &[Share], target_x: u128) -> Result<u128, DynamicQuo
             required: 1,
         });
     }
+    if target_x >= PRIME_P {
+        return Err(DynamicQuorumError::NonCanonicalFieldElement(target_x));
+    }
+    for p in points {
+        if p.y >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(p.y));
+        }
+    }
     let xs: Vec<ValidatorId> = points.iter().map(|s| s.x).collect();
     validate_coordinates(&xs)?;
 
-    let target = reduce(target_x);
+    let target = target_x;
     let mut acc = 0u128;
     for i in 0..points.len() {
         let xi = points[i].x as u128;
@@ -1266,9 +1336,9 @@ pub fn redistribute_shares(
         });
     }
 
-    let envelopes_processed = old_quorum_shares.len() * new_committee.len();
+    let envelopes_processed = old_quorum_shares.len().saturating_mul(new_committee.len());
     // Each single envelope consumes 1 OTP pad (16 B) + 2 CW-MAC key elements (32 B) = 48 B.
-    let otp_bytes_consumed = envelopes_processed * 48;
+    let otp_bytes_consumed = envelopes_processed.saturating_mul(48);
 
     Ok(RedistributionResult {
         epoch,
@@ -1314,6 +1384,8 @@ pub fn redistribute_ledger_accounts(
     let mut old_validator_shares: Vec<Vec<u128>> = vec![Vec::with_capacity(num_accounts); old_quorum.len()];
     for &acct in &account_ids {
         let shares = &old_ledger[&acct];
+        let acct_xs: Vec<ValidatorId> = shares.iter().map(|s| s.x).collect();
+        validate_coordinates(&acct_xs)?;
         for (i, &vid) in old_quorum.iter().enumerate() {
             let found = shares
                 .iter()
@@ -1322,6 +1394,9 @@ pub fn redistribute_ledger_accounts(
                     account_id: acct,
                     validator_id: vid,
                 })?;
+            if found.y() >= PRIME_P {
+                return Err(DynamicQuorumError::NonCanonicalFieldElement(found.y()));
+            }
             old_validator_shares[i].push(found.y());
         }
     }
@@ -1407,9 +1482,10 @@ pub fn redistribute_ledger_accounts(
         redistributed_accounts.insert(acct_id, shares);
     }
 
-    let envelopes_processed = old_quorum.len() * new_committee.len();
+    let envelopes_processed = old_quorum.len().saturating_mul(new_committee.len());
     // Each batch envelope uses `num_accounts * 16 B` OTP pads + `32 B` CW-MAC key.
-    let otp_bytes_consumed = envelopes_processed * (num_accounts * 16 + 32);
+    let otp_bytes_consumed =
+        envelopes_processed.saturating_mul(num_accounts.saturating_mul(16).saturating_add(32));
 
     Ok(BatchRedistributionResult {
         epoch,
@@ -1438,10 +1514,14 @@ pub struct BftParams {
     pub threshold: usize,
 }
 
-/// Automatically compute BFT-safe `(t, N)` parameters: `f = (N - 1) / 3`, `t = 2f + 1`.
+/// Automatically compute BFT-safe `(t, N)` parameters for any `N >= 4`:
+/// - `f = (N - 1) / 3` (maximum Byzantine faults tolerated, guaranteeing `N >= 3f + 1`),
+/// - `t = ((N + f) / 2) + 1` (minimum strict BFT + Shamir quorum guaranteeing `t >= 2f + 1`,
+///   `t > N / 2`, `2t - N >= f + 1` honest quorum intersection, and `t <= N - f` liveness).
 ///
 /// Examples:
 /// - `N = 4` -> `f = 1, t = 3`
+/// - `N = 6` -> `f = 1, t = 4`
 /// - `N = 7` -> `f = 2, t = 5`
 /// - `N = 10` -> `f = 3, t = 7`
 pub fn compute_bft_params(committee_size: usize) -> Result<BftParams, DynamicQuorumError> {
@@ -1452,12 +1532,33 @@ pub fn compute_bft_params(committee_size: usize) -> Result<BftParams, DynamicQuo
         });
     }
     let max_faults = (committee_size - 1) / 3;
-    let threshold = 2 * max_faults + 1;
+    // Use u128 to prevent overflow even for extreme committee_size values.
+    let threshold_u128 = ((committee_size as u128) + (max_faults as u128)) / 2 + 1;
+    let threshold = usize::try_from(threshold_u128).map_err(|_| {
+        DynamicQuorumError::InvalidCommitteeSize {
+            size: committee_size,
+            min_required: MIN_BFT_COMMITTEE_SIZE,
+        }
+    })?;
+    debug_assert!(committee_size >= 3 * max_faults + 1);
+    debug_assert!(threshold >= 2 * max_faults + 1);
+    debug_assert!(threshold > committee_size / 2);
+    debug_assert!(threshold <= committee_size - max_faults);
     Ok(BftParams {
         committee_size,
         max_faults,
         threshold,
     })
+}
+
+/// Strict per-epoch validator churn limit (`f_old.max(1)`) for committee replacements/ejections.
+#[inline]
+pub const fn max_churn_per_epoch(bft: BftParams) -> usize {
+    if bft.max_faults >= 1 {
+        bft.max_faults
+    } else {
+        1
+    }
 }
 
 /// Reason a validator is automatically scheduled for slashing/ejection.
@@ -1608,11 +1709,16 @@ impl TrialEndorsement {
 
     /// Verify this endorsement's Carter-Wegman MAC in constant time, consuming `verifier_key`.
     pub fn verify(&self, verifier_key: CwMacKey) -> Result<(), DynamicQuorumError> {
+        if self.trial_digest >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(
+                self.trial_digest,
+            ));
+        }
         let elems = [
             self.endorser as u128,
             self.candidate_id as u128,
             self.target_epoch as u128,
-            reduce(self.trial_digest),
+            self.trial_digest,
         ];
         verifier_key.verify_elems(
             DOMAIN_TRIAL_ENDORSEMENT,
@@ -1731,6 +1837,11 @@ impl DynamicCommitteeManager {
         compute_bft_params(self.committee.len()).expect("active committee always satisfies N >= 4")
     }
 
+    /// Strict per-epoch ejection/replacement churn limit (`f_old.max(1)`).
+    pub fn max_churn_per_epoch(&self) -> usize {
+        max_churn_per_epoch(self.bft_params())
+    }
+
     /// Candidates that passed Proof-of-Pad trial + quorum endorsement and await next epoch.
     pub fn admitted_candidates(&self) -> &[ValidatorId] {
         &self.admitted_queue
@@ -1759,12 +1870,35 @@ impl DynamicCommitteeManager {
         {
             return Err(DynamicQuorumError::DuplicateCandidate(trial.candidate_id));
         }
-        if trial.target_epoch != self.epoch + 1 {
+        let next_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(DynamicQuorumError::InvalidConfig("epoch counter overflow"))?;
+        if trial.target_epoch != next_epoch {
             return Err(DynamicQuorumError::InvalidCandidateTrial(
                 "target_epoch must equal current_epoch + 1",
             ));
         }
-        if reduce(trial.epoch_beacon_challenge) != self.epoch_beacon {
+        if trial.epoch_beacon_challenge >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(
+                trial.epoch_beacon_challenge,
+            ));
+        }
+        if trial.beaver_a >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(trial.beaver_a));
+        }
+        if trial.beaver_b >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(trial.beaver_b));
+        }
+        if trial.beaver_c >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(trial.beaver_c));
+        }
+        if trial.challenge_response >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(
+                trial.challenge_response,
+            ));
+        }
+        if trial.epoch_beacon_challenge != self.epoch_beacon {
             return Err(DynamicQuorumError::InvalidCandidateTrial(
                 "epoch beacon challenge mismatch",
             ));
@@ -1787,15 +1921,15 @@ impl DynamicCommitteeManager {
             ));
         }
         if !trial.beaver_triple_verified
-            || reduce(trial.beaver_a) == 0
-            || reduce(trial.beaver_b) == 0
-            || mul_mod(trial.beaver_a, trial.beaver_b) != reduce(trial.beaver_c)
+            || trial.beaver_a == 0
+            || trial.beaver_b == 0
+            || mul_mod(trial.beaver_a, trial.beaver_b) != trial.beaver_c
         {
             return Err(DynamicQuorumError::InvalidCandidateTrial(
                 "Beaver multiplication triple check failed",
             ));
         }
-        if reduce(trial.challenge_response) != trial.expected_challenge_response() {
+        if trial.challenge_response != trial.expected_challenge_response() {
             return Err(DynamicQuorumError::InvalidCandidateTrial(
                 "beacon challenge response mismatch",
             ));
@@ -1837,9 +1971,16 @@ impl DynamicCommitteeManager {
                 ));
             }
         };
-        if endorsement.target_epoch != self.epoch + 1
-            || reduce(endorsement.trial_digest) != expected_digest
-        {
+        let next_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(DynamicQuorumError::InvalidConfig("epoch counter overflow"))?;
+        if endorsement.trial_digest >= PRIME_P {
+            return Err(DynamicQuorumError::NonCanonicalFieldElement(
+                endorsement.trial_digest,
+            ));
+        }
+        if endorsement.target_epoch != next_epoch || endorsement.trial_digest != expected_digest {
             return Err(DynamicQuorumError::InvalidCandidateTrial(
                 "endorsement epoch or trial digest mismatch",
             ));
@@ -1878,7 +2019,7 @@ impl DynamicCommitteeManager {
                 self.missed_epoch_counts.insert(vid, 0);
             } else {
                 let count = self.missed_epoch_counts.entry(vid).or_insert(0);
-                *count += 1;
+                *count = count.saturating_add(1);
                 if *count >= self.max_missed_epochs {
                     self.statuses.insert(
                         vid,
@@ -1908,6 +2049,25 @@ impl DynamicCommitteeManager {
             return Err(DynamicQuorumError::ValidatorNotActive(offender));
         }
         let bft = self.bft_params();
+        let max_churn = max_churn_per_epoch(bft);
+        let already_scheduled = self
+            .committee
+            .iter()
+            .filter(|&&vid| {
+                vid != offender
+                    && matches!(
+                        self.statuses.get(&vid),
+                        Some(ValidatorStatus::ScheduledForEjection { .. })
+                    )
+            })
+            .count();
+        if already_scheduled >= max_churn {
+            return Err(DynamicQuorumError::ChurnLimitExceeded {
+                attempted: already_scheduled + 1,
+                max_allowed: max_churn,
+            });
+        }
+
         let mut distinct_active = BTreeSet::new();
         for &v in attesting_validators {
             if self.is_active_member(v) && v != offender {
@@ -1927,13 +2087,23 @@ impl DynamicCommitteeManager {
     }
 
     /// Compute the deterministic committee plan for `epoch + 1`:
-    /// - Removes scheduled ejected validators (capped so at least `old_t` old validators remain
-    ///   to run zero-reconstruction resharing).
-    /// - Admits verified Proof-of-Pad candidates from `admitted_queue` (supporting both `N -> N`
-    ///   fault replacement and `N -> N'` committee scaling up to `max_committee_size`).
-    /// - Recomputes BFT-safe `(t', N') = compute_bft_params(N')`.
+    /// - Enforces strict anti-committee-takeover per-epoch churn bounds:
+    ///   - At most `max_churn = f_old.max(1)` validators may be ejected in a single epoch.
+    ///   - Surviving old committee must satisfy `surviving.len() >= old_bft.threshold`.
+    ///   - Newly admitted candidates are capped so that even if all `f_old` old Byzantine
+    ///     validators collude with every newly admitted candidate, they remain strictly below
+    ///     `new_bft.threshold` (`old_f + admitted < new_t`) AND surviving old validators retain
+    ///     strict majority (`surviving.len() > new_N / 2`). Excess queued candidates remain in
+    ///     `admitted_queue` for subsequent epochs.
+    /// - Verifies strict BFT + Shamir safety (`new_t > new_N / 2`, `new_N >= 3*new_f + 1`,
+    ///   `new_t >= 2*new_f + 1`).
     pub fn plan_next_epoch_committee(&self) -> Result<EpochCommitteePlan, DynamicQuorumError> {
+        let to_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(DynamicQuorumError::InvalidConfig("epoch counter overflow"))?;
         let old_bft = self.bft_params();
+        let max_churn = max_churn_per_epoch(old_bft);
         let mut scheduled_ejections = Vec::new();
         let mut surviving = Vec::new();
 
@@ -1946,18 +2116,18 @@ impl DynamicCommitteeManager {
             }
         }
 
-        // Preserve resharing liveness: at least `old_bft.threshold` old validators must remain.
-        let max_ejectable = self.committee.len().saturating_sub(old_bft.threshold);
-        let mut ejected_validators = Vec::new();
-        for vid in scheduled_ejections {
-            if ejected_validators.len() < max_ejectable {
-                ejected_validators.push(vid);
-            } else {
-                surviving.push(vid);
-            }
+        // Anti-committee-takeover churn bound: reject ejecting > f_old.max(1) validators in one epoch.
+        if scheduled_ejections.len() > max_churn {
+            return Err(DynamicQuorumError::ChurnLimitExceeded {
+                attempted: scheduled_ejections.len(),
+                max_allowed: max_churn,
+            });
         }
+
+        let ejected_validators = scheduled_ejections;
         surviving.sort_unstable();
 
+        // Preserve resharing liveness: at least `old_bft.threshold` old validators must remain.
         if surviving.len() < old_bft.threshold {
             return Err(DynamicQuorumError::InsufficientQuorumForReshare {
                 remaining: surviving.len(),
@@ -1966,11 +2136,30 @@ impl DynamicCommitteeManager {
         }
 
         let slots_available = self.max_committee_size.saturating_sub(surviving.len());
+        let max_candidates = slots_available.min(self.admitted_queue.len());
+
+        // Compute the maximum safe admissions for this epoch such that:
+        // 1. Old surviving committee retains strict majority: `surviving.len() > new_N / 2`.
+        // 2. Worst-case adversarial coalition (`f_old` old + all `admitted`) stays strictly
+        //    below the new threshold: `old_bft.max_faults + admitted < new_bft.threshold`.
+        let mut safe_admit_count = 0usize;
+        for candidate_count in 0..=max_candidates {
+            let candidate_n = surviving.len().saturating_add(candidate_count);
+            if let Ok(cand_bft) = compute_bft_params(candidate_n) {
+                let old_majority_holds = surviving.len() > candidate_n / 2;
+                let takeover_impossible =
+                    old_bft.max_faults.saturating_add(candidate_count) < cand_bft.threshold;
+                if old_majority_holds && takeover_impossible {
+                    safe_admit_count = candidate_count;
+                }
+            }
+        }
+
         let admitted_validators: Vec<ValidatorId> = self
             .admitted_queue
             .iter()
             .copied()
-            .take(slots_available)
+            .take(safe_admit_count)
             .collect();
 
         let mut new_committee = surviving.clone();
@@ -1978,11 +2167,21 @@ impl DynamicCommitteeManager {
         new_committee.sort_unstable();
 
         let new_bft = compute_bft_params(new_committee.len())?;
+        // Formally assert strict BFT + Shamir safety on the planned committee.
+        if new_bft.threshold <= new_committee.len() / 2
+            || new_committee.len() < 3 * new_bft.max_faults + 1
+            || new_bft.threshold < 2 * new_bft.max_faults + 1
+        {
+            return Err(DynamicQuorumError::InvalidThreshold {
+                threshold: new_bft.threshold,
+                committee_size: new_committee.len(),
+            });
+        }
         let reshare_quorum = surviving[..old_bft.threshold].to_vec();
 
         Ok(EpochCommitteePlan {
             from_epoch: self.epoch,
-            to_epoch: self.epoch + 1,
+            to_epoch,
             old_committee: self.committee.clone(),
             old_bft,
             reshare_quorum,
@@ -2269,6 +2468,11 @@ impl PrunedCheckpointLedger {
         }
         let bft = compute_bft_params(initial_committee.len())?;
         validate_coordinates(&initial_committee)?;
+        for &bal in initial_balances.values() {
+            if bal >= PRIME_P {
+                return Err(DynamicQuorumError::NonCanonicalFieldElement(bal));
+            }
+        }
         initial_committee.sort_unstable();
 
         let genesis_r = random_nonzero_field_elem();
@@ -2352,12 +2556,18 @@ impl PrunedCheckpointLedger {
             staged.insert(tx.to, new_to);
         }
 
-        // Commit staged balances.
+        let height = self
+            .current_height
+            .checked_add(1)
+            .ok_or(DynamicQuorumError::InvalidConfig("block height overflow"))?;
+        let tx_count = u32::try_from(transfers.len())
+            .map_err(|_| DynamicQuorumError::InvalidConfig("transfer count exceeds u32::MAX"))?;
+
+        // Commit staged balances only after all pre-checks (including height/tx_count) succeed.
         for (acct, bal) in staged {
             self.active_balances.insert(acct, bal);
         }
 
-        let height = self.current_height + 1;
         let epoch = (height - 1) / self.blocks_per_epoch;
         let prev_state_root = self.last_state_root;
         let body_hash = poly_universal_hash_bytes(
@@ -2384,7 +2594,7 @@ impl PrunedCheckpointLedger {
             proposer,
             prev_state_root,
             state_root,
-            tx_count: transfers.len() as u32,
+            tx_count,
             body_bytes,
         };
         self.retained_blocks.insert(height, block);
@@ -2395,7 +2605,12 @@ impl PrunedCheckpointLedger {
         let mut blocks_pruned_this_step = 0u64;
 
         if height % self.blocks_per_epoch == 0 {
-            let start_height = epoch * self.blocks_per_epoch + 1;
+            let start_height = epoch
+                .checked_mul(self.blocks_per_epoch)
+                .and_then(|v| v.checked_add(1))
+                .ok_or(DynamicQuorumError::InvalidConfig(
+                    "checkpoint start_height overflow",
+                ))?;
             let end_height = height;
             let prev_checkpoint_root = self
                 .checkpoints
@@ -2442,7 +2657,7 @@ impl PrunedCheckpointLedger {
             checkpoint_created = Some(checkpoint);
 
             // Automatic history pruning: retain only blocks from the latest `retention_epochs` epochs.
-            let cutoff_epoch = (epoch + 1).saturating_sub(self.retention_epochs);
+            let cutoff_epoch = epoch.saturating_add(1).saturating_sub(self.retention_epochs);
             let expired_heights: Vec<u64> = self
                 .retained_blocks
                 .iter()
@@ -2451,9 +2666,9 @@ impl PrunedCheckpointLedger {
                 .collect();
             for h in expired_heights {
                 self.retained_blocks.remove(&h);
-                blocks_pruned_this_step += 1;
+                blocks_pruned_this_step = blocks_pruned_this_step.saturating_add(1);
             }
-            self.pruned_blocks += blocks_pruned_this_step;
+            self.pruned_blocks = self.pruned_blocks.saturating_add(blocks_pruned_this_step);
         }
 
         Ok(BlockFinalizationResult {
@@ -2499,11 +2714,29 @@ impl PrunedCheckpointLedger {
                     "non-sequential checkpoint epoch",
                 ));
             }
-            let expected_start = expected_epoch * self.blocks_per_epoch + 1;
-            let expected_end = (expected_epoch + 1) * self.blocks_per_epoch;
+            let expected_start = expected_epoch
+                .checked_mul(self.blocks_per_epoch)
+                .and_then(|v| v.checked_add(1))
+                .ok_or(DynamicQuorumError::CheckpointVerificationFailed(
+                    "checkpoint start height overflow",
+                ))?;
+            let expected_end = expected_epoch
+                .checked_add(1)
+                .and_then(|e| e.checked_mul(self.blocks_per_epoch))
+                .ok_or(DynamicQuorumError::CheckpointVerificationFailed(
+                    "checkpoint end height overflow",
+                ))?;
             if cp.start_height != expected_start || cp.end_height != expected_end {
                 return Err(DynamicQuorumError::CheckpointVerificationFailed(
                     "checkpoint height span mismatch",
+                ));
+            }
+            if cp.prev_checkpoint_root >= PRIME_P
+                || cp.state_root_r >= PRIME_P
+                || cp.state_root >= PRIME_P
+            {
+                return Err(DynamicQuorumError::CheckpointVerificationFailed(
+                    "non-canonical field element in checkpoint",
                 ));
             }
             if cp.prev_checkpoint_root != expected_prev_root {
@@ -2511,8 +2744,9 @@ impl PrunedCheckpointLedger {
                     "broken checkpoint chain link",
                 ));
             }
+            validate_coordinates(&cp.committee)?;
             let bft = compute_bft_params(cp.committee.len())?;
-            if cp.threshold < bft.threshold {
+            if cp.threshold < bft.threshold || cp.threshold > cp.committee.len() {
                 return Err(DynamicQuorumError::CheckpointVerificationFailed(
                     "checkpoint threshold below BFT safety bound",
                 ));
@@ -2578,19 +2812,21 @@ impl PrunedCheckpointLedger {
     /// Report live pruning telemetry and estimated steady-state disk footprint in bytes.
     pub fn metrics(&self) -> PruningMetrics {
         // Active state: ~40 bytes per (AccountId, u128) B-tree entry.
-        let active_state_bytes = self.active_balances.len() * 40;
+        let active_state_bytes = self.active_balances.len().saturating_mul(40);
         // Retained blocks: 72-byte header + full body payload.
         let retained_blocks_bytes: usize = self
             .retained_blocks
             .values()
-            .map(|b| 72 + b.body_bytes.len())
-            .sum();
+            .fold(0usize, |acc, b| {
+                acc.saturating_add(72usize.saturating_add(b.body_bytes.len()))
+            });
         // Compact checkpoints: 96-byte fixed metadata + 8 B per committee member + 24 B per MAC share.
-        let checkpoints_bytes: usize = self
-            .checkpoints
-            .iter()
-            .map(|cp| 96 + cp.committee.len() * 8 + cp.threshold_macs.len() * 24)
-            .sum();
+        let checkpoints_bytes: usize = self.checkpoints.iter().fold(0usize, |acc, cp| {
+            let entry = 96usize
+                .saturating_add(cp.committee.len().saturating_mul(8))
+                .saturating_add(cp.threshold_macs.len().saturating_mul(24));
+            acc.saturating_add(entry)
+        });
 
         PruningMetrics {
             current_height: self.current_height,
@@ -2599,7 +2835,9 @@ impl PrunedCheckpointLedger {
             retained_blocks: self.retained_blocks.len(),
             checkpoint_count: self.checkpoints.len(),
             active_account_count: self.active_balances.len(),
-            estimated_state_bytes: active_state_bytes + retained_blocks_bytes + checkpoints_bytes,
+            estimated_state_bytes: active_state_bytes
+                .saturating_add(retained_blocks_bytes)
+                .saturating_add(checkpoints_bytes),
         }
     }
 }
@@ -3065,5 +3303,230 @@ mod tests {
                 acct as u128 * 999
             );
         }
+    }
+
+    #[test]
+    fn test_bft_params_formal_safety_and_liveness_all_sizes() {
+        for n in 0..4usize {
+            assert!(compute_bft_params(n).is_err());
+        }
+        // Explicitly verify N=6 has t=4 > 6/2 (preventing disjoint 3+3 quorum split).
+        let p6 = compute_bft_params(6).unwrap();
+        assert_eq!(
+            p6,
+            BftParams {
+                committee_size: 6,
+                max_faults: 1,
+                threshold: 4,
+            }
+        );
+
+        for n in 4..=64usize {
+            let p = compute_bft_params(n).unwrap();
+            assert_eq!(p.committee_size, n);
+            assert!(n >= 3 * p.max_faults + 1, "N={n} must satisfy N >= 3f + 1");
+            assert!(
+                p.threshold >= 2 * p.max_faults + 1,
+                "N={n} must satisfy t >= 2f + 1"
+            );
+            assert!(
+                p.threshold > n / 2,
+                "N={n} must satisfy strict Shamir/BFT majority t > N/2"
+            );
+            assert!(
+                2 * p.threshold - n >= p.max_faults + 1,
+                "N={n} must guarantee >= f+1 quorum overlap (>= 1 honest node)"
+            );
+            assert!(
+                p.threshold <= n - p.max_faults,
+                "N={n} must preserve liveness when f validators are offline"
+            );
+        }
+    }
+
+    #[test]
+    fn test_churn_limit_and_anti_committee_takeover_enforcement() {
+        // 1. On N=4 (f=1, max_churn=1): scheduling 1 ejection succeeds, 2nd is rejected with ChurnLimitExceeded.
+        let mut mgr4 = DynamicCommitteeManager::new(vec![1, 2, 3, 4], 2, 16).unwrap();
+        assert_eq!(mgr4.max_churn_per_epoch(), 1);
+        mgr4.slash_and_schedule_ejection(4, EjectionReason::Equivocation, &[1, 2, 3])
+            .unwrap();
+        assert_eq!(
+            mgr4.slash_and_schedule_ejection(3, EjectionReason::Equivocation, &[1, 2, 4]),
+            Err(DynamicQuorumError::ChurnLimitExceeded {
+                attempted: 2,
+                max_allowed: 1,
+            })
+        );
+
+        // 2. On N=6 (f=1, max_churn=1): liveness-scheduling 2 offline validators in one epoch
+        //    must be rejected by plan_next_epoch_committee with ChurnLimitExceeded!
+        let mut mgr6 = DynamicCommitteeManager::new(vec![1, 2, 3, 4, 5, 6], 1, 16).unwrap();
+        assert_eq!(mgr6.max_churn_per_epoch(), 1);
+        let sched = mgr6.record_epoch_liveness(&[1, 2, 3, 4]); // 5 & 6 both miss
+        assert_eq!(sched, vec![5, 6]);
+        assert_eq!(
+            mgr6.plan_next_epoch_committee(),
+            Err(DynamicQuorumError::ChurnLimitExceeded {
+                attempted: 2,
+                max_allowed: 1,
+            })
+        );
+
+        // 3. On N=7 (f=2, max_churn=2): 2 ejections allowed, 3rd rejected with ChurnLimitExceeded!
+        let mut mgr7 = DynamicCommitteeManager::new(vec![1, 2, 3, 4, 5, 6, 7], 2, 16).unwrap();
+        assert_eq!(mgr7.max_churn_per_epoch(), 2);
+        mgr7.slash_and_schedule_ejection(7, EjectionReason::MpcSubShareFault, &[1, 2, 3, 4, 5])
+            .unwrap();
+        mgr7.slash_and_schedule_ejection(6, EjectionReason::MpcSubShareFault, &[1, 2, 3, 4, 5])
+            .unwrap();
+        assert_eq!(
+            mgr7.slash_and_schedule_ejection(5, EjectionReason::MpcSubShareFault, &[1, 2, 3, 4, 6]),
+            Err(DynamicQuorumError::ChurnLimitExceeded {
+                attempted: 3,
+                max_allowed: 2,
+            })
+        );
+
+        // 4. Anti-Committee-Takeover Flood: on N=4 (max_committee_size=16), even if 6 candidates
+        //    pass Proof-of-Pad in one epoch, the manager MUST cap admissions so the old committee
+        //    retains strict majority (> N'/2) and `old_f + admitted < new_t` (no supermajority seizure!).
+        let mut takeover_mgr = DynamicCommitteeManager::new(vec![1, 2, 3, 4], 2, 16).unwrap();
+        for cid in 5..=10u64 {
+            let trial = CandidateTrial::generate_passing(
+                cid,
+                1,
+                takeover_mgr.epoch_beacon(),
+                0.2,
+                0.02,
+                2 * 1024 * 1024,
+            );
+            let digest = takeover_mgr.submit_candidate_trial(trial).unwrap();
+            for &endorser in &[1u64, 2, 3] {
+                let (sk, vk) = CwMacKey::generate_pair();
+                let end = TrialEndorsement::sign(endorser, cid, 1, digest, sk);
+                takeover_mgr.record_trial_endorsement(end, vk).unwrap();
+            }
+        }
+        assert_eq!(takeover_mgr.admitted_candidates().len(), 6);
+
+        let plan = takeover_mgr.plan_next_epoch_committee().unwrap();
+        // From surviving=4 (old_f=1), admitting 4+ would violate surviving > N'/2 (4 <= 8/2)
+        // or allow takeover; at most 3 can be admitted in epoch 1 (4 -> 7, new_t = 5 > 1 + 3 = 4).
+        assert_eq!(plan.admitted_validators, vec![5, 6, 7]);
+        assert_eq!(plan.new_committee.len(), 7);
+        assert!(plan.old_bft.max_faults + plan.admitted_validators.len() < plan.new_bft.threshold);
+        assert!(plan.old_committee.len() > plan.new_committee.len() / 2);
+
+        // Execute transition and confirm remaining 3 candidates stay queued safely for epoch 2!
+        let mut ledger = BTreeMap::new();
+        ledger.insert(1, split_secret(42_000, 3, takeover_mgr.committee()).unwrap());
+        let receipt = takeover_mgr.execute_epoch_transition(&ledger).unwrap();
+        assert_eq!(takeover_mgr.committee(), &[1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(takeover_mgr.admitted_candidates(), &[8, 9, 10]);
+        assert_eq!(
+            reconstruct_secret(&receipt.reshare.redistributed_accounts[&1], 5).unwrap(),
+            42_000
+        );
+    }
+
+    #[test]
+    fn test_adversarial_non_canonical_prime_p_share_and_mac_injection_rejected() {
+        // 1. Share::new rejects >= PRIME_P values (no silent modular reduction).
+        assert_eq!(
+            Share::new(1, PRIME_P),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(PRIME_P))
+        );
+        assert_eq!(
+            Share::new(1, PRIME_P + 42),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(PRIME_P + 42))
+        );
+        assert_eq!(
+            Share::new(1, u128::MAX),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(u128::MAX))
+        );
+
+        // 2. split_secret rejects non-canonical secret >= PRIME_P.
+        assert_eq!(
+            split_secret(PRIME_P, 3, &[1, 2, 3, 4]),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(PRIME_P))
+        );
+
+        // 3. verify_subshare_matrix rejects injected non-canonical >= PRIME_P sub-share.
+        let mut matrix = BTreeMap::new();
+        for &d in &[1u64, 2, 3] {
+            for &t in &[1u64, 2, 3, 4] {
+                matrix.insert((d, t), if d == 2 && t == 4 { PRIME_P + 1 } else { 7 });
+            }
+        }
+        assert_eq!(
+            verify_subshare_matrix(&[1, 2, 3], &[1, 2, 3, 4], 3, &matrix),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(PRIME_P + 1))
+        );
+
+        // 4. Wire malleability: adding PRIME_P to ciphertext or cw_tag MUST be rejected!
+        let (sk1, rk1) = PairwiseOtpKey::generate_pair();
+        let mut env_ct = encrypt_subshare(1, 10, 1, 2, 123, sk1);
+        env_ct.ciphertext += PRIME_P;
+        assert!(matches!(
+            decrypt_subshare(&env_ct, rk1),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
+
+        let (sk2, rk2) = PairwiseOtpKey::generate_pair();
+        let mut env_tag = encrypt_subshare(1, 10, 1, 2, 123, sk2);
+        env_tag.cw_tag += PRIME_P;
+        assert!(matches!(
+            decrypt_subshare(&env_tag, rk2),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
+
+        // 5. Batch envelope malleability & non-canonical sub-share injection rejected.
+        let (bsk, brk) = BatchOtpKey::generate_pair(2);
+        assert!(matches!(
+            encrypt_subshare_batch(1, 1, 2, vec![1, 2], &[5, PRIME_P], bsk),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
+        drop(brk);
+
+        let (bsk2, brk2) = BatchOtpKey::generate_pair(2);
+        let mut benv = encrypt_subshare_batch(1, 1, 2, vec![1, 2], &[5, 9], bsk2).unwrap();
+        benv.ciphertexts[1] += PRIME_P;
+        assert!(matches!(
+            decrypt_subshare_batch(&benv, brk2),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
+
+        // 6. CwMacKey rejects tag + PRIME_P malleability directly.
+        let (ms, mv) = CwMacKey::generate_pair();
+        let tag = ms.mac_bytes(DOMAIN_TRIAL_DIGEST, b"vernam");
+        assert!(matches!(
+            mv.verify_bytes(DOMAIN_TRIAL_DIGEST, b"vernam", tag + PRIME_P, "malleable_tag"),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
+
+        // 7. CandidateTrial with non-canonical field element rejected.
+        let mgr = DynamicCommitteeManager::new(vec![1, 2, 3, 4], 2, 10).unwrap();
+        let mut bad_trial = CandidateTrial::generate_passing(
+            5,
+            1,
+            mgr.epoch_beacon(),
+            0.1,
+            0.01,
+            2 * 1024 * 1024,
+        );
+        bad_trial.beaver_a += PRIME_P;
+        assert!(matches!(
+            mgr.validate_trial(&bad_trial),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
+
+        // 8. PrunedCheckpointLedger rejects non-canonical >= PRIME_P genesis balance.
+        let mut bad_bal = BTreeMap::new();
+        bad_bal.insert(1, PRIME_P);
+        assert!(matches!(
+            PrunedCheckpointLedger::new(10, 1, vec![1, 2, 3, 4], bad_bal),
+            Err(DynamicQuorumError::NonCanonicalFieldElement(_))
+        ));
     }
 }

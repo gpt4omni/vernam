@@ -9,20 +9,21 @@
 //! - 21M-Cap Proof-of-Pad Tokenomics & 80/20 Pad-Burn Engine (`crate::tokenomics::TokenomicsEngine`)
 //! - Proof-of-Personhood Web-of-Trust Registry (`crate::bft::WebOfTrustRegistry`)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::bft::{BftCluster, BftConfig, BinaryTx, WebOfTrustRegistry};
+use crate::entropy_beacon::{BeaconConfig, OtpChannelKey, VernamBeacon};
 use crate::explorer_ui::VERNAM_EXPLORER_HTML;
 use crate::field::zeroize_slice;
 use crate::pop_mining::{
-    BilateralPopSubmission, PeerReceiptKey, PopAuditor, PopEpochCoordinator, PopMiner,
-    PopReplayRegistry,
+    BeaconPairingSchedule, BilateralPopSubmission, DEFAULT_CHALLENGE_SLOT_COUNT, PeerReceiptKey,
+    PopAuditor, PopEpochCoordinator, PopMiner, PopReplayRegistry,
 };
 use crate::privacy_mpc::{
     BeaverPool, ConfidentialTransferRequest, DEFAULT_BUCKET_SIZE, DEFAULT_NUM_VALIDATORS,
@@ -55,8 +56,18 @@ const MAX_CONCURRENT_CONNS: usize = 64;
 /// Maximum external P2P peer entries retained from `POST /p2p/announce`.
 const MAX_EXTERNAL_PEERS: usize = 64;
 
+/// Maximum peers permitted from any single non-loopback IPv4 `/24` (or IPv6 `/48`) subnet
+/// to prevent P2P eclipse attacks.
+pub const MAX_PEERS_PER_SUBNET: usize = 4;
+
 /// Maximum peer address string length accepted by `POST /p2p/announce`.
 const MAX_PEER_ADDR_LEN: usize = 128;
+
+/// Maximum distinct client IPs tracked by [`IpRateLimiter`] before oldest-entry eviction.
+pub const MAX_TRACKED_IPS: usize = 4096;
+
+/// Default per-IP request limit per 1-second window.
+pub const DEFAULT_RATE_LIMIT_PER_SEC: u32 = 120;
 
 /// Overall wall-clock deadline for reading a single HTTP request (Slowloris defense).
 const HTTP_READ_DEADLINE: Duration = Duration::from_secs(5);
@@ -79,8 +90,14 @@ const DEFAULT_BFT_MAX_VIEWS: u64 = 4;
 /// Maximum accepted HTTP request header size (16 KiB).
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 
+/// Maximum accepted HTTP header count per request.
+const MAX_HTTP_HEADERS: usize = 64;
+
 /// Maximum accepted HTTP request body size (64 KiB).
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
+
+/// Maximum nesting depth permitted when scanning JSON objects.
+const MAX_JSON_DEPTH: usize = 32;
 
 // ============================================================================
 // 1. Configuration & Action Receipts
@@ -834,65 +851,229 @@ pub fn json_escape(input: &str) -> String {
     out
 }
 
-/// Find the byte offset immediately after `"key" :` inside a flat JSON object string.
-fn find_json_value_start<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let bytes = json.as_bytes();
-    let mut i = 0;
+/// Scan a JSON string literal starting at `bytes[start] == b'"'`, returning the byte offset
+/// immediately AFTER the closing `"` if well-formed, or `None` if unterminated/invalid.
+fn scan_json_string(bytes: &[u8], start: usize) -> Option<usize> {
     let len = bytes.len();
-
+    if start >= len || bytes[start] != b'"' {
+        return None;
+    }
+    let mut i = start + 1;
     while i < len {
-        // Locate opening quote of a JSON string token.
-        if bytes[i] != b'"' {
+        let b = bytes[i];
+        if b < 0x20 {
+            // Unescaped ASCII control characters (including NUL, CR, LF) are invalid in JSON strings.
+            return None;
+        }
+        if b == b'\\' {
             i += 1;
+            if i >= len {
+                return None;
+            }
+            match bytes[i] {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    i += 1;
+                }
+                b'u' => {
+                    if i + 5 > len {
+                        return None;
+                    }
+                    for &hx in &bytes[i + 1..i + 5] {
+                        if !hx.is_ascii_hexdigit() {
+                            return None;
+                        }
+                    }
+                    i += 5;
+                }
+                _ => return None,
+            }
             continue;
         }
-        let str_start = i + 1;
+        if b == b'"' {
+            return Some(i + 1);
+        }
         i += 1;
-        let mut escaped = false;
-        while i < len {
-            if escaped {
-                escaped = false;
+    }
+    None
+}
+
+/// Unescape a validated JSON string literal (`"..."` including quotes) into a `String`.
+fn unescape_json_string_literal(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let end = scan_json_string(bytes, 0)?;
+    let inner = &raw[1..end - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if (ch as u32) < 0x20 {
+            return None;
+        }
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{0008}'),
+            'f' => out.push('\u{000c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let mut hex = [0u8; 4];
+                for slot in &mut hex {
+                    let c = chars.next()?;
+                    if !c.is_ascii_hexdigit() {
+                        return None;
+                    }
+                    *slot = c as u8;
+                }
+                let hex_str = std::str::from_utf8(&hex).ok()?;
+                let code = u32::from_str_radix(hex_str, 16).ok()?;
+                let decoded = char::from_u32(code)?;
+                out.push(decoded);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Skip one JSON value starting at `bytes[start]` iteratively (zero recursion, bounded depth).
+fn skip_json_value(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if start >= len {
+        return None;
+    }
+    match bytes[start] {
+        b'"' => scan_json_string(bytes, start),
+        b'{' | b'[' => {
+            let mut stack = [0u8; MAX_JSON_DEPTH];
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < len {
+                match bytes[i] {
+                    b'"' => {
+                        i = scan_json_string(bytes, i)?;
+                    }
+                    b'{' => {
+                        if depth >= MAX_JSON_DEPTH {
+                            return None;
+                        }
+                        stack[depth] = b'}';
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'[' => {
+                        if depth >= MAX_JSON_DEPTH {
+                            return None;
+                        }
+                        stack[depth] = b']';
+                        depth += 1;
+                        i += 1;
+                    }
+                    b'}' | b']' => {
+                        if depth == 0 || stack[depth - 1] != bytes[i] {
+                            return None;
+                        }
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    b if b < 0x20 && !matches!(b, b' ' | b'\t' | b'\r' | b'\n') => return None,
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < len && !matches!(bytes[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n')
+            {
+                if bytes[i] < 0x20 {
+                    return None;
+                }
                 i += 1;
-                continue;
             }
-            if bytes[i] == b'\\' {
-                escaped = true;
-                i += 1;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                break;
-            }
+            if i == start { None } else { Some(i) }
+        }
+    }
+}
+
+/// Find the byte slice starting at the value of a top-level `"key": <value>` entry inside a JSON
+/// object, rejecting key-substring spoofing, nested-object spoofing, string-embedded keys, and
+/// excessive nesting depth (> `MAX_JSON_DEPTH`).
+fn find_json_value_start<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = json.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= len || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1;
+
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] == b'}' {
+            return None;
+        }
+        // Key MUST begin with '"' immediately after '{' or ',' (+ whitespace).
+        if bytes[i] != b'"' {
+            return None;
+        }
+        let key_end = scan_json_string(bytes, i)?;
+        let raw_key_inner = &json[i + 1..key_end - 1];
+        let matched = if !raw_key_inner.contains('\\') {
+            raw_key_inner == key
+        } else {
+            unescape_json_string_literal(&json[i..key_end]).as_deref() == Some(key)
+        };
+        i = key_end;
+
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len || bytes[i] != b':' {
+            return None;
+        }
+        i += 1;
+        while i < len && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= len {
             return None;
         }
-        let candidate_key = &json[str_start..i];
-        i += 1; // Advance past closing quote.
-
-        // Skip ASCII whitespace after the string token.
-        let mut j = i;
-        while j < len && bytes[j].is_ascii_whitespace() {
-            j += 1;
+        if matched {
+            return Some(&json[i..]);
         }
 
-        // Only treat this quoted string as an object key if followed by `:`.
-        if j < len && bytes[j] == b':' {
-            j += 1;
-            while j < len && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if candidate_key == key {
-                return Some(&json[j..]);
-            }
-            i = j;
+        i = skip_json_value(bytes, i)?;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
+        if i >= len || bytes[i] == b'}' {
+            return None;
+        }
+        if bytes[i] != b',' {
+            return None;
+        }
+        i += 1;
     }
-    None
 }
 
-/// Parse an unsigned 64-bit integer value for `key` from a flat JSON object.
+/// Parse an unsigned 64-bit integer value for top-level `key` from a JSON object.
 pub fn parse_json_u64(json: &str, key: &str) -> Option<u64> {
     let rest = find_json_value_start(json, key)?;
     let bytes = rest.as_bytes();
@@ -913,36 +1094,260 @@ pub fn parse_json_u64(json: &str, key: &str) -> Option<u64> {
     rest[..end].parse::<u64>().ok()
 }
 
-/// Parse a string value for `key` from a flat JSON object.
+/// Parse a string value for top-level `key` from a JSON object.
 pub fn parse_json_str(json: &str, key: &str) -> Option<String> {
     let rest = find_json_value_start(json, key)?;
-    let mut chars = rest.chars();
-    if chars.next()? != '"' {
+    let bytes = rest.as_bytes();
+    let end = scan_json_string(bytes, 0)?;
+    // Verify clean delimiter after the closing quote.
+    let mut k = end;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k < bytes.len() && !matches!(bytes[k], b',' | b'}' | b']') {
         return None;
     }
-    let mut out = String::new();
-    let mut escaped = false;
-    for ch in chars {
-        if escaped {
-            match ch {
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                '/' => out.push('/'),
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                other => out.push(other),
-            }
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(out),
-            c => out.push(c),
+    unescape_json_string_literal(&rest[..end])
+}
+
+// ============================================================================
+// 3B. Bounded Per-IP Rate Limiter & P2P Subnet Diversity Helpers
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct IpWindowEntry {
+    window_start: Instant,
+    count: u32,
+    last_seen_seq: u64,
+}
+
+/// Zero-dependency, memory-bounded per-IP fixed-window rate limiter.
+///
+/// Caps tracked distinct client IPs at `max_tracked_ips` (default [`MAX_TRACKED_IPS`] = 4096)
+/// with oldest-entry eviction so an IP-spoofing flood can never OOM the server.
+#[derive(Debug)]
+pub struct IpRateLimiter {
+    entries: HashMap<IpAddr, IpWindowEntry>,
+    order: VecDeque<(IpAddr, u64)>,
+    seq: u64,
+    max_requests_per_window: u32,
+    window: Duration,
+    max_tracked_ips: usize,
+}
+
+impl IpRateLimiter {
+    /// Create a rate limiter allowing `max_requests_per_sec` per 1-second window per IP,
+    /// capped at [`MAX_TRACKED_IPS`] tracked IPs.
+    pub fn new(max_requests_per_sec: u32) -> Self {
+        Self::with_config(
+            max_requests_per_sec,
+            Duration::from_secs(1),
+            MAX_TRACKED_IPS,
+        )
+    }
+
+    /// Create a rate limiter with custom window size and IP tracking capacity.
+    pub fn with_config(
+        max_requests_per_window: u32,
+        window: Duration,
+        max_tracked_ips: usize,
+    ) -> Self {
+        let cap = max_tracked_ips.max(1);
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            seq: 0,
+            max_requests_per_window,
+            window,
+            max_tracked_ips: cap,
         }
     }
-    None
+
+    /// Update the per-window request limit dynamically.
+    pub fn set_limit(&mut self, max_requests_per_window: u32) {
+        self.max_requests_per_window = max_requests_per_window;
+    }
+
+    /// Number of distinct client IPs currently tracked in memory.
+    pub fn tracked_ips(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Check whether a request from `ip` is allowed at the current wall-clock time.
+    pub fn allow(&mut self, ip: IpAddr) -> bool {
+        self.allow_at(ip, Instant::now())
+    }
+
+    /// Deterministic rate-limit check at explicit timestamp `now` (ideal for unit tests).
+    pub fn allow_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if self.max_requests_per_window == 0 {
+            return false;
+        }
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+
+        if let Some(entry) = self.entries.get_mut(&ip) {
+            entry.last_seen_seq = seq;
+            self.order.push_back((ip, seq));
+            let allowed = if now.saturating_duration_since(entry.window_start) >= self.window {
+                entry.window_start = now;
+                entry.count = 1;
+                true
+            } else if entry.count < self.max_requests_per_window {
+                entry.count += 1;
+                true
+            } else {
+                false
+            };
+            self.compact_order_if_needed();
+            return allowed;
+        }
+
+        if self.entries.len() >= self.max_tracked_ips {
+            self.evict_oldest();
+        }
+        self.entries.insert(
+            ip,
+            IpWindowEntry {
+                window_start: now,
+                count: 1,
+                last_seen_seq: seq,
+            },
+        );
+        self.order.push_back((ip, seq));
+        self.compact_order_if_needed();
+        true
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some((cand_ip, cand_seq)) = self.order.pop_front() {
+            let is_live = self
+                .entries
+                .get(&cand_ip)
+                .is_some_and(|e| e.last_seen_seq == cand_seq);
+            if is_live {
+                self.entries.remove(&cand_ip);
+                return;
+            }
+        }
+        if let Some(oldest_ip) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_seen_seq)
+            .map(|(&ip, _)| ip)
+        {
+            self.entries.remove(&oldest_ip);
+        }
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        if self.order.len() > self.max_tracked_ips.saturating_mul(2) {
+            let entries = &self.entries;
+            self.order.retain(|(ip, seq)| {
+                entries
+                    .get(ip)
+                    .is_some_and(|e| e.last_seen_seq == *seq)
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerSubnetKey {
+    V4([u8; 3]),
+    V6([u16; 3]),
+    Host(String),
+}
+
+fn parse_peer_host_port(addr: &str) -> Result<(&str, u16), &'static str> {
+    if addr.is_empty()
+        || addr.len() > MAX_PEER_ADDR_LEN
+        || addr.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("malformed peer 'addr'");
+    }
+    let (host, port_str) = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split_once("]:").ok_or("malformed peer 'addr'")?
+    } else {
+        let (h, p) = addr.rsplit_once(':').ok_or("malformed peer 'addr'")?;
+        if h.contains(':') {
+            return Err("malformed peer 'addr'");
+        }
+        (h, p)
+    };
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')))
+    {
+        return Err("malformed peer 'addr'");
+    }
+    let port = port_str.parse::<u16>().map_err(|_| "malformed peer 'addr'")?;
+    if port == 0 {
+        return Err("malformed peer 'addr'");
+    }
+    Ok((host, port))
+}
+
+fn is_ssrf_blocked_v4(v4: Ipv4Addr) -> bool {
+    v4.is_link_local()
+        || v4.is_multicast()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.octets() == [169, 254, 169, 254]
+}
+
+fn is_ssrf_blocked_host(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => is_ssrf_blocked_v4(v4),
+            IpAddr::V6(v6) => {
+                v6.is_multicast()
+                    || v6.is_unspecified()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || v6.to_ipv4_mapped().is_some_and(is_ssrf_blocked_v4)
+            }
+        };
+    }
+    false
+}
+
+/// Extract a `/24` (IPv4) or `/48` (IPv6) eclipse-defense subnet key for `addr`, returning `None`
+/// for loopback addresses (`127.0.0.0/8`, `::1`, `localhost`) so local multi-node tests stay unaffected.
+fn peer_subnet_key(addr: &str) -> Option<PeerSubnetKey> {
+    let (host, _) = parse_peer_host_port(addr).ok()?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                if v4.is_loopback() {
+                    None
+                } else {
+                    let o = v4.octets();
+                    Some(PeerSubnetKey::V4([o[0], o[1], o[2]]))
+                }
+            }
+            IpAddr::V6(v6) => {
+                if v6.is_loopback() {
+                    None
+                } else if let Some(mapped) = v6.to_ipv4_mapped() {
+                    if mapped.is_loopback() {
+                        None
+                    } else {
+                        let o = mapped.octets();
+                        Some(PeerSubnetKey::V4([o[0], o[1], o[2]]))
+                    }
+                } else {
+                    let s = v6.segments();
+                    Some(PeerSubnetKey::V6([s[0], s[1], s[2]]))
+                }
+            }
+        };
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        None
+    } else {
+        Some(PeerSubnetKey::Host(host.to_ascii_lowercase()))
+    }
 }
 
 // ============================================================================
@@ -1045,6 +1450,49 @@ fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Run a 4-validator unbiasable threshold entropy beacon round for `epoch` and return `gamma`.
+fn run_testnet_beacon_round(epoch: u64) -> Result<u128, String> {
+    let cfg = BeaconConfig::bft(4).map_err(|e| format!("{e}"))?;
+    let mut nodes: Vec<VernamBeacon> = (0..4u32)
+        .map(|id| VernamBeacon::new(cfg, epoch, id).map_err(|e| format!("{e}")))
+        .collect::<Result<_, _>>()?;
+    let pad_len = cfg.share_payload_bytes();
+    for dealer in 0..4usize {
+        let mut pairs: Vec<(u32, OtpChannelKey, OtpChannelKey)> = (0..4u32)
+            .map(|recip| {
+                let (s_k, r_k) = OtpChannelKey::generate_pair(pad_len);
+                (recip, s_k, r_k)
+            })
+            .collect();
+        let key_refs: Vec<(u32, &OtpChannelKey)> =
+            pairs.iter().map(|(r, sk, _)| (*r, sk)).collect();
+        let envs = nodes[dealer]
+            .generate_commit_envelopes(&key_refs)
+            .map_err(|e| format!("{e}"))?;
+        for env in envs {
+            let r = env.recipient_id as usize;
+            nodes[r]
+                .receive_commit_envelope(&env, &pairs[r].2)
+                .map_err(|e| format!("{e}"))?;
+        }
+        pairs.clear();
+    }
+    for node in &mut nodes {
+        node.lock_commit_phase().map_err(|e| format!("{e}"))?;
+    }
+    let mut reveals = Vec::with_capacity(4);
+    for node in &mut nodes {
+        reveals.push(node.generate_reveal().map_err(|e| format!("{e}"))?);
+    }
+    for r in &reveals {
+        for node in &mut nodes {
+            node.receive_reveal(r).map_err(|e| format!("{e}"))?;
+        }
+    }
+    let out = nodes[0].finalize_epoch().map_err(|e| format!("{e}"))?;
+    Ok(out.gamma)
+}
+
 /// Enforce optional `VRNM_API_TOKEN` bearer authentication on mutating/admin endpoints.
 /// When `VRNM_API_TOKEN` is unset or empty, requests remain open for local devnets/tests.
 fn check_api_auth(req: &HttpRequest) -> Result<(), HttpResponse> {
@@ -1082,7 +1530,40 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Read and parse a single HTTP/1.1 request from `stream` with an overall wall-clock deadline.
+fn is_valid_http_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b > 0x20
+                && b < 0x7f
+                && !matches!(
+                    b,
+                    b'(' | b')'
+                        | b'<'
+                        | b'>'
+                        | b'@'
+                        | b','
+                        | b';'
+                        | b':'
+                        | b'\\'
+                        | b'"'
+                        | b'/'
+                        | b'['
+                        | b']'
+                        | b'?'
+                        | b'='
+                        | b'{'
+                        | b'}'
+                )
+        })
+}
+
+fn has_disallowed_header_value_bytes(val: &str) -> bool {
+    val.bytes()
+        .any(|b| b == 0 || (b < 0x20 && b != b'\t') || b == 0x7f)
+}
+
+/// Read and parse a single HTTP/1.1 request from `stream` with an overall wall-clock deadline
+/// and strict request-smuggling / control-byte / header-count hardening.
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let deadline = Instant::now() + HTTP_READ_DEADLINE;
     let mut raw = Vec::with_capacity(1024);
@@ -1090,6 +1571,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
 
     let header_end = loop {
         if let Some(pos) = find_header_end(&raw) {
+            if pos > MAX_HTTP_HEADER_BYTES {
+                return Err("HTTP headers exceed maximum allowed size".to_string());
+            }
             break pos;
         }
         if raw.len() > MAX_HTTP_HEADER_BYTES {
@@ -1112,6 +1596,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     };
 
     let header_bytes = &raw[..header_end];
+    if header_bytes.contains(&0) {
+        return Err("HTTP headers contain NUL byte".to_string());
+    }
     let header_str = std::str::from_utf8(header_bytes)
         .map_err(|_| "HTTP headers contain invalid UTF-8".to_string())?;
 
@@ -1119,14 +1606,39 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let request_line = lines
         .next()
         .ok_or_else(|| "missing HTTP request line".to_string())?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts
+    if request_line.is_empty()
+        || request_line.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err("malformed HTTP request line".to_string());
+    }
+    let mut parts = request_line.split(' ');
+    let method_str = parts
         .next()
-        .ok_or_else(|| "missing HTTP method".to_string())?
-        .to_string();
+        .ok_or_else(|| "missing HTTP method".to_string())?;
     let raw_target = parts
         .next()
         .ok_or_else(|| "missing HTTP request target".to_string())?;
+    let version = parts
+        .next()
+        .ok_or_else(|| "missing HTTP version".to_string())?;
+    if parts.next().is_some() {
+        return Err("malformed HTTP request line: unexpected trailing tokens".to_string());
+    }
+    if method_str.is_empty()
+        || method_str.len() > 16
+        || !method_str.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        return Err("invalid HTTP method".to_string());
+    }
+    if raw_target.is_empty()
+        || (!raw_target.starts_with('/') && !(method_str == "OPTIONS" && raw_target == "*"))
+    {
+        return Err("invalid HTTP request target".to_string());
+    }
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        return Err("unsupported HTTP version".to_string());
+    }
+    let method = method_str.to_string();
     let path = raw_target
         .split('?')
         .next()
@@ -1134,19 +1646,50 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         .to_string();
 
     let mut content_length: usize = 0;
+    let mut seen_content_length = false;
+    let mut seen_transfer_encoding = false;
+    let mut header_count: usize = 0;
     let mut auth_header: Option<String> = None;
     for line in lines {
-        if let Some((name, val)) = line.split_once(':') {
-            let trimmed_name = name.trim();
-            if trimmed_name.eq_ignore_ascii_case("content-length") {
-                content_length = val
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|_| "invalid Content-Length header".to_string())?;
-            } else if trimmed_name.eq_ignore_ascii_case("authorization") {
-                auth_header = Some(val.trim().to_string());
-            }
+        header_count += 1;
+        if header_count > MAX_HTTP_HEADERS {
+            return Err("too many HTTP headers".to_string());
         }
+        if line.is_empty() || line.contains('\r') || line.contains('\n') {
+            return Err("malformed HTTP header line".to_string());
+        }
+        let Some((name, val)) = line.split_once(':') else {
+            return Err("malformed HTTP header: missing colon".to_string());
+        };
+        if !is_valid_http_header_name(name) {
+            return Err("malformed HTTP header name".to_string());
+        }
+        if has_disallowed_header_value_bytes(val) {
+            return Err("HTTP header contains disallowed control bytes".to_string());
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if seen_content_length {
+                return Err("duplicate Content-Length header".to_string());
+            }
+            seen_content_length = true;
+            let trimmed_val = val.trim();
+            if trimmed_val.is_empty() || !trimmed_val.bytes().all(|b| b.is_ascii_digit()) {
+                return Err("invalid Content-Length header".to_string());
+            }
+            content_length = trimmed_val
+                .parse::<usize>()
+                .map_err(|_| "invalid Content-Length header".to_string())?;
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            seen_transfer_encoding = true;
+        } else if name.eq_ignore_ascii_case("authorization") {
+            auth_header = Some(val.trim().to_string());
+        }
+    }
+    if seen_transfer_encoding && seen_content_length {
+        return Err("conflicting Transfer-Encoding and Content-Length headers".to_string());
+    }
+    if seen_transfer_encoding {
+        return Err("Transfer-Encoding request header is not supported".to_string());
     }
     if content_length > MAX_HTTP_BODY_BYTES {
         return Err("HTTP body exceeds maximum allowed size".to_string());
@@ -1173,7 +1716,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             .read(&mut chunk[..to_read])
             .map_err(|e| format!("failed to read HTTP body: {e}"))?;
         if n == 0 {
-            break;
+            return Err("truncated HTTP request body".to_string());
         }
         body_bytes.extend_from_slice(&chunk[..n]);
     }
@@ -1225,6 +1768,8 @@ fn try_acquire_conn_slot(active: &Arc<AtomicUsize>) -> Option<ConnSlotGuard> {
 pub struct TestnetServer {
     listener: TcpListener,
     state: Arc<Mutex<TestnetState>>,
+    rate_limiter: Arc<Mutex<IpRateLimiter>>,
+    active_conns: Arc<AtomicUsize>,
 }
 
 impl TestnetServer {
@@ -1237,6 +1782,8 @@ impl TestnetServer {
         Ok(Self {
             listener,
             state: Arc::new(Mutex::new(state)),
+            rate_limiter: Arc::new(Mutex::new(IpRateLimiter::new(DEFAULT_RATE_LIMIT_PER_SEC))),
+            active_conns: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1250,23 +1797,64 @@ impl TestnetServer {
         Arc::clone(&self.state)
     }
 
+    /// Configure the per-IP request rate limit (requests per 1-second window).
+    pub fn set_rate_limit(&self, max_requests_per_sec: u32) {
+        self.rate_limiter
+            .lock()
+            .expect("rate limiter mutex poisoned")
+            .set_limit(max_requests_per_sec);
+    }
+
+    fn write_early_error_and_close(tcp: &mut TcpStream, resp: &[u8]) {
+        let _ = tcp.set_write_timeout(Some(Duration::from_millis(500)));
+        let _ = tcp.write_all(resp);
+        let _ = tcp.flush();
+        let _ = tcp.shutdown(Shutdown::Write);
+        // Drain a small bounded amount of buffered client request bytes so the OS sends a clean
+        // FIN instead of TCP RST when closing early (ensuring clients reliably read HTTP 429/503).
+        let _ = tcp.set_read_timeout(Some(Duration::from_millis(20)));
+        let mut drain = [0u8; 2048];
+        let _ = tcp.read(&mut drain);
+    }
+
+    fn check_rate_limit(&self, tcp: &mut TcpStream) -> bool {
+        let allowed = match tcp.peer_addr() {
+            Ok(sa) => self
+                .rate_limiter
+                .lock()
+                .expect("rate limiter mutex poisoned")
+                .allow(sa.ip()),
+            Err(_) => true,
+        };
+        if !allowed {
+            let resp = HttpResponse::err_json(
+                429,
+                "Too Many Requests",
+                "per-IP rate limit exceeded",
+            )
+            .to_http_bytes();
+            Self::write_early_error_and_close(tcp, &resp);
+        }
+        allowed
+    }
+
     /// Accept and serve HTTP/1.1 connections indefinitely with bounded concurrency
-    /// (`MAX_CONCURRENT_CONNS`), returning HTTP 503 when saturated.
+    /// (`MAX_CONCURRENT_CONNS`) and per-IP rate limiting, returning HTTP 429 / 503 when exceeded.
     pub fn serve_forever(&self) {
-        let active_conns = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
             match stream {
                 Ok(mut tcp) => {
-                    let Some(slot_guard) = try_acquire_conn_slot(&active_conns) else {
-                        let _ = tcp.set_write_timeout(Some(Duration::from_millis(500)));
+                    if !self.check_rate_limit(&mut tcp) {
+                        continue;
+                    }
+                    let Some(slot_guard) = try_acquire_conn_slot(&self.active_conns) else {
                         let resp = HttpResponse::err_json(
                             503,
                             "Service Unavailable",
                             "server saturated: too many concurrent connections",
                         )
                         .to_http_bytes();
-                        let _ = tcp.write_all(&resp);
-                        let _ = tcp.flush();
+                        Self::write_early_error_and_close(&mut tcp, &resp);
                         continue;
                     };
                     let state = Arc::clone(&self.state);
@@ -1289,7 +1877,9 @@ impl TestnetServer {
                 break;
             }
             if let Ok(mut tcp) = stream {
-                Self::handle_connection(&self.state, &mut tcp);
+                if self.check_rate_limit(&mut tcp) {
+                    Self::handle_connection(&self.state, &mut tcp);
+                }
                 served += 1;
                 if served >= count {
                     break;
@@ -1341,7 +1931,7 @@ impl TestnetServer {
             ("GET", "/") => HttpResponse::html(VERNAM_EXPLORER_HTML.to_string()),
 
             ("GET", "/health") => HttpResponse::ok_json(
-                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"1.0.1\"}"
+                "{\"status\":\"ok\",\"network\":\"vernam-vrnm-testnet\",\"version\":\"1.1.0\"}"
                     .to_string(),
             ),
 
@@ -1358,12 +1948,16 @@ impl TestnetServer {
                     return HttpResponse::err_json(400, "Bad Request", "missing string field 'addr'");
                 };
                 let trimmed = raw_addr.trim();
-                if trimmed.is_empty()
-                    || trimmed.len() > MAX_PEER_ADDR_LEN
-                    || !trimmed.contains(':')
-                    || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
-                {
-                    return HttpResponse::err_json(400, "Bad Request", "malformed peer 'addr'");
+                let (host, _port) = match parse_peer_host_port(trimmed) {
+                    Ok(hp) => hp,
+                    Err(msg) => return HttpResponse::err_json(400, "Bad Request", msg),
+                };
+                if is_ssrf_blocked_host(host) {
+                    return HttpResponse::err_json(
+                        400,
+                        "Bad Request",
+                        "SSRF protection: blocked peer IP address",
+                    );
                 }
                 let node_id = parse_json_u64(&req.body, "node_id").unwrap_or(100);
                 let height = parse_json_u64(&req.body, "height").unwrap_or(0);
@@ -1375,12 +1969,28 @@ impl TestnetServer {
                     .unwrap_or_else(|| guard.config.bind_addr.clone());
                 if trimmed != self_adv && trimmed != guard.config.bind_addr {
                     let is_new = !guard.external_peers.contains_key(trimmed);
-                    if is_new && guard.external_peers.len() >= MAX_EXTERNAL_PEERS {
-                        return HttpResponse::err_json(
-                            400,
-                            "Bad Request",
-                            "external peer table full",
-                        );
+                    if is_new {
+                        if guard.external_peers.len() >= MAX_EXTERNAL_PEERS {
+                            return HttpResponse::err_json(
+                                400,
+                                "Bad Request",
+                                "external peer table full",
+                            );
+                        }
+                        if let Some(subnet) = peer_subnet_key(trimmed) {
+                            let same_subnet_count = guard
+                                .external_peers
+                                .keys()
+                                .filter(|k| peer_subnet_key(k).as_ref() == Some(&subnet))
+                                .count();
+                            if same_subnet_count >= MAX_PEERS_PER_SUBNET {
+                                return HttpResponse::err_json(
+                                    400,
+                                    "Bad Request",
+                                    "eclipse protection: per-subnet peer cap exceeded",
+                                );
+                            }
+                        }
                     }
                     guard
                         .external_peers
@@ -1397,17 +2007,46 @@ impl TestnetServer {
                     return resp;
                 }
                 // Read current epoch briefly, then drop mutex so /health and /status never stall
-                // while bilateral PoP QKD/entropy mining & commit-then-challenge proofs run.
+                // while threshold beacon + bilateral PoP QKD/entropy mining execute.
                 let (epoch, mut last_qber) = {
                     let guard = state.lock().expect("testnet state mutex poisoned");
                     (guard.tokenomics.current_epoch(), guard.last_qber)
                 };
 
-                let mut submissions = Vec::with_capacity(4);
+                // 1. Run unbiasable 4-validator threshold entropy beacon round for this epoch.
+                let beacon_gamma = match run_testnet_beacon_round(epoch) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        return HttpResponse::err_json(
+                            500,
+                            "Internal Server Error",
+                            &format!("threshold entropy beacon round failed: {e}"),
+                        );
+                    }
+                };
+                let active_validators = [0u64, 1, 2, 3];
+                let schedule =
+                    match BeaconPairingSchedule::derive(epoch, &active_validators, beacon_gamma) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return HttpResponse::err_json(
+                                500,
+                                "Internal Server Error",
+                                &format!("beacon pairing derivation failed: {e}"),
+                            );
+                        }
+                    };
+
+                // 2. Mine bilateral pad batches strictly against each validator's beacon-assigned
+                //    counterparty peer and answer deterministic beacon-derived challenges.
+                let mut submissions = Vec::with_capacity(active_validators.len());
                 let mut all_mined = true;
 
-                for vid in 0..4u64 {
-                    let counterparty = (vid + 1) % 4;
+                for &vid in &active_validators {
+                    let Some(counterparty) = schedule.expected_counterparty(vid) else {
+                        all_mined = false;
+                        continue;
+                    };
                     let peer_key = PeerReceiptKey::generate();
                     match PopMiner::mine_bilateral_pad_batch(
                         vid,
@@ -1418,16 +2057,27 @@ impl TestnetServer {
                         &peer_key,
                     ) {
                         Ok((mut batch, commit, peer_receipt)) => {
-                            let challenge = PopAuditor::issue_challenge(vid, epoch);
-                            let proof = PopMiner::answer_challenge(&mut batch, &challenge)
-                                .with_liveness(1, 1);
-                            submissions.push(BilateralPopSubmission {
-                                commitment: commit,
-                                challenge,
-                                proof,
-                                peer_receipt: Some(peer_receipt),
-                                peer_key: Some(peer_key),
-                            });
+                            match PopAuditor::issue_beacon_challenge(
+                                vid,
+                                epoch,
+                                beacon_gamma,
+                                DEFAULT_CHALLENGE_SLOT_COUNT,
+                            ) {
+                                Ok(challenge) => {
+                                    let proof = PopMiner::answer_challenge(&mut batch, &challenge)
+                                        .with_liveness(1, 1);
+                                    submissions.push(BilateralPopSubmission {
+                                        commitment: commit,
+                                        challenge,
+                                        proof,
+                                        peer_receipt: Some(peer_receipt),
+                                        peer_key: Some(peer_key),
+                                    });
+                                }
+                                Err(_) => {
+                                    all_mined = false;
+                                }
+                            }
                         }
                         Err(_) => {
                             all_mined = false;
@@ -1441,11 +2091,22 @@ impl TestnetServer {
                     ref mut pop_replay_registry,
                     ..
                 } = *guard;
-                let report = PopEpochCoordinator::run_bilateral_audited_epoch(
+                let report = match PopEpochCoordinator::run_beacon_bilateral_audited_epoch(
+                    beacon_gamma,
+                    &active_validators,
                     tokenomics,
                     pop_replay_registry,
                     &submissions,
-                );
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return HttpResponse::err_json(
+                            500,
+                            "Internal Server Error",
+                            &format!("beacon bilateral PoP audit failed: {e}"),
+                        );
+                    }
+                };
                 let tracked_pads = guard.pop_replay_registry.tracked_pad_fingerprints();
                 let mut last_monobit_z = 0.0f64;
                 let mut last_runs_z = 0.0f64;
@@ -1462,20 +2123,23 @@ impl TestnetServer {
                 let _ = guard.shielded_ledger.proactive_refresh_epoch();
                 guard.last_qber = last_qber;
                 guard.push_event(format!(
-                    "POP MINE: epoch #{} bilateral-audited {}/{} validators (anti-replay={} pads), subsidy={} vern, QBER={:.4}%",
+                    "POP MINE: epoch #{} beacon-paired {}/{} validators (gamma=0x{:032x}, anti-replay={} pads), subsidy={} vern, QBER={:.4}%",
                     report.settlement.epoch,
                     report.accepted.len(),
                     submissions.len(),
+                    beacon_gamma,
                     tracked_pads,
                     report.settlement.subsidy_minted,
                     last_qber * 100.0
                 ));
                 HttpResponse::ok_json(format!(
-                    "{{\"status\":\"mined\",\"epoch\":{},\"pss_epoch\":{},\"audited_validators\":{},\"passed_validators\":{},\"beaver_verified\":{},\"bilateral_receipts_verified\":{},\"anti_replay_tracked_pads\":{},\"monobit_z\":{:.4},\"runs_z\":{:.4},\"qber\":{:.6},\"subsidy_minted_vern\":{},\"total_burned_vern\":{},\"circulating_supply_vern\":{}}}",
+                    "{{\"status\":\"mined\",\"epoch\":{},\"pss_epoch\":{},\"beacon_gamma\":\"0x{:032x}\",\"audited_validators\":{},\"passed_validators\":{},\"beaver_verified\":{},\"bilateral_receipts_verified\":{},\"beacon_paired_verified\":{},\"anti_replay_tracked_pads\":{},\"monobit_z\":{:.4},\"runs_z\":{:.4},\"qber\":{:.6},\"subsidy_minted_vern\":{},\"total_burned_vern\":{},\"circulating_supply_vern\":{}}}",
                     report.settlement.epoch,
                     guard.shielded_ledger.epoch(),
+                    beacon_gamma,
                     submissions.len(),
                     report.accepted.len(),
+                    all_bilateral_ok,
                     all_bilateral_ok,
                     all_bilateral_ok,
                     tracked_pads,
@@ -1801,7 +2465,7 @@ mod tests {
         assert!(headers.contains("Access-Control-Allow-Origin: *"));
         assert_eq!(
             body,
-            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"1.0.1"}"#
+            r#"{"status":"ok","network":"vernam-vrnm-testnet","version":"1.1.0"}"#
         );
 
         // 2. GET / (Dark-mode interactive explorer HTML)
@@ -2005,23 +2669,28 @@ mod tests {
         assert_eq!(resp_long.status_code, 400);
 
         for i in 0..MAX_EXTERNAL_PEERS {
+            let subnet = i / MAX_PEERS_PER_SUBNET;
+            let host_octet = (i % MAX_PEERS_PER_SUBNET) + 1;
             let resp = TestnetServer::route_request(
                 &state,
                 &HttpRequest {
                     method: "POST".to_string(),
                     path: "/p2p/announce".to_string(),
-                    body: format!("{{\"addr\":\"10.0.0.1:{}\",\"node_id\":{}}}", 9000 + i, i),
+                    body: format!(
+                        "{{\"addr\":\"10.0.{subnet}.{host_octet}:{}\",\"node_id\":{i}}}",
+                        9000 + i
+                    ),
                     auth_header: None,
                 },
             );
-            assert_eq!(resp.status_code, 200);
+            assert_eq!(resp.status_code, 200, "peer {i} rejected: {}", resp.body);
         }
         let resp_overflow = TestnetServer::route_request(
             &state,
             &HttpRequest {
                 method: "POST".to_string(),
                 path: "/p2p/announce".to_string(),
-                body: "{\"addr\":\"10.0.0.1:9999\",\"node_id\":999}".to_string(),
+                body: "{\"addr\":\"10.0.99.1:9999\",\"node_id\":999}".to_string(),
                 auth_header: None,
             },
         );
@@ -2040,8 +2709,272 @@ mod tests {
         assert_eq!(resp_pop.status_code, 200, "pop mine failed: {}", resp_pop.body);
         assert!(resp_pop.body.contains("\"beaver_verified\":true"));
         assert!(resp_pop.body.contains("\"bilateral_receipts_verified\":true"));
+        assert!(resp_pop.body.contains("\"beacon_paired_verified\":true"));
+        assert!(resp_pop.body.contains("\"beacon_gamma\":\"0x"));
         assert!(parse_json_u64(&resp_pop.body, "anti_replay_tracked_pads").unwrap_or(0) >= 4);
         assert_eq!(parse_json_u64(&resp_pop.body, "passed_validators"), Some(4));
         assert_eq!(parse_json_u64(&resp_pop.body, "audited_validators"), Some(4));
+    }
+
+    fn send_raw_bytes(addr: SocketAddr, payload: &[u8]) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect TestnetServer");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream.write_all(payload).expect("write raw payload");
+        stream.flush().expect("flush");
+        let mut resp = Vec::new();
+        stream.read_to_end(&mut resp).expect("read response");
+        let resp_str = String::from_utf8_lossy(&resp).into_owned();
+        let status_line = resp_str.lines().next().unwrap_or("");
+        let code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        (code, resp_str)
+    }
+
+    #[test]
+    fn test_adversarial_http_smuggling_and_parser_hardening() {
+        let config = TestnetConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            num_buckets: 2,
+            max_accounts: 32,
+        };
+        let server = TestnetServer::bind(config).expect("bind server");
+        let addr = server.local_addr().expect("local_addr");
+
+        // Build 65 headers (> MAX_HTTP_HEADERS = 64).
+        let mut many_headers = String::from("GET /health HTTP/1.1\r\nHost: localhost\r\n");
+        for i in 0..65 {
+            many_headers.push_str(&format!("X-H-{i}: v\r\n"));
+        }
+        many_headers.push_str("\r\n");
+
+        let hostile_requests: Vec<Vec<u8>> = vec![
+            // 1. Duplicate Content-Length (smuggling)
+            b"POST /faucet HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            // 2. Conflicting Transfer-Encoding + Content-Length (CL.TE smuggling)
+            b"POST /faucet HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            // 3. NUL byte in path
+            b"GET /health\x00evil HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec(),
+            // 4. Non-printable ASCII control byte in header value
+            b"GET /health HTTP/1.1\r\nHost: localhost\r\nX-Test: bad\x07val\r\n\r\n".to_vec(),
+            // 5. > 64 headers
+            many_headers.into_bytes(),
+            // 6. Malformed request line (extra tokens)
+            b"GET /health HTTP/1.1 EXTRA\r\nHost: localhost\r\n\r\n".to_vec(),
+            // 7. Whitespace before colon in header name (RFC 7230 smuggling)
+            b"POST /faucet HTTP/1.1\r\nHost: localhost\r\nContent-Length : 2\r\n\r\n{}".to_vec(),
+            // 8. Bare LF inside header line
+            b"GET /health HTTP/1.1\r\nHost: localhost\nX-Smuggled: 1\r\n\r\n".to_vec(),
+        ];
+
+        let count = hostile_requests.len();
+        let handle = thread::spawn(move || server.serve_n_requests(count));
+        for (idx, req) in hostile_requests.iter().enumerate() {
+            let (code, resp) = send_raw_bytes(addr, req);
+            assert_eq!(
+                code, 400,
+                "hostile request #{idx} must return 400 Bad Request, got {code}: {resp}"
+            );
+        }
+        handle.join().expect("server thread exited cleanly");
+    }
+
+    #[test]
+    fn test_adversarial_json_spoofing_escapes_nesting_and_overflow() {
+        // Key-substring spoofing must NEVER match.
+        assert_eq!(parse_json_u64(r#"{"not_account_id": 1}"#, "account_id"), None);
+        assert_eq!(
+            parse_json_u64(r#"{"fake_account_id": 9, "account_id": 2}"#, "account_id"),
+            Some(2)
+        );
+        // Key embedded inside another string value must NEVER match.
+        assert_eq!(
+            parse_json_u64(r#"{"memo": "\"account_id\": 99"}"#, "account_id"),
+            None
+        );
+        assert_eq!(
+            parse_json_u64(
+                r#"{"memo": "{\"account_id\": 99}", "account_id": 7}"#,
+                "account_id"
+            ),
+            Some(7)
+        );
+        // Nested object key must NEVER spoof top-level key.
+        assert_eq!(
+            parse_json_u64(r#"{"nested": {"account_id": 99}}"#, "account_id"),
+            None
+        );
+        assert_eq!(
+            parse_json_u64(
+                r#"{"nested": {"account_id": 99}, "account_id": 3}"#,
+                "account_id"
+            ),
+            Some(3)
+        );
+        // Escaped backslash-quote (`\\"`) and escaped quote (`\"`) edge cases.
+        let escaped_json = r#"{"a": "foo\\", "b": "bar\\\"baz", "account_id": 42}"#;
+        assert_eq!(parse_json_str(escaped_json, "a").as_deref(), Some(r"foo\"));
+        assert_eq!(
+            parse_json_str(escaped_json, "b").as_deref(),
+            Some("bar\\\"baz")
+        );
+        assert_eq!(parse_json_u64(escaped_json, "account_id"), Some(42));
+        // u64 overflow returns None cleanly without panic.
+        assert_eq!(
+            parse_json_u64(r#"{"account_id": 99999999999999999999999}"#, "account_id"),
+            None
+        );
+        // Deeply nested JSON (> MAX_JSON_DEPTH) returns None without stack overflow.
+        let deep = format!(
+            "{{\"nested\": {}{}, \"account_id\": 5}}",
+            "{".repeat(128),
+            "}".repeat(128)
+        );
+        assert_eq!(parse_json_u64(&deep, "account_id"), None);
+        // Malformed / unclosed escapes / negative / floats never panic.
+        assert_eq!(parse_json_str("{\"a\": \"unterminated\\", "a"), None);
+        assert_eq!(parse_json_u64(r#"{"account_id": -5}"#, "account_id"), None);
+        assert_eq!(parse_json_u64(r#"{"account_id": 12.5}"#, "account_id"), None);
+        assert_eq!(parse_json_u64("garbage \"account_id\": 1", "account_id"), None);
+    }
+
+    #[test]
+    fn test_ip_rate_limiter_throttling_and_bounded_memory_10k_ips() {
+        let mut limiter = IpRateLimiter::new(3);
+        let t0 = Instant::now();
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        assert!(limiter.allow_at(ip, t0));
+        assert!(limiter.allow_at(ip, t0));
+        assert!(limiter.allow_at(ip, t0));
+        assert!(!limiter.allow_at(ip, t0), "4th request in 1s window must throttle");
+        // After 1 second window elapses, requests are allowed again.
+        assert!(limiter.allow_at(ip, t0 + Duration::from_secs(1)));
+
+        // Flood with 10,000 unique spoofed IPs -> memory strictly capped at MAX_TRACKED_IPS (4096).
+        let mut flood_limiter = IpRateLimiter::new(10);
+        for i in 0..10_000u32 {
+            let spoofed = IpAddr::V4(Ipv4Addr::new(
+                10,
+                ((i >> 16) & 0xff) as u8,
+                ((i >> 8) & 0xff) as u8,
+                (i & 0xff) as u8,
+            ));
+            assert!(flood_limiter.allow_at(spoofed, t0));
+        }
+        assert!(
+            flood_limiter.tracked_ips() <= MAX_TRACKED_IPS,
+            "tracked_ips {} exceeded MAX_TRACKED_IPS {MAX_TRACKED_IPS}",
+            flood_limiter.tracked_ips()
+        );
+        assert!(flood_limiter.order.len() <= MAX_TRACKED_IPS * 2 + 1);
+
+        // Live TCP HTTP 429 Too Many Requests enforcement on TestnetServer.
+        let config = TestnetConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            num_buckets: 2,
+            max_accounts: 32,
+        };
+        let server = TestnetServer::bind(config).expect("bind server");
+        server.set_rate_limit(2);
+        let addr = server.local_addr().expect("local_addr");
+        let handle = thread::spawn(move || server.serve_n_requests(3));
+
+        let (c1, _, _) = send_raw_http(addr, "GET", "/health", "");
+        let (c2, _, _) = send_raw_http(addr, "GET", "/health", "");
+        let (c3, _, body3) = send_raw_http(addr, "GET", "/health", "");
+        assert_eq!(c1, 200);
+        assert_eq!(c2, 200);
+        assert_eq!(c3, 429, "3rd request must return 429 Too Many Requests: {body3}");
+        handle.join().expect("server exited cleanly");
+    }
+
+    #[test]
+    fn test_p2p_announce_subnet_eclipse_and_ssrf_defense() {
+        let config = TestnetConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            num_buckets: 2,
+            max_accounts: 32,
+        };
+        let state = Arc::new(Mutex::new(TestnetState::new(config).expect("init state")));
+
+        // 4 peers in the same /24 subnet succeed.
+        for i in 1..=MAX_PEERS_PER_SUBNET {
+            let resp = TestnetServer::route_request(
+                &state,
+                &HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/p2p/announce".to_string(),
+                    body: format!("{{\"addr\":\"198.51.100.{i}:8080\",\"node_id\":{i}}}"),
+                    auth_header: None,
+                },
+            );
+            assert_eq!(resp.status_code, 200);
+        }
+        // 5th peer in same /24 subnet MUST be rejected (eclipse defense).
+        let resp_eclipse = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/p2p/announce".to_string(),
+                body: "{\"addr\":\"198.51.100.5:8080\",\"node_id\":5}".to_string(),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_eclipse.status_code, 400);
+        assert!(resp_eclipse.body.contains("eclipse"));
+
+        // IPv4-mapped IPv6 in the same /24 must also be rejected (cannot bypass /24 cap).
+        let resp_mapped = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/p2p/announce".to_string(),
+                body: "{\"addr\":\"[::ffff:198.51.100.6]:8080\",\"node_id\":6}".to_string(),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_mapped.status_code, 400);
+
+        // Different /24 subnet succeeds.
+        let resp_other = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/p2p/announce".to_string(),
+                body: "{\"addr\":\"198.51.101.1:8080\",\"node_id\":10}".to_string(),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_other.status_code, 200);
+
+        // Loopback remains exempt for local multi-node tests.
+        for port in 19001..=19006 {
+            let resp = TestnetServer::route_request(
+                &state,
+                &HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/p2p/announce".to_string(),
+                    body: format!("{{\"addr\":\"127.0.0.1:{port}\",\"node_id\":{port}}}"),
+                    auth_header: None,
+                },
+            );
+            assert_eq!(resp.status_code, 200);
+        }
+
+        // SSRF metadata IP rejected.
+        let resp_ssrf = TestnetServer::route_request(
+            &state,
+            &HttpRequest {
+                method: "POST".to_string(),
+                path: "/p2p/announce".to_string(),
+                body: "{\"addr\":\"169.254.169.254:80\",\"node_id\":99}".to_string(),
+                auth_header: None,
+            },
+        );
+        assert_eq!(resp_ssrf.status_code, 400);
     }
 }

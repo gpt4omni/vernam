@@ -377,11 +377,14 @@ impl OtpLinkDeck {
         );
         for _ in 0..count {
             let id = outbound.next_alloc_id;
+            let next_id = id
+                .checked_add(1)
+                .expect("OTP link deck slot_id space exhausted");
             let (slot_a, slot_b) = LinkKeySlot::generate_pair();
             outbound.slots.insert(id, slot_a);
             inbound.slots.insert(id, slot_b);
-            outbound.next_alloc_id += 1;
-            inbound.next_alloc_id += 1;
+            outbound.next_alloc_id = next_id;
+            inbound.next_alloc_id = next_id;
         }
     }
 
@@ -399,11 +402,14 @@ impl OtpLinkDeck {
         plaintext: &[u8; WIRE_PAYLOAD_LEN],
     ) -> Result<WireFrame, BftError> {
         let slot_id = self.next_send_id;
+        let next_id = slot_id
+            .checked_add(1)
+            .ok_or(BftError::OtpDeckExhausted { from, to })?;
         let slot = self
             .slots
             .remove(&slot_id)
             .ok_or(BftError::OtpDeckExhausted { from, to })?;
-        self.next_send_id += 1;
+        self.next_send_id = next_id;
 
         let LinkKeySlot { otp_pad, cw_key } = slot;
 
@@ -732,7 +738,10 @@ impl TxBatchBlock {
         let mut block_tag = [0u8; 16];
         block_tag.copy_from_slice(&bytes[40..56]);
 
-        let expected_len = 56 + tx_count * BINARY_TX_SIZE;
+        let expected_len = tx_count
+            .checked_mul(BINARY_TX_SIZE)
+            .and_then(|n| n.checked_add(56))
+            .ok_or(BftError::InvalidEncoding("block tx payload length overflow"))?;
         if bytes.len() != expected_len {
             return Err(BftError::InvalidEncoding("block tx payload length mismatch"));
         }
@@ -790,9 +799,16 @@ impl LedgerState {
 
     /// Validate a proposed batch against current state without mutating `self`.
     pub fn validate_batch_readonly(&self, block: &TxBatchBlock) -> Result<(), BftError> {
-        if block.height != self.height + 1 || !ct_eq_16(&block.prev_tag, &self.tip_tag) {
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(BftError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: block.height,
+            })?;
+        if block.height != expected_height || !ct_eq_16(&block.prev_tag, &self.tip_tag) {
             return Err(BftError::ChainLinkMismatch {
-                expected_height: self.height + 1,
+                expected_height,
                 got_height: block.height,
             });
         }
@@ -863,11 +879,23 @@ impl LedgerState {
     pub fn apply_committed_block(&mut self, block: &TxBatchBlock) -> Result<(), BftError> {
         self.validate_batch_readonly(block)?;
 
-        for tx in &block.txs {
+        for (idx, tx) in block.txs.iter().enumerate() {
             let sender_bal = self.balance_of(tx.sender_id);
             let recip_bal = self.balance_of(tx.recipient_id);
-            self.balances.insert(tx.sender_id, sender_bal - tx.amount);
-            self.balances.insert(tx.recipient_id, recip_bal + tx.amount);
+            let new_sender = sender_bal
+                .checked_sub(tx.amount)
+                .ok_or(BftError::InvalidTransaction {
+                    index: idx,
+                    reason: "insufficient balance",
+                })?;
+            let new_recip = recip_bal
+                .checked_add(tx.amount)
+                .ok_or(BftError::InvalidTransaction {
+                    index: idx,
+                    reason: "recipient balance overflow",
+                })?;
+            self.balances.insert(tx.sender_id, new_sender);
+            self.balances.insert(tx.recipient_id, new_recip);
             self.used_pages.insert((tx.sender_id, tx.page_id));
             self.used_nonces.insert((tx.sender_id, tx.nonce));
         }
@@ -892,7 +920,10 @@ pub struct BftConfig {
 impl BftConfig {
     /// Create a BFT configuration for `num_validators = 3f + 1` (`4, 7, 10, ...`).
     pub fn new(num_validators: usize, max_batch_txs: usize) -> Result<Self, BftError> {
-        if num_validators < 4 || (num_validators - 1) % 3 != 0 {
+        if num_validators < 4
+            || (num_validators - 1) % 3 != 0
+            || num_validators > u32::MAX as usize
+        {
             return Err(BftError::InvalidValidatorCount(num_validators));
         }
         Ok(Self {
@@ -906,8 +937,13 @@ impl BftConfig {
         if f == 0 {
             return Err(BftError::InvalidValidatorCount(1));
         }
+        let num_validators = f
+            .checked_mul(3)
+            .and_then(|v| v.checked_add(1))
+            .filter(|&n| n <= u32::MAX as usize)
+            .ok_or(BftError::InvalidValidatorCount(usize::MAX))?;
         Ok(Self {
-            num_validators: 3 * f + 1,
+            num_validators,
             max_batch_txs: DEFAULT_MAX_BATCH_TXS,
         })
     }
@@ -925,10 +961,10 @@ impl BftConfig {
     }
 
     /// Deterministic leader rotation: `leader = (height + view) % N`.
-    /// At `view == 0`, this is `height % N`; view changes automatically bypass offline/Byzantine leaders.
+    /// Uses `u128` addition to avoid modular wrap discontinuity at `u64::MAX`.
     #[inline]
     pub const fn leader_for(&self, height: u64, view: u64) -> u32 {
-        (((height as usize).wrapping_add(view as usize)) % self.num_validators) as u32
+        (((height as u128) + (view as u128)) % (self.num_validators as u128)) as u32
     }
 }
 
@@ -1091,7 +1127,7 @@ impl BftValidator {
     /// Next height this validator expects to finalize.
     #[inline]
     pub fn next_height(&self) -> u64 {
-        self.ledger.height + 1
+        self.ledger.height.saturating_add(1)
     }
 
     /// Remaining outbound OTP slots toward `peer_id`.
@@ -1167,7 +1203,14 @@ impl BftValidator {
         if !self.online {
             return Err(BftError::ValidatorOffline(self.id));
         }
-        let height = self.next_height();
+        let height = self
+            .ledger
+            .height
+            .checked_add(1)
+            .ok_or(BftError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: u64::MAX,
+            })?;
         let view = self.current_view;
         let expected_leader = self.config.leader_for(height, view);
         if self.id != expected_leader {
@@ -1175,6 +1218,10 @@ impl BftValidator {
                 expected: expected_leader,
                 got: self.id,
             });
+        }
+
+        if self.locked_view.is_some_and(|lv| view <= lv) {
+            return Err(BftError::ConflictingPrePrepare { height, view });
         }
 
         if txs.len() > self.config.max_batch_txs {
@@ -1249,7 +1296,14 @@ impl BftValidator {
             return Err(BftError::ValidatorOffline(self.id));
         }
 
-        let height = self.next_height();
+        let height = self
+            .ledger
+            .height
+            .checked_add(1)
+            .ok_or(BftError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: block.height,
+            })?;
         let view = self.current_view;
         let expected_leader = self.config.leader_for(height, view);
 
@@ -1275,6 +1329,11 @@ impl BftValidator {
                 expected_height: height,
                 got_height: block.height,
             });
+        }
+
+        // BFT Safety lock rule: never accept a PrePrepare at or below an already-locked view.
+        if self.locked_view.is_some_and(|lv| view <= lv) {
+            return Err(BftError::ConflictingPrePrepare { height, view });
         }
 
         if let Some(existing) = &self.round.proposed_block {
@@ -1331,6 +1390,7 @@ impl BftValidator {
             || vote.voter_id != frame.from
             || vote.height != self.next_height()
             || vote.view != self.current_view
+            || !ct_eq_16(&vote.prev_tag, &self.ledger.tip_tag)
         {
             return Err(BftError::InvalidEncoding("mismatched Prepare vote"));
         }
@@ -1427,6 +1487,7 @@ impl BftValidator {
             || vote.voter_id != frame.from
             || vote.height != self.next_height()
             || vote.view != self.current_view
+            || !ct_eq_16(&vote.prev_tag, &self.ledger.tip_tag)
         {
             return Err(BftError::InvalidEncoding("mismatched Commit vote"));
         }
@@ -1498,7 +1559,15 @@ impl BftValidator {
                 quorum: self.config.quorum(),
             })?;
 
-        self.ledger.apply_committed_block(&block)?;
+        if !ct_eq_16(&block.block_tag, &prepared_tag) {
+            self.round.proposed_block = Some(block);
+            return Err(BftError::ConflictingPrePrepare { height, view });
+        }
+
+        if let Err(err) = self.ledger.apply_committed_block(&block) {
+            self.round.proposed_block = Some(block);
+            return Err(err);
+        }
 
         let cert = BlockCertificate {
             height: block.height,
@@ -1567,6 +1636,8 @@ impl BftValidator {
             || vote.voter_id != frame.from
             || vote.height != self.next_height()
             || vote.view <= self.current_view
+            || !ct_eq_16(&vote.prev_tag, &self.ledger.tip_tag)
+            || vote.locked_view.is_some_and(|lv| lv >= vote.view)
         {
             return Err(BftError::InvalidEncoding("mismatched ViewChange vote"));
         }
@@ -1603,10 +1674,11 @@ impl BftValidator {
                 quorum: self.config.quorum(),
             });
         }
-        // Preserve highest-view lock reported by the ViewChange quorum.
+        // Preserve highest-view lock strictly below target_view reported by the ViewChange quorum.
+        // Uses strict `>` so an equal-view claim from another peer cannot overwrite our existing lock.
         if let Some(map) = votes {
             for lock in map.values().flatten() {
-                if self.locked_view.is_none_or(|cur| lock.0 >= cur) {
+                if lock.0 < target_view && self.locked_view.is_none_or(|cur| lock.0 > cur) {
                     self.locked_view = Some(lock.0);
                     self.locked_block_tag = Some(lock.1);
                 }
@@ -1689,7 +1761,14 @@ pub fn sync_validator_from_quorum(
     let mut synced = 0usize;
 
     while validators[idx].ledger.height < max_peer_height {
-        let h = validators[idx].ledger.height + 1;
+        let h = validators[idx]
+            .ledger
+            .height
+            .checked_add(1)
+            .ok_or(BftError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: max_peer_height,
+            })?;
 
         // Step 1: Every online peer holding height `h` sends an OTP+CW authenticated SyncCert frame.
         let mut outbound_frames: Vec<WireFrame> = Vec::new();
@@ -1916,7 +1995,10 @@ impl BftCluster {
             vc_frames.extend(frames);
         }
         for frame in &vc_frames {
-            match self.validators[frame.to as usize].on_view_change_frame(frame) {
+            let Some(v) = self.validators.get_mut(frame.to as usize) else {
+                return Err(BftError::UnknownValidator(frame.to));
+            };
+            match v.on_view_change_frame(frame) {
                 Ok(()) | Err(BftError::InvalidMac | BftError::InvalidEncoding(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -1956,7 +2038,10 @@ impl BftCluster {
             if self.validators[candidate as usize].online {
                 break candidate;
             }
-            self.execute_view_change(view + 1)?;
+            let next_view = view
+                .checked_add(1)
+                .ok_or(BftError::InvalidEncoding("view number overflow"))?;
+            self.execute_view_change(next_view)?;
         };
 
         // Phase 0: Leader PrePrepare + Leader Prepare
@@ -1965,15 +2050,20 @@ impl BftCluster {
 
         // Followers process PrePrepare and emit pairwise Prepare frames
         for frame in &pre_prepare_frames {
-            let follower_prepares =
-                self.validators[frame.to as usize].on_pre_prepare(frame, block.clone(), &online)?;
+            let Some(v) = self.validators.get_mut(frame.to as usize) else {
+                return Err(BftError::UnknownValidator(frame.to));
+            };
+            let follower_prepares = v.on_pre_prepare(frame, block.clone(), &online)?;
             prepare_frames.extend(follower_prepares);
         }
 
         // Phase 1: Deliver all Prepare frames over pairwise OTP+CW links (ignore individual
         // Byzantine InvalidMac/InvalidEncoding frames; fail only if quorum < 2f + 1).
         for frame in &prepare_frames {
-            match self.validators[frame.to as usize].on_prepare_frame(frame) {
+            let Some(v) = self.validators.get_mut(frame.to as usize) else {
+                return Err(BftError::UnknownValidator(frame.to));
+            };
+            match v.on_prepare_frame(frame) {
                 Ok(()) | Err(BftError::InvalidMac | BftError::InvalidEncoding(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -1988,7 +2078,10 @@ impl BftCluster {
 
         // Phase 2: Deliver all Commit frames over pairwise OTP+CW links (tolerate Byzantine frames).
         for frame in &commit_frames {
-            match self.validators[frame.to as usize].on_commit_frame(frame) {
+            let Some(v) = self.validators.get_mut(frame.to as usize) else {
+                return Err(BftError::UnknownValidator(frame.to));
+            };
+            match v.on_commit_frame(frame) {
                 Ok(()) | Err(BftError::InvalidMac | BftError::InvalidEncoding(_)) => {}
                 Err(e) => return Err(e),
             }
@@ -2799,5 +2892,352 @@ mod tests {
         // Seal key for (1, 2) must still be available for a valid proposal!
         let good_txs = vec![BinaryTx::new(0, 1, 100, 1, 1)];
         assert!(cluster.validators[3].leader_propose(good_txs, &online).is_ok());
+    }
+
+    #[test]
+    fn test_bft_locked_block_preserved_across_multiple_view_changes_and_rejects_conflicting_proposal()
+    {
+        let config = BftConfig::default(); // N=4, f=1, quorum=3
+        let mut cluster = BftCluster::new(config, initial_test_balances(), 128, 8, 8);
+        let online = cluster.online_ids();
+
+        // View 0, Height 1 (leader = 1): propose batch_locked, reach 2f+1 Prepares so all 4
+        // validators enter Commit and lock on batch_locked at locked_view = 0, then abort before Commit!
+        let batch_locked = vec![BinaryTx::new(0, 1, 12_345, 1, 1)];
+        let (block0, pp_frames, mut prep_frames) = cluster.validators[1]
+            .leader_propose(batch_locked.clone(), &online)
+            .unwrap();
+        for f in &pp_frames {
+            let fp = cluster.validators[f.to as usize]
+                .on_pre_prepare(f, block0.clone(), &online)
+                .unwrap();
+            prep_frames.extend(fp);
+        }
+        for f in &prep_frames {
+            cluster.validators[f.to as usize].on_prepare_frame(f).unwrap();
+        }
+        for &id in &online {
+            let _ = cluster.validators[id as usize].try_enter_commit(&online).unwrap();
+            assert_eq!(cluster.validators[id as usize].locked_view, Some(0));
+            assert_eq!(
+                cluster.validators[id as usize].locked_block_tag,
+                Some(block0.block_tag)
+            );
+            // Simulate network partition aborting Commit phase (clearing transient round state,
+            // while preserving locked_view, locked_block_tag, locked_txs).
+            cluster.validators[id as usize].abort_round();
+        }
+
+        // Byzantine validator tries to spoof a future locked_view >= target_view in ViewChange.
+        let spoof_vc = ConsensusVote {
+            kind: MsgKind::ViewChange,
+            voter_id: 2,
+            height: 1,
+            view: 1,
+            block_tag: [0xEEu8; 16],
+            prev_tag: GENESIS_TAG,
+            tx_count: 0,
+            locked_view: Some(1), // Invalid: locked_view == target_view!
+        };
+        let spoof_frame = cluster.validators[2].send_vote_frame(0, &spoof_vc).unwrap();
+        assert!(matches!(
+            cluster.validators[0].on_view_change_frame(&spoof_frame),
+            Err(BftError::InvalidEncoding(_))
+        ));
+
+        // Before view change, attempting to propose or accept another PrePrepare at the already-locked
+        // view 0 must be rejected with ConflictingPrePrepare!
+        let conflicting_same_view = vec![BinaryTx::new(0, 2, 99_999, 2, 2)];
+        assert!(matches!(
+            cluster.validators[1].leader_propose(conflicting_same_view.clone(), &online),
+            Err(BftError::ConflictingPrePrepare { height: 1, view: 0 })
+        ));
+
+        // Run a sequence of 3 consecutive ViewChanges (0 -> 1 -> 2 -> 3) and assert strict lock preservation!
+        for target_view in 1..=3u64 {
+            cluster.execute_view_change(target_view).unwrap();
+            for v in &cluster.validators {
+                assert_eq!(v.current_view, target_view);
+                assert_eq!(v.locked_view, Some(0));
+                assert_eq!(v.locked_block_tag, Some(block0.block_tag));
+            }
+        }
+
+        // Byzantine validator attempting to inject an equal-view conflicting lock (view 0, fake tag)
+        // during ViewChange 3 -> 4 must NOT overwrite honest validators' genuine lock from view 0!
+        let fake_equal_vc = ConsensusVote {
+            kind: MsgKind::ViewChange,
+            voter_id: 3,
+            height: 1,
+            view: 4,
+            block_tag: [0x99u8; 16],
+            prev_tag: GENESIS_TAG,
+            tx_count: 0,
+            locked_view: Some(0),
+        };
+        let fake_vc_frame = cluster.validators[3].send_vote_frame(0, &fake_equal_vc).unwrap();
+        cluster.validators[0].on_view_change_frame(&fake_vc_frame).unwrap();
+        // Complete view change to view 4 across all honest validators (V3 already voted via fake frame to V0,
+        // so use validators 0, 1, 2 to form a 3-of-4 quorum for view 4 on V0).
+        for &voter in &[0u32, 1, 2] {
+            let frames = cluster.validators[voter as usize]
+                .start_view_change(4, &[0, 1, 2])
+                .unwrap();
+            for f in &frames {
+                let _ = cluster.validators[f.to as usize].on_view_change_frame(f);
+            }
+        }
+        for &id in &[0u32, 1, 2] {
+            cluster.validators[id as usize].try_complete_view_change(4).unwrap();
+            assert_eq!(cluster.validators[id as usize].current_view, 4);
+            assert_eq!(cluster.validators[id as usize].locked_view, Some(0));
+            assert_eq!(
+                cluster.validators[id as usize].locked_block_tag,
+                Some(block0.block_tag),
+                "equal-view Byzantine lock claim must never overwrite honest validator's lock"
+            );
+        }
+
+        // Bring V3 offline for view 4 commit (quorum 3 of 4 commits the locked batch cleanly!).
+        cluster.set_online(3, false).unwrap();
+        let cert = cluster.propose_and_finalize_batch(batch_locked).unwrap();
+        assert_eq!(cert.height, 1);
+        assert_eq!(cert.view, 4);
+        cluster.sync_validator_from_quorum(3).unwrap();
+        for v in &cluster.validators {
+            assert_eq!(v.ledger.balance_of(0), 1_000_000 - 12_345);
+            assert_eq!(v.ledger.balance_of(1), 1_000_000 + 12_345);
+            assert_eq!(v.locked_view, None);
+            assert_eq!(v.locked_block_tag, None);
+        }
+    }
+
+    #[test]
+    fn test_adversarial_bft_byzantine_fuzz_64_rounds() {
+        // Deterministic xorshift64* PRNG (zero external crates).
+        let mut rng_state: u64 = 0x5652_4E4D_BFA0_2026;
+        let mut next_u64 = || -> u64 {
+            let mut x = rng_state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            rng_state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        let config = BftConfig::for_faults(2).unwrap(); // N=7, f=2, quorum=5
+        let initial = initial_test_balances();
+        let initial_total_supply: u64 = initial.values().sum();
+        let mut cluster = BftCluster::new(config, initial, 2_048, 128, 12);
+
+        let mut next_page_nonce = [1u64; 16];
+        let mut expected_height = 0u64;
+        let mut offline_set: BTreeSet<u32> = BTreeSet::new();
+        let mut equivocations_blocked = 0usize;
+        let mut forged_macs_rejected = 0usize;
+        let mut duplicate_votes_ignored = 0usize;
+        let mut view_changes_triggered = 0usize;
+        let mut catchup_syncs_completed = 0usize;
+
+        for round in 0..64u64 {
+            let action = next_u64() % 10;
+
+            // 1. Periodically take up to f=2 validators offline (including crashing the next leader!)
+            //    or bring offline validators back online via quorum catch-up sync.
+            if action == 0 && offline_set.len() < config.max_faults() {
+                let next_h = expected_height + 1;
+                let victim = config.leader_for(next_h, 0);
+                if offline_set.insert(victim) {
+                    cluster.set_online(victim, false).unwrap();
+                }
+            } else if action == 1 && !offline_set.is_empty() {
+                let rejoin_id = *offline_set.iter().next().unwrap();
+                let prev_h = cluster.validators[rejoin_id as usize].ledger.height;
+                let synced = cluster.sync_validator_from_quorum(rejoin_id).unwrap();
+                assert_eq!(
+                    prev_h + synced as u64,
+                    expected_height,
+                    "rejoining validator must catch up to exact tip height"
+                );
+                offline_set.remove(&rejoin_id);
+                catchup_syncs_completed += 1;
+            } else if action == 2 && offline_set.len() < config.max_faults() {
+                let victim = (next_u64() % config.num_validators as u64) as u32;
+                if offline_set.insert(victim) {
+                    cluster.set_online(victim, false).unwrap();
+                }
+            }
+
+            // 2. Inject Byzantine leader equivocation periodically (catching up any offline peers first
+            //    so the full 7-validator committee exercises the split-partition equivocation attack).
+            if round % 10 == 3 {
+                let to_sync: Vec<u32> = offline_set.iter().copied().collect();
+                for id in to_sync {
+                    cluster.sync_validator_from_quorum(id).unwrap();
+                    offline_set.remove(&id);
+                    catchup_syncs_completed += 1;
+                }
+                let pre_balances = cluster.validators[0].ledger.balances.clone();
+                let pre_tip = cluster.validators[0].ledger.tip_tag;
+                let cur_view = cluster.validators[0].current_view;
+                let leader = config.leader_for(expected_height + 1, cur_view);
+                let mut group_a = vec![leader];
+                let mut group_b = Vec::new();
+                for id in 0..config.num_validators as u32 {
+                    if id == leader {
+                        continue;
+                    }
+                    if group_a.len() < 3 {
+                        group_a.push(id);
+                    } else {
+                        group_b.push(id);
+                    }
+                }
+                let tx_a = vec![BinaryTx::new(0, 1, 500, next_page_nonce[0], next_page_nonce[0])];
+                let tx_b = vec![BinaryTx::new(0, 2, 500, next_page_nonce[0], next_page_nonce[0])];
+                let eq_res = cluster.simulate_byzantine_equivocation(tx_a, &group_a, tx_b, &group_b);
+                assert!(
+                    matches!(eq_res, Err(BftError::QuorumNotReached { .. })),
+                    "Byzantine equivocation at round {round} must never reach quorum"
+                );
+                for v in &cluster.validators {
+                    assert_eq!(v.ledger.height, expected_height);
+                    assert_eq!(v.ledger.tip_tag, pre_tip);
+                    assert_eq!(v.ledger.balances, pre_balances);
+                }
+                // Advance view strictly monotonically past the equivocating leader.
+                cluster.execute_view_change(cur_view + 1).unwrap();
+                equivocations_blocked += 1;
+                view_changes_triggered += 1;
+            }
+            let online_before = cluster.online_ids();
+            assert!(online_before.len() >= config.quorum());
+            let ref_id = online_before[0] as usize;
+
+            // 3. Inject forged Carter-Wegman MACs and duplicate votes directly against honest validators.
+            if action == 4 || action == 5 {
+                let sender = online_before[0];
+                let receiver = online_before[1];
+                let cur_view = cluster.validators[receiver as usize].current_view;
+                let tip = cluster.validators[receiver as usize].ledger.tip_tag;
+                let probe_vote = ConsensusVote {
+                    kind: MsgKind::Prepare,
+                    voter_id: sender,
+                    height: expected_height + 1,
+                    view: cur_view,
+                    block_tag: [0x5Au8; 16],
+                    prev_tag: tip,
+                    tx_count: 1,
+                    locked_view: None,
+                };
+                // Forged MAC: flip 1 bit in tag -> must reject with InvalidMac without mutating state.
+                let mut forged = cluster.validators[sender as usize]
+                    .send_vote_frame(receiver, &probe_vote)
+                    .unwrap();
+                forged.tag[(round as usize) % 16] ^= 0x80;
+                assert_eq!(
+                    cluster.validators[receiver as usize].on_prepare_frame(&forged),
+                    Err(BftError::InvalidMac)
+                );
+                forged_macs_rejected += 1;
+
+                // Duplicate valid Prepare votes from the SAME validator must never double-count!
+                let valid1 = cluster.validators[sender as usize]
+                    .send_vote_frame(receiver, &probe_vote)
+                    .unwrap();
+                let valid2 = cluster.validators[sender as usize]
+                    .send_vote_frame(receiver, &probe_vote)
+                    .unwrap();
+                cluster.validators[receiver as usize]
+                    .on_prepare_frame(&valid1)
+                    .unwrap();
+                cluster.validators[receiver as usize]
+                    .on_prepare_frame(&valid2)
+                    .unwrap();
+                assert_eq!(
+                    cluster.validators[receiver as usize]
+                        .round
+                        .prepare_votes
+                        .get(&[0x5Au8; 16])
+                        .map(BTreeSet::len),
+                    Some(1),
+                    "duplicate Prepare votes from same validator must never double-count"
+                );
+                cluster.validators[receiver as usize].abort_round();
+                duplicate_votes_ignored += 1;
+            }
+
+            // 4. Build a randomized valid batch of 1..=8 transfers from live balances.
+            let batch_len = ((next_u64() % 8) + 1) as usize;
+            let mut batch = Vec::with_capacity(batch_len);
+            let mut staged_bal = cluster.validators[ref_id].ledger.balances.clone();
+            for _ in 0..batch_len {
+                let s = (next_u64() % 16) as u32;
+                let mut r = (next_u64() % 16) as u32;
+                if r == s {
+                    r = (r + 1) % 16;
+                }
+                let avail = staged_bal.get(&s).copied().unwrap_or(0);
+                if avail == 0 {
+                    continue;
+                }
+                let amt = ((next_u64() % 250) + 1).min(avail);
+                let pn = next_page_nonce[s as usize];
+                next_page_nonce[s as usize] += 1;
+                *staged_bal.get_mut(&s).unwrap() -= amt;
+                *staged_bal.entry(r).or_insert(0) += amt;
+                batch.push(BinaryTx::new(s, r, amt, pn, pn));
+            }
+
+            let view_before = cluster.validators[ref_id].current_view;
+            let cert = cluster
+                .propose_and_finalize_batch(batch)
+                .expect("honest quorum must finalize batch even under leader crashes/attacks");
+
+            // Invariant (c): strictly monotonic height, valid view progression.
+            expected_height += 1;
+            assert_eq!(cert.height, expected_height);
+            assert!(cert.view >= view_before);
+            if cert.view > view_before {
+                view_changes_triggered += 1;
+            }
+            assert!(cert.commit_voters.len() >= config.quorum());
+
+            // Invariant (a) & (b): identical ledger state & exact coin conservation across ALL online honest validators!
+            let ref_ledger = cluster.validators[ref_id].ledger.clone();
+            assert_eq!(ref_ledger.height, expected_height);
+            assert!(ct_eq_16(&ref_ledger.tip_tag, &cert.block_tag));
+            let total_supply: u64 = ref_ledger.balances.values().sum();
+            assert_eq!(
+                total_supply, initial_total_supply,
+                "coin conservation violated at height {expected_height}"
+            );
+            for &id in &online_before {
+                assert_eq!(
+                    cluster.validators[id as usize].ledger, ref_ledger,
+                    "Safety violation: validator {id} diverged at height {expected_height}"
+                );
+            }
+        }
+
+        // Catch up any remaining offline validators and verify ALL 7 validators match bit-for-bit!
+        for id in offline_set {
+            cluster.sync_validator_from_quorum(id).unwrap();
+            catchup_syncs_completed += 1;
+        }
+        let final_ref = &cluster.validators[0].ledger;
+        assert_eq!(final_ref.height, 64);
+        assert_eq!(
+            final_ref.balances.values().sum::<u64>(),
+            initial_total_supply
+        );
+        for v in &cluster.validators[1..] {
+            assert_eq!(v.ledger, *final_ref);
+        }
+        assert!(equivocations_blocked > 0);
+        assert!(forged_macs_rejected > 0);
+        assert!(duplicate_votes_ignored > 0);
+        assert!(view_changes_triggered > 0);
+        assert!(catchup_syncs_completed > 0);
     }
 }

@@ -208,7 +208,9 @@ impl FeeSchedule {
                 1,
             ),
         };
-        let burn_share = ((total_fee as u128 * self.burn_bps as u128) / BPS_DENOMINATOR as u128) as u64;
+        let effective_burn_bps = self.burn_bps.min(BPS_DENOMINATOR);
+        let burn_share =
+            ((total_fee as u128 * effective_burn_bps as u128) / BPS_DENOMINATOR as u128) as u64;
         let validator_reward_share = total_fee - burn_share;
         FeeBreakdown {
             lane,
@@ -516,7 +518,12 @@ impl OneTimeAuditKey {
     }
 
     fn settlement_words(settlement: &EpochSettlement) -> Vec<u64> {
-        let mut words = Vec::with_capacity(11 + settlement.payouts.len() * 4);
+        let cap = settlement
+            .payouts
+            .len()
+            .saturating_mul(4)
+            .saturating_add(11);
+        let mut words = Vec::with_capacity(cap);
         // Domain tag = 1 for EpochSettlement.
         words.push(1);
         words.push(settlement.epoch);
@@ -672,9 +679,19 @@ impl TokenomicsEngine {
         if new_minted > MAX_SUPPLY {
             return Err(TokenomicsError::SupplyCapExceeded);
         }
+        let new_circ = self
+            .circulating_supply
+            .checked_add(amount)
+            .ok_or(TokenomicsError::InvariantViolation(
+                "circulating_supply overflow",
+            ))?;
+        let new_liquid = self
+            .liquid_supply
+            .checked_add(amount)
+            .ok_or(TokenomicsError::InvariantViolation("liquid_supply overflow"))?;
         self.total_minted = new_minted;
-        self.circulating_supply += amount;
-        self.liquid_supply += amount;
+        self.circulating_supply = new_circ;
+        self.liquid_supply = new_liquid;
         Ok(())
     }
 
@@ -699,8 +716,15 @@ impl TokenomicsEngine {
                 available: self.liquid_supply,
             });
         }
-        self.liquid_supply -= bond;
-        self.total_bonded += bond;
+        let new_bonded = self
+            .total_bonded
+            .checked_add(bond)
+            .ok_or(TokenomicsError::InvariantViolation("total_bonded overflow"))?;
+        self.liquid_supply = self
+            .liquid_supply
+            .checked_sub(bond)
+            .ok_or(TokenomicsError::InvariantViolation("liquid_supply underflow"))?;
+        self.total_bonded = new_bonded;
         let vault = ValidatorVault {
             validator_id,
             bond,
@@ -770,10 +794,20 @@ impl TokenomicsEngine {
                 available: self.liquid_supply,
             });
         }
-        self.liquid_supply -= top_up;
-        self.total_bonded += top_up;
+        let new_bonded = self
+            .total_bonded
+            .checked_add(top_up)
+            .ok_or(TokenomicsError::InvariantViolation("total_bonded overflow"))?;
+        let new_vault_bond = bond
+            .checked_add(top_up)
+            .ok_or(TokenomicsError::InvariantViolation("vault bond overflow"))?;
+        self.liquid_supply = self
+            .liquid_supply
+            .checked_sub(top_up)
+            .ok_or(TokenomicsError::InvariantViolation("liquid_supply underflow"))?;
+        self.total_bonded = new_bonded;
         let vault = self.vaults.get_mut(&validator_id).expect("checked above");
-        vault.bond += top_up;
+        vault.bond = new_vault_bond;
         vault.status = ValidatorStatus::Active;
         Ok(())
     }
@@ -783,14 +817,25 @@ impl TokenomicsEngine {
         &mut self,
         validator_id: ValidatorId,
     ) -> Result<u64, TokenomicsError> {
-        let vault = self
+        let amount = self
             .vaults
-            .get_mut(&validator_id)
-            .ok_or(TokenomicsError::ValidatorNotFound(validator_id))?;
-        let amount = vault.reward_balance;
+            .get(&validator_id)
+            .ok_or(TokenomicsError::ValidatorNotFound(validator_id))?
+            .reward_balance;
+        let new_total_rewards = self
+            .total_validator_rewards
+            .checked_sub(amount)
+            .ok_or(TokenomicsError::InvariantViolation(
+                "total_validator_rewards underflow",
+            ))?;
+        let new_liquid = self
+            .liquid_supply
+            .checked_add(amount)
+            .ok_or(TokenomicsError::InvariantViolation("liquid_supply overflow"))?;
+        let vault = self.vaults.get_mut(&validator_id).expect("checked above");
         vault.reward_balance = 0;
-        self.total_validator_rewards -= amount;
-        self.liquid_supply += amount;
+        self.total_validator_rewards = new_total_rewards;
+        self.liquid_supply = new_liquid;
         Ok(amount)
     }
 
@@ -807,10 +852,31 @@ impl TokenomicsEngine {
             });
         }
 
-        self.liquid_supply -= breakdown.total_fee;
-        self.pending_fee_rewards += breakdown.validator_reward_share;
-        self.total_burned += breakdown.burn_share;
-        self.circulating_supply -= breakdown.burn_share;
+        let new_liquid = self
+            .liquid_supply
+            .checked_sub(breakdown.total_fee)
+            .ok_or(TokenomicsError::InvariantViolation("liquid_supply underflow"))?;
+        let new_pending = self
+            .pending_fee_rewards
+            .checked_add(breakdown.validator_reward_share)
+            .ok_or(TokenomicsError::InvariantViolation(
+                "pending_fee_rewards overflow",
+            ))?;
+        let new_burned = self
+            .total_burned
+            .checked_add(breakdown.burn_share)
+            .ok_or(TokenomicsError::InvariantViolation("total_burned overflow"))?;
+        let new_circ = self
+            .circulating_supply
+            .checked_sub(breakdown.burn_share)
+            .ok_or(TokenomicsError::InvariantViolation(
+                "circulating_supply underflow",
+            ))?;
+
+        self.liquid_supply = new_liquid;
+        self.pending_fee_rewards = new_pending;
+        self.total_burned = new_burned;
+        self.circulating_supply = new_circ;
 
         self.fees_burned_in_current_epoch = self
             .fees_burned_in_current_epoch
@@ -868,7 +934,26 @@ impl TokenomicsEngine {
         let slash_amount =
             ((vault.bond as u128 * offense.slash_bps() as u128) / BPS_DENOMINATOR as u128) as u64;
 
-        vault.bond -= slash_amount;
+        let remaining_bond = vault
+            .bond
+            .checked_sub(slash_amount)
+            .ok_or(TokenomicsError::InvariantViolation("vault bond underflow"))?;
+        let new_total_bonded = self
+            .total_bonded
+            .checked_sub(slash_amount)
+            .ok_or(TokenomicsError::InvariantViolation("total_bonded underflow"))?;
+        let new_circ = self
+            .circulating_supply
+            .checked_sub(slash_amount)
+            .ok_or(TokenomicsError::InvariantViolation(
+                "circulating_supply underflow",
+            ))?;
+        let new_total_burned = self
+            .total_burned
+            .checked_add(slash_amount)
+            .ok_or(TokenomicsError::InvariantViolation("total_burned overflow"))?;
+
+        vault.bond = remaining_bond;
         vault.slashing_events = vault.slashing_events.saturating_add(1);
         vault.total_slashed = vault.total_slashed.saturating_add(slash_amount);
         vault.forfeited_current_epoch = true;
@@ -879,13 +964,12 @@ impl TokenomicsEngine {
             SlashingOffense::ExtendedDowntime => ValidatorStatus::Offline,
         };
 
-        let remaining_bond = vault.bond;
         let new_status = vault.status;
 
-        self.total_bonded -= slash_amount;
-        self.total_burned = self.total_burned.saturating_add(slash_amount);
+        self.total_bonded = new_total_bonded;
+        self.total_burned = new_total_burned;
         self.total_slashed_burned = self.total_slashed_burned.saturating_add(slash_amount);
-        self.circulating_supply -= slash_amount;
+        self.circulating_supply = new_circ;
 
         Ok(SlashingReceipt {
             validator_id,
@@ -941,19 +1025,27 @@ impl TokenomicsEngine {
             let remaining_cap = MAX_SUPPLY.saturating_sub(self.total_minted);
             subsidy_minted = scheduled.min(remaining_cap);
 
-            self.total_minted += subsidy_minted;
-            self.circulating_supply += subsidy_minted;
+            self.total_minted = self
+                .total_minted
+                .checked_add(subsidy_minted)
+                .expect("clamped to MAX_SUPPLY");
+            self.circulating_supply = self
+                .circulating_supply
+                .checked_add(subsidy_minted)
+                .expect("bounded by MAX_SUPPLY");
 
             let available_fees = self.pending_fee_rewards;
-            let total_pool = subsidy_minted + available_fees;
+            let total_pool_u128 = (subsidy_minted as u128) + (available_fees as u128);
+            let total_pool = u64::try_from(total_pool_u128).expect("bounded by MAX_SUPPLY");
 
             let count = eligible.len() as u128;
             let total_entropy_score: u128 = eligible.iter().map(|&(_, s)| s as u128).sum();
 
+            let effective_equal_bps = policy.equal_participation_bps.min(BPS_DENOMINATOR);
             let (equal_pool, entropy_pool) = if total_entropy_score == 0 {
                 (total_pool, 0u64)
             } else {
-                let eq = ((total_pool as u128 * policy.equal_participation_bps as u128)
+                let eq = ((total_pool as u128 * effective_equal_bps as u128)
                     / BPS_DENOMINATOR as u128) as u64;
                 (eq, total_pool - eq)
             };
@@ -966,12 +1058,22 @@ impl TokenomicsEngine {
                 } else {
                     ((entropy_pool as u128 * score as u128) / total_entropy_score) as u64
                 };
-                let total_reward = equal_each + entropy_share;
-                total_distributed += total_reward;
+                let total_reward = equal_each
+                    .checked_add(entropy_share)
+                    .expect("bounded by total_pool");
+                total_distributed = total_distributed
+                    .checked_add(total_reward)
+                    .expect("bounded by total_pool");
 
                 let vault = self.vaults.get_mut(&id).expect("eligible validator exists");
-                vault.reward_balance += total_reward;
-                self.total_validator_rewards += total_reward;
+                vault.reward_balance = vault
+                    .reward_balance
+                    .checked_add(total_reward)
+                    .expect("bounded by MAX_SUPPLY");
+                self.total_validator_rewards = self
+                    .total_validator_rewards
+                    .checked_add(total_reward)
+                    .expect("bounded by MAX_SUPPLY");
 
                 payouts.push(ValidatorPayout {
                     validator_id: id,
@@ -981,19 +1083,21 @@ impl TokenomicsEngine {
                 });
             }
 
-            let dust = total_pool - total_distributed;
+            let dust = total_pool
+                .checked_sub(total_distributed)
+                .expect("total_distributed <= total_pool");
             // Subsidy is paid first, then fee rewards; any integer-division dust stays in pending_fee_rewards.
             fee_rewards_distributed = total_distributed.saturating_sub(subsidy_minted);
             self.pending_fee_rewards = dust;
         }
 
-        // Reset epoch state and advance epoch counter.
+        // Reset epoch state and advance epoch counter without overflowing at u64::MAX.
         self.epoch_contributions.clear();
         self.fees_burned_in_current_epoch = 0;
         for vault in self.vaults.values_mut() {
             vault.forfeited_current_epoch = false;
         }
-        self.current_epoch += 1;
+        self.current_epoch = self.current_epoch.saturating_add(1);
 
         EpochSettlement {
             epoch,
@@ -1009,33 +1113,53 @@ impl TokenomicsEngine {
         }
     }
 
-    /// Verify all supply and accounting invariants to the exact `vern`.
+    /// Verify all supply and accounting invariants to the exact `vern` (panic-free via u128).
     pub fn check_invariants(&self) -> Result<(), TokenomicsError> {
         if self.total_minted > MAX_SUPPLY {
             return Err(TokenomicsError::InvariantViolation("total_minted > MAX_SUPPLY"));
         }
-        if self.circulating_supply + self.total_burned != self.total_minted {
+        if (self.circulating_supply as u128) + (self.total_burned as u128)
+            != (self.total_minted as u128)
+        {
             return Err(TokenomicsError::InvariantViolation(
                 "circulating_supply + total_burned != total_minted",
             ));
         }
-        let sum_vault_bonds: u64 = self.vaults.values().map(|v| v.bond).sum();
-        if sum_vault_bonds != self.total_bonded {
+        if (self.total_fees_burned as u128) + (self.total_slashed_burned as u128)
+            != (self.total_burned as u128)
+        {
+            return Err(TokenomicsError::InvariantViolation(
+                "total_fees_burned + total_slashed_burned != total_burned",
+            ));
+        }
+        if (self.total_fees_burned as u128) + (self.total_fees_rewarded as u128)
+            != (self.total_fees_collected as u128)
+        {
+            return Err(TokenomicsError::InvariantViolation(
+                "total_fees_burned + total_fees_rewarded != total_fees_collected",
+            ));
+        }
+        let sum_vault_bonds: u128 = self.vaults.values().map(|v| v.bond as u128).sum();
+        if sum_vault_bonds != (self.total_bonded as u128) {
             return Err(TokenomicsError::InvariantViolation(
                 "sum(vault.bond) != total_bonded",
             ));
         }
-        let sum_vault_rewards: u64 = self.vaults.values().map(|v| v.reward_balance).sum();
-        if sum_vault_rewards != self.total_validator_rewards {
+        let sum_vault_rewards: u128 = self
+            .vaults
+            .values()
+            .map(|v| v.reward_balance as u128)
+            .sum();
+        if sum_vault_rewards != (self.total_validator_rewards as u128) {
             return Err(TokenomicsError::InvariantViolation(
                 "sum(vault.reward_balance) != total_validator_rewards",
             ));
         }
-        let sub_ledger_total = self.liquid_supply
-            + self.total_bonded
-            + self.pending_fee_rewards
-            + self.total_validator_rewards;
-        if sub_ledger_total != self.circulating_supply {
+        let sub_ledger_total: u128 = (self.liquid_supply as u128)
+            + (self.total_bonded as u128)
+            + (self.pending_fee_rewards as u128)
+            + (self.total_validator_rewards as u128);
+        if sub_ledger_total != (self.circulating_supply as u128) {
             return Err(TokenomicsError::InvariantViolation(
                 "sub-ledger sum != circulating_supply",
             ));
@@ -1107,7 +1231,9 @@ impl TokenomicsEngine {
 
     /// Total consensus voting power across all active bonded validators (1 per seat).
     pub fn total_voting_power(&self) -> u64 {
-        self.vaults.values().map(ValidatorVault::voting_power).sum()
+        self.vaults
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(v.voting_power()))
     }
 }
 
@@ -1458,5 +1584,167 @@ mod tests {
         let mut bad_receipt = receipt.clone();
         bad_receipt.epoch_rewards_forfeited = false;
         assert!(!vkey2_forfeit.verify_slashing(&bad_receipt, &slash_tag));
+    }
+
+    #[test]
+    fn test_adversarial_tokenomics_extreme_epochs_and_fuzz_invariants() {
+        // 1. Defensive clamping on unvalidated FeeSchedule (no underflow panic).
+        let extreme_sched = FeeSchedule {
+            express_fee: 10_000,
+            shielded_fee: 250_000,
+            burn_bps: u16::MAX,
+            shielded_beaver_triples: 16,
+        };
+        let bd = extreme_sched.breakdown(FeeLane::Express);
+        assert_eq!(bd.burn_share + bd.validator_reward_share, bd.total_fee);
+        assert_eq!(bd.burn_share, bd.total_fee);
+
+        // 2. Deterministic adversarial fuzz over epochs 0..1000 + extreme boundary epochs.
+        let mut rng_state: u64 = 0x5652_4E4D_70C0_2026;
+        let mut next_u64 = || -> u64 {
+            let mut x = rng_state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            rng_state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.mint_genesis_supply(500_000 * VERN_PER_VRNM).unwrap();
+        for id in 1..=7u64 {
+            engine.register_validator(id, DEFAULT_REQUIRED_BOND).unwrap();
+        }
+        engine.check_invariants().unwrap();
+
+        // Fuzz epochs 0..1000 with random fees, contributions, slashing, top-ups, and withdrawals.
+        for _ in 0..1_000u64 {
+            // Collect 0..5 random Express & Shielded fees.
+            let num_fees = next_u64() % 6;
+            for _ in 0..num_fees {
+                let lane = if next_u64() % 2 == 0 {
+                    FeeLane::Express
+                } else {
+                    FeeLane::Shielded
+                };
+                let _ = engine.collect_fee(lane);
+                engine.check_invariants().unwrap();
+            }
+
+            // Record random contributions across validators 1..=7.
+            for id in 1..=7u64 {
+                if next_u64() % 4 != 0 {
+                    engine
+                        .record_contribution(
+                            id,
+                            EpochContribution {
+                                pad_pages_supplied: next_u64() % 2_000,
+                                beaver_triples_contributed: next_u64() % 2_000,
+                                blocks_finalized: (next_u64() % 3),
+                                pss_refreshes_completed: (next_u64() % 2),
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+
+            // Occasionally slash, reactivate, or test double-withdrawal.
+            let event = next_u64() % 12;
+            let vid = (next_u64() % 7) + 1;
+            if event == 0 {
+                let offense = match next_u64() % 2 {
+                    0 => SlashingOffense::ExtendedDowntime,
+                    _ => SlashingOffense::InconsistentMpcShare,
+                };
+                let _ = engine.slash_validator(vid, offense);
+            } else if event == 1 {
+                if let Some(v) = engine.vault(vid)
+                    && v.status != ValidatorStatus::Ejected
+                {
+                    let needed = v.required_bond.saturating_sub(v.bond);
+                    let _ = engine.top_up_bond_and_reactivate(vid, needed);
+                }
+            } else if event == 2 {
+                let withdrawn = engine.withdraw_validator_rewards(vid).unwrap();
+                // Immediate second withdrawal must yield 0 (no double-payout!).
+                let second = engine.withdraw_validator_rewards(vid).unwrap();
+                assert_eq!(second, 0, "double withdrawal must never pay out twice");
+                let _ = withdrawn;
+            }
+
+            let settlement = engine.settle_epoch();
+            assert!(settlement.total_minted <= MAX_SUPPLY);
+            assert!(settlement.circulating_supply <= MAX_SUPPLY);
+            assert!(engine.total_minted() <= MAX_SUPPLY);
+            engine.check_invariants().unwrap();
+        }
+
+        // 3. Test extreme epoch numbers: halving boundaries, 100+ halvings, u64::MAX / 2, and u64::MAX!
+        let extreme_epochs = [
+            EPOCHS_PER_HALVING - 1,
+            EPOCHS_PER_HALVING,
+            EPOCHS_PER_HALVING + 1,
+            33 * EPOCHS_PER_HALVING,
+            100 * EPOCHS_PER_HALVING,
+            u64::MAX / 2,
+            u64::MAX - 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for &ep in &extreme_epochs {
+            engine.current_epoch = ep;
+            for id in 1..=7u64 {
+                let _ = engine.record_contribution(
+                    id,
+                    EpochContribution {
+                        pad_pages_supplied: 100,
+                        beaver_triples_contributed: 100,
+                        blocks_finalized: 5,
+                        pss_refreshes_completed: 1,
+                    },
+                );
+            }
+            let _ = engine.collect_fee(FeeLane::Shielded);
+            let s = engine.settle_epoch();
+            if ep >= 33 * EPOCHS_PER_HALVING {
+                assert_eq!(s.subsidy_minted, 0, "post-halving epoch {ep} must mint 0");
+            }
+            assert!(engine.total_minted() <= MAX_SUPPLY);
+            engine.check_invariants().unwrap();
+        }
+        // Repeated settle_epoch at u64::MAX must never panic or overflow!
+        assert_eq!(engine.current_epoch(), u64::MAX);
+        let s_max = engine.settle_epoch();
+        assert_eq!(s_max.subsidy_minted, 0);
+        assert_eq!(engine.current_epoch(), u64::MAX);
+        engine.check_invariants().unwrap();
+
+        // 4. Slash & permanently eject ALL validators -> zero active validators edge case!
+        for id in 1..=7u64 {
+            let receipt = engine
+                .slash_validator(id, SlashingOffense::Equivocation)
+                .unwrap();
+            assert_eq!(receipt.remaining_bond, 0);
+            assert_eq!(receipt.new_status, ValidatorStatus::Ejected);
+            // Re-slashing an already-ejected validator must fail cleanly with AlreadyEjected.
+            assert_eq!(
+                engine.slash_validator(id, SlashingOffense::Equivocation),
+                Err(TokenomicsError::AlreadyEjected(id))
+            );
+            engine.check_invariants().unwrap();
+        }
+        assert_eq!(engine.total_voting_power(), 0);
+        assert_eq!(engine.total_bonded(), 0);
+
+        // Settle with zero active validators (reset epoch to 0 to prove subsidy is NOT minted when 0 eligible).
+        engine.current_epoch = 0;
+        let _ = engine.collect_fee(FeeLane::Express);
+        let pending_before = engine.pending_fee_rewards();
+        let zero_val_settlement = engine.settle_epoch();
+        assert_eq!(zero_val_settlement.subsidy_minted, 0);
+        assert_eq!(zero_val_settlement.total_distributed, 0);
+        assert!(zero_val_settlement.payouts.is_empty());
+        assert_eq!(engine.pending_fee_rewards(), pending_before);
+        engine.check_invariants().unwrap();
     }
 }

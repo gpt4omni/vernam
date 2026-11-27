@@ -19,8 +19,8 @@ use vernam_rs::field::random_field_elem;
 use vernam_rs::otp::{FRAME_BYTES, PadPage, WalPadBook, open_frame, seal_frame};
 use vernam_rs::p2p_node::{P2pNode, P2pNodeConfig, discover_network_peers};
 use vernam_rs::pop_mining::{
-    BilateralPopSubmission, PeerReceiptKey, PopAuditor, PopEpochCoordinator, PopMiner,
-    PopReplayRegistry,
+    BeaconPairingSchedule, BilateralPopSubmission, DEFAULT_CHALLENGE_SLOT_COUNT, PeerReceiptKey,
+    PopAuditor, PopEpochCoordinator, PopMiner, PopReplayRegistry,
 };
 use vernam_rs::privacy_mpc::{BeaverPool, ConfidentialTransferRequest, ShardedPrivateLedger};
 use vernam_rs::qkd::{
@@ -224,24 +224,78 @@ fn cmd_node(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_pop_mine() -> Result<(), String> {
-    println!("=== Vernam (VRNM) Bilateral Proof-of-Pad (PoP) Entropy Mining Audit ===");
+    println!("=== Vernam (VRNM) Beacon-Paired Bilateral Proof-of-Pad (PoP) Audit ===");
     let mut tok = TokenomicsEngine::with_defaults();
     tok.mint_genesis_supply(10_000 * VERN_PER_VRNM)
         .map_err(|e| format!("{e}"))?;
-    for vid in 0..4u64 {
+    let active_validators = [0u64, 1, 2, 3];
+    for &vid in &active_validators {
         tok.register_genesis_validator(vid)
             .map_err(|e| format!("{e}"))?;
     }
     let mut replay = PopReplayRegistry::default();
     let epoch = tok.current_epoch();
+
+    // Run a live 4-validator unbiasable threshold entropy beacon round for this epoch.
+    let cfg = BeaconConfig::bft(4).map_err(|e| format!("{e}"))?;
+    let mut nodes: Vec<VernamBeacon> = (0..4u32)
+        .map(|id| VernamBeacon::new(cfg, epoch, id).map_err(|e| format!("{e}")))
+        .collect::<Result<_, _>>()?;
+    let pad_len = cfg.share_payload_bytes();
+    for dealer in 0..4usize {
+        let mut pairs: Vec<(u32, OtpChannelKey, OtpChannelKey)> = (0..4u32)
+            .map(|recip| {
+                let (s_k, r_k) = OtpChannelKey::generate_pair(pad_len);
+                (recip, s_k, r_k)
+            })
+            .collect();
+        let key_refs: Vec<(u32, &OtpChannelKey)> =
+            pairs.iter().map(|(r, sk, _)| (*r, sk)).collect();
+        let envs = nodes[dealer]
+            .generate_commit_envelopes(&key_refs)
+            .map_err(|e| format!("{e}"))?;
+        for env in envs {
+            let r = env.recipient_id as usize;
+            nodes[r]
+                .receive_commit_envelope(&env, &pairs[r].2)
+                .map_err(|e| format!("{e}"))?;
+        }
+        pairs.clear();
+    }
+    for node in &mut nodes {
+        node.lock_commit_phase().map_err(|e| format!("{e}"))?;
+    }
+    let mut reveals = Vec::with_capacity(4);
+    for node in &mut nodes {
+        reveals.push(node.generate_reveal().map_err(|e| format!("{e}"))?);
+    }
+    for r in &reveals {
+        for node in &mut nodes {
+            node.receive_reveal(r).map_err(|e| format!("{e}"))?;
+        }
+    }
+    let beacon_out = nodes[0].finalize_epoch().map_err(|e| format!("{e}"))?;
+    let beacon_gamma = beacon_out.gamma;
+    let schedule = BeaconPairingSchedule::derive(epoch, &active_validators, beacon_gamma)
+        .map_err(|e| format!("{e}"))?;
+    println!("  Threshold Beacon Gamma_{epoch}: 0x{beacon_gamma:032x}");
+
     let mut submissions = Vec::with_capacity(4);
-    for vid in 0..4u64 {
-        let counterparty = (vid + 1) % 4;
+    for &vid in &active_validators {
+        let counterparty = schedule
+            .expected_counterparty(vid)
+            .ok_or_else(|| format!("missing beacon counterparty for V{vid}"))?;
         let peer_key = PeerReceiptKey::generate();
         let (mut batch, commit, peer_receipt) =
             PopMiner::mine_bilateral_pad_batch(vid, counterparty, epoch, 8, 8, &peer_key)
                 .map_err(|e| format!("{e}"))?;
-        let challenge = PopAuditor::issue_challenge(vid, epoch);
+        let challenge = PopAuditor::issue_beacon_challenge(
+            vid,
+            epoch,
+            beacon_gamma,
+            DEFAULT_CHALLENGE_SLOT_COUNT,
+        )
+        .map_err(|e| format!("{e}"))?;
         let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(1, 1);
         submissions.push(BilateralPopSubmission {
             commitment: commit,
@@ -251,10 +305,17 @@ fn cmd_pop_mine() -> Result<(), String> {
             peer_key: Some(peer_key),
         });
     }
-    let report = PopEpochCoordinator::run_bilateral_audited_epoch(&mut tok, &mut replay, &submissions);
+    let report = PopEpochCoordinator::run_beacon_bilateral_audited_epoch(
+        beacon_gamma,
+        &active_validators,
+        &mut tok,
+        &mut replay,
+        &submissions,
+    )
+    .map_err(|e| format!("{e}"))?;
     for rcpt in &report.accepted {
         println!(
-            "  Validator V{} <-> Peer V{}: PASS | monobit_z={:.3} runs_z={:.3} QBER={:.2}% beaver_triple=OK peer_receipt=OK anti_replay=OK",
+            "  Validator V{} <-> Beacon Peer V{}: PASS | monobit_z={:.3} runs_z={:.3} QBER={:.2}% beaver=OK peer_receipt=OK beacon_pair=OK anti_replay=OK",
             rcpt.validator_id,
             rcpt.counterparty_id.unwrap_or(0),
             rcpt.entropy_stats.monobit_z_score,

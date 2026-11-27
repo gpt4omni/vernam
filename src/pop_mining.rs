@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
+use crate::entropy_beacon::EpochBeaconOutput;
 use crate::field::{
     PRIME_P, add_mod, ct_eq_16, fill_os_random, mul_mod, random_field_elem, reduce, zeroize_slice,
     zeroize_u128,
@@ -119,6 +120,13 @@ pub enum PopError {
     MissingPeerReceipt(&'static str),
     /// Provider attempted to self-co-sign its own pad batch (`counterparty_id == provider_id`).
     SelfCoSignForbidden(ValidatorId),
+    /// Provider submitted a bilateral receipt co-signed by a counterparty other than the
+    /// mandatory beacon-assigned peer (defeats 2-node Sybil collusion rings).
+    UnauthorizedCounterparty {
+        provider_id: ValidatorId,
+        expected_counterparty: ValidatorId,
+        actual_counterparty: ValidatorId,
+    },
     /// Counterparty peer's Carter-Wegman delivery receipt MAC failed verification or did not match
     /// the provider's committed pad batch.
     InvalidPeerReceiptMac {
@@ -160,6 +168,7 @@ impl PopError {
             | Self::ChallengeMismatch(_)
             | Self::MissingPeerReceipt(_)
             | Self::SelfCoSignForbidden(_)
+            | Self::UnauthorizedCounterparty { .. }
             | Self::InvalidPeerReceiptMac { .. }
             | Self::CrossEpochPadReplay { .. } => Some(SlashingOffense::InconsistentMpcShare),
             Self::QkdQberExceeded { .. }
@@ -226,6 +235,14 @@ impl fmt::Display for PopError {
                     "validator {vid} attempted to self-co-sign its own pad delivery receipt"
                 )
             }
+            Self::UnauthorizedCounterparty {
+                provider_id,
+                expected_counterparty,
+                actual_counterparty,
+            } => write!(
+                f,
+                "unauthorized counterparty for provider {provider_id}: beacon assigned counterparty {expected_counterparty}, but receipt was co-signed by {actual_counterparty}"
+            ),
             Self::InvalidPeerReceiptMac {
                 provider_id,
                 counterparty_id,
@@ -1072,6 +1089,275 @@ impl Drop for PopReplayRegistry {
 }
 
 // ============================================================================
+// Step 2c: Unbiasable Beacon Counterparty Derangement & Anti-Collusion Schedule
+// ============================================================================
+
+// Distinct non-zero domain separation constants (< PRIME_P) over F_(2^127 - 1).
+const POP_DOMAIN_DERANGEMENT: u128 = 0x504F_505F_4445_5241_4E47_454D_0001;
+const POP_DOMAIN_CHALLENGE_R: u128 = 0x504F_505F_4348_414C_5F52_0000_0002;
+const POP_DOMAIN_PAD_SLOTS: u128 = 0x504F_505F_5041_445F_534C_4F54_0003;
+const POP_DOMAIN_BEAVER_SLOT: u128 = 0x504F_505F_4245_4156_4552_0000_0004;
+
+// Distinct non-zero field mixing constants (< PRIME_P) for bijective polynomial permutation.
+const POP_MIX_K1: u128 = 0x61C8_8646_80B5_83EB_4F2D_7A91_35E7_2B19;
+const POP_MIX_K2: u128 = 0x39E3_779B_97F4_A7C1_5D83_2E17_9C4B_6A2F;
+const POP_MIX_K3: u128 = 0x4B72_D19E_63A5_8F1C_27E9_5A3B_18D4_7F63;
+const POP_MIX_K4: u128 = 0x2D5F_91A7_4E83_C6B9_71A5_3F28_E4C1_59D7;
+const POP_MIX_K5: u128 = 0x5E93_1B47_8A2D_6C51_94F7_2B83_6D19_4A75;
+const POP_MIX_K6: u128 = 0x1A6B_4E89_D273_5F1C_83B7_6E29_4D51_3C97;
+const POP_MIX_K7: u128 = 0x73D1_8C45_2E9B_7A63_51F4_9E27_8B61_3D49;
+const POP_MIX_K8: u128 = 0x48F2_6A1D_9C37_5E8B_2F41_7D93_6B5E_19A3;
+const POP_MIX_K9: u128 = 0x27B9_5D31_8E4F_6A72_3C95_1F84_7E2D_4B69;
+
+/// Bijective power map `x -> x^5 mod (2^127 - 1)`.
+///
+/// Since `gcd(5, 2^127 - 2) = 1`, `x -> x^5` is an exact permutation on `F_(2^127 - 1)`
+/// requiring only 3 field multiplications and zero computational hash functions.
+#[inline(always)]
+fn pop_pow5_mod(x: u128) -> u128 {
+    let x = reduce(x);
+    let x2 = mul_mod(x, x);
+    let x4 = mul_mod(x2, x2);
+    mul_mod(x4, x)
+}
+
+/// Purely information-theoretic bijective mixing step over `F_(2^127 - 1)`.
+///
+/// For any fixed `(domain, subject, counter)`, the map `beacon_gamma -> output` is a
+/// composition of invertible affine transforms and the bijection `x -> x^5`, hence an
+/// exact bijection on `F_p` with zero statistical bias when `beacon_gamma` is uniform.
+#[inline]
+fn beacon_mix_field_elem(beacon_gamma: u128, domain: u128, subject: u64, counter: u64) -> u128 {
+    let s0 = pop_pow5_mod(add_mod(reduce(beacon_gamma), POP_MIX_K1));
+    let s1 = pop_pow5_mod(add_mod(
+        mul_mod(s0, POP_MIX_K2),
+        add_mod(reduce(domain), POP_MIX_K3),
+    ));
+    let s2 = pop_pow5_mod(add_mod(
+        mul_mod(s1, POP_MIX_K4),
+        add_mod(reduce(subject as u128), POP_MIX_K5),
+    ));
+    let s3 = pop_pow5_mod(add_mod(
+        mul_mod(s2, POP_MIX_K6),
+        add_mod(reduce(counter as u128), POP_MIX_K7),
+    ));
+    pop_pow5_mod(add_mod(mul_mod(s3, POP_MIX_K8), POP_MIX_K9))
+}
+
+/// Unbiased uniform index in `[0, bound)` derived from `beacon_gamma` over `F_(2^127 - 1)`
+/// via rejection sampling (eliminates modulo bias completely).
+#[inline]
+fn beacon_uniform_index(beacon_gamma: u128, domain: u128, subject: u64, bound: usize) -> usize {
+    debug_assert!(bound > 0);
+    if bound <= 1 {
+        return 0;
+    }
+    let b = bound as u128;
+    let limit = PRIME_P - (PRIME_P % b);
+    let mut counter = 0u64;
+    loop {
+        let v = beacon_mix_field_elem(beacon_gamma, domain, subject, counter);
+        if v < limit {
+            return (v % b) as usize;
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+/// Validate that a beacon scalar is strictly canonical and non-zero (`0 < beacon_gamma < PRIME_P`).
+#[inline]
+fn validate_beacon_gamma(beacon_gamma: u128) -> Result<(), PopError> {
+    if beacon_gamma == 0 || beacon_gamma >= PRIME_P {
+        return Err(PopError::InvalidParameter(
+            "beacon_gamma must satisfy 0 < beacon_gamma < PRIME_P",
+        ));
+    }
+    Ok(())
+}
+
+/// Derive a deterministic non-zero `challenge_r` in `[1, PRIME_P)` from `(beacon_gamma, validator_id, epoch)`.
+fn beacon_derive_challenge_r(beacon_gamma: u128, validator_id: ValidatorId, epoch: u64) -> u128 {
+    let domain = add_mod(POP_DOMAIN_CHALLENGE_R, reduce(epoch as u128));
+    let mut counter = 0u64;
+    loop {
+        let v = beacon_mix_field_elem(beacon_gamma, domain, validator_id, counter);
+        if v != 0 {
+            return v;
+        }
+        counter = counter.wrapping_add(1);
+    }
+}
+
+/// Derive `slot_count` deterministic pad slot selectors from `(beacon_gamma, validator_id, epoch)`.
+fn beacon_derive_pad_slots(
+    beacon_gamma: u128,
+    validator_id: ValidatorId,
+    epoch: u64,
+    slot_count: usize,
+) -> Vec<usize> {
+    let mut slots = Vec::with_capacity(slot_count);
+    let epoch_term = mul_mod(reduce(epoch as u128), POP_MIX_K3);
+    for step in 0..slot_count {
+        let step_domain = add_mod(
+            POP_DOMAIN_PAD_SLOTS,
+            add_mod(epoch_term, reduce((step as u128) + 1)),
+        );
+        let v = beacon_mix_field_elem(beacon_gamma, step_domain, validator_id, step as u64);
+        slots.push(v as usize);
+    }
+    slots
+}
+
+/// Derive a deterministic Beaver triple slot selector from `(beacon_gamma, validator_id, epoch)`.
+fn beacon_derive_beaver_slot(beacon_gamma: u128, validator_id: ValidatorId, epoch: u64) -> usize {
+    let domain = add_mod(POP_DOMAIN_BEAVER_SLOT, reduce(epoch as u128));
+    beacon_mix_field_elem(beacon_gamma, domain, validator_id, 0) as usize
+}
+
+/// Deterministically derive a **fixed-point-free bijective counterparty derangement**
+/// (`pairing[v] != v` for every validator `v`) from an unbiasable epoch beacon scalar
+/// `beacon_gamma` in `F_(2^127 - 1)` using Sattolo's algorithm driven by bijective Mersenne
+/// field mixing (zero external crates, zero computational hashes).
+///
+/// Security properties:
+/// - **Zero fixed points (`pairing[v] != v`):** No validator can ever be paired with itself.
+/// - **Bijective:** Every active validator appears exactly once as provider and once as counterparty.
+/// - **Single `N`-cycle (zero 2-cycles for `N >= 3`):** Defeats reciprocal 2-node Sybil collusion
+///   rings (`V_A <-> V_B`) because `pairing[pairing[v]] != v` for every committee of size `N >= 3`.
+/// - **Committee-order independent:** Sorts and deduplicates `validators` canonically before
+///   deriving the schedule.
+/// - **Rejects invalid inputs:** Requires `>= 2` distinct validators and canonical
+///   `0 < beacon_gamma < PRIME_P`.
+pub fn derive_counterparty_derangement(
+    validators: &[ValidatorId],
+    beacon_gamma: u128,
+) -> Result<BTreeMap<ValidatorId, ValidatorId>, PopError> {
+    validate_beacon_gamma(beacon_gamma)?;
+
+    let unique: BTreeSet<ValidatorId> = validators.iter().copied().collect();
+    if unique.len() < 2 {
+        return Err(PopError::InvalidParameter(
+            "at least 2 distinct validators are required for counterparty derangement",
+        ));
+    }
+
+    let sorted: Vec<ValidatorId> = unique.into_iter().collect();
+    let n = sorted.len();
+
+    // Bind exact sorted committee membership via Carter-Wegman fold in F_(2^127 - 1).
+    let mut set_digest = mul_mod(reduce(n as u128), POP_MIX_K1);
+    for &vid in &sorted {
+        set_digest = mul_mod(add_mod(set_digest, reduce(vid as u128)), POP_MIX_K2);
+    }
+    let derangement_domain = add_mod(POP_DOMAIN_DERANGEMENT, set_digest);
+
+    // Sattolo's algorithm: swap index `i` with uniform `j in 0..i` (strictly `< i`).
+    // Mathematically guaranteed to yield a uniformly random single N-cycle (fixed-point-free
+    // derangement with zero 2-cycles for all N >= 3).
+    let mut permuted = sorted.clone();
+    for i in (1..n).rev() {
+        let j = beacon_uniform_index(beacon_gamma, derangement_domain, i as u64, i);
+        permuted.swap(i, j);
+    }
+
+    let mut schedule = BTreeMap::new();
+    for (&provider, &counterparty) in sorted.iter().zip(permuted.iter()) {
+        debug_assert_ne!(provider, counterparty, "Sattolo derangement must have no fixed points");
+        schedule.insert(provider, counterparty);
+    }
+    Ok(schedule)
+}
+
+/// Mandatory epoch counterparty pairing schedule derived deterministically from the unbiasable
+/// distributed entropy beacon `Gamma_e` over `F_(2^127 - 1)`.
+///
+/// Prevents 2-node Sybil collusion rings from self-selecting each other as QKD counterparties:
+/// every validator MUST submit a [`BilateralDeliveryReceipt`] co-signed by the exact counterparty
+/// assigned by `BeaconPairingSchedule`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeaconPairingSchedule {
+    pub epoch: u64,
+    pub beacon_gamma: u128,
+    pub pairings: BTreeMap<ValidatorId, ValidatorId>,
+}
+
+impl BeaconPairingSchedule {
+    /// Derive the mandatory fixed-point-free counterparty schedule for `epoch` from `beacon_gamma`
+    /// and `validators` (requires `>= 2` distinct validators and `0 < beacon_gamma < PRIME_P`).
+    pub fn derive(
+        epoch: u64,
+        validators: &[ValidatorId],
+        beacon_gamma: u128,
+    ) -> Result<Self, PopError> {
+        let pairings = derive_counterparty_derangement(validators, beacon_gamma)?;
+        Ok(Self {
+            epoch,
+            beacon_gamma,
+            pairings,
+        })
+    }
+
+    /// Derive the mandatory counterparty schedule directly from a finalized [`EpochBeaconOutput`].
+    pub fn from_beacon_output(
+        output: &EpochBeaconOutput,
+        validators: &[ValidatorId],
+    ) -> Result<Self, PopError> {
+        Self::derive(output.epoch, validators, output.gamma)
+    }
+
+    /// Look up the mandatory beacon-assigned counterparty for `provider_id`.
+    #[inline]
+    pub fn expected_counterparty(&self, provider_id: ValidatorId) -> Option<ValidatorId> {
+        self.pairings.get(&provider_id).copied()
+    }
+
+    /// Access the full `provider -> counterparty` derangement map.
+    #[inline]
+    pub fn pairings(&self) -> &BTreeMap<ValidatorId, ValidatorId> {
+        &self.pairings
+    }
+
+    /// Number of validators covered by this epoch pairing schedule.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pairings.len()
+    }
+
+    /// Returns `true` if this schedule contains no pairings.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pairings.is_empty()
+    }
+
+    /// Verify that `actual_counterparty` is the exact beacon-assigned counterparty for `provider_id`.
+    pub fn verify_assignment(
+        &self,
+        provider_id: ValidatorId,
+        actual_counterparty: ValidatorId,
+    ) -> Result<(), PopError> {
+        let expected_counterparty = self.expected_counterparty(provider_id).ok_or_else(|| {
+            PopError::CoordinatorRejected(format!(
+                "validator {provider_id} is not registered in epoch {} beacon pairing schedule",
+                self.epoch
+            ))
+        })?;
+        if expected_counterparty == provider_id {
+            return Err(PopError::InvalidParameter(
+                "beacon pairing schedule contains a forbidden fixed point",
+            ));
+        }
+        if actual_counterparty != expected_counterparty {
+            return Err(PopError::UnauthorizedCounterparty {
+                provider_id,
+                expected_counterparty,
+                actual_counterparty,
+            });
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Mined Pad Batch, Challenge, Proof & Verification Receipt
 // ============================================================================
 
@@ -1656,6 +1942,82 @@ impl PopAuditor {
         }
     }
 
+    /// Issue a deterministic, unbiasable beacon-derived Proof-of-Pad challenge for `validator_id`
+    /// in `epoch` seeded by canonical `0 < beacon_gamma < PRIME_P` over `F_(2^127 - 1)`.
+    ///
+    /// - `challenge_r`, `pad_slot_indices`, and `beaver_slot_index` are derived deterministically
+    ///   from `(beacon_gamma, validator_id, epoch)` via bijective Mersenne field mixing so no
+    ///   auditor or miner can bias slot selection.
+    /// - One-time Carter-Wegman MAC masks (`sample_mask_s`, `batch_mask_s`, `slots_mask_s`) remain
+    ///   fresh OS-random field elements per audit to preserve unconditional information-theoretic
+    ///   one-time MAC security.
+    pub fn issue_beacon_challenge(
+        validator_id: ValidatorId,
+        epoch: u64,
+        beacon_gamma: u128,
+        slot_count: usize,
+    ) -> Result<PopChallenge, PopError> {
+        validate_beacon_gamma(beacon_gamma)?;
+        if slot_count == 0 {
+            return Err(PopError::InvalidParameter("slot_count must be > 0"));
+        }
+        Ok(PopChallenge {
+            validator_id,
+            epoch,
+            challenge_r: beacon_derive_challenge_r(beacon_gamma, validator_id, epoch),
+            sample_mask_s: random_field_elem(),
+            batch_mask_s: random_field_elem(),
+            slots_mask_s: random_field_elem(),
+            pad_slot_indices: beacon_derive_pad_slots(
+                beacon_gamma,
+                validator_id,
+                epoch,
+                slot_count,
+            ),
+            beaver_slot_index: beacon_derive_beaver_slot(beacon_gamma, validator_id, epoch),
+        })
+    }
+
+    /// Verify that a `PopChallenge`'s deterministic fields (`challenge_r`, `pad_slot_indices`,
+    /// `beaver_slot_index`) match the canonical beacon derivation for `beacon_gamma`.
+    pub fn verify_beacon_challenge_binding(
+        challenge: &PopChallenge,
+        beacon_gamma: u128,
+    ) -> Result<(), PopError> {
+        validate_beacon_gamma(beacon_gamma)?;
+        if challenge.pad_slot_indices.is_empty() {
+            return Err(PopError::ChallengeMismatch(
+                "beacon challenge must specify at least 1 pad slot".into(),
+            ));
+        }
+        let expected_r =
+            beacon_derive_challenge_r(beacon_gamma, challenge.validator_id, challenge.epoch);
+        if challenge.challenge_r != expected_r {
+            return Err(PopError::ChallengeMismatch(
+                "challenge_r does not match deterministic epoch beacon derivation".into(),
+            ));
+        }
+        let expected_slots = beacon_derive_pad_slots(
+            beacon_gamma,
+            challenge.validator_id,
+            challenge.epoch,
+            challenge.pad_slot_indices.len(),
+        );
+        if challenge.pad_slot_indices != expected_slots {
+            return Err(PopError::ChallengeMismatch(
+                "pad_slot_indices do not match deterministic epoch beacon derivation".into(),
+            ));
+        }
+        let expected_beaver =
+            beacon_derive_beaver_slot(beacon_gamma, challenge.validator_id, challenge.epoch);
+        if challenge.beaver_slot_index != expected_beaver {
+            return Err(PopError::ChallengeMismatch(
+                "beaver_slot_index does not match deterministic epoch beacon derivation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Verify a validator's `PopProof` against its pre-challenge `PopCommitment` and issued
     /// `PopChallenge` using default information-theoretic audit bounds.
     pub fn verify_proof(
@@ -1722,6 +2084,9 @@ impl PopAuditor {
         }
 
         // H-3: Reject any non-canonical field digest (>= PRIME_P) BEFORE MAC/uniqueness checks.
+        if challenge.challenge_r == 0 || challenge.challenge_r >= PRIME_P {
+            return Err(PopError::InvalidCommitmentTag("non-canonical challenge_r"));
+        }
         if commitment.commit_r == 0 || commitment.commit_r >= PRIME_P || commitment.commit_s >= PRIME_P {
             return Err(PopError::InvalidCommitmentTag("non-canonical commitment key"));
         }
@@ -2027,6 +2392,95 @@ impl PopAuditor {
         verified.counterparty_id = Some(receipt.counterparty_id);
         Ok(verified)
     }
+
+    /// Anti-collusion Proof-of-Pad verification enforcing the epoch's unbiasable
+    /// [`BeaconPairingSchedule`] BEFORE accepting any bilateral proof.
+    ///
+    /// Defeats 2-node Sybil collusion rings (`V_A <-> V_B`): if the beacon assigned
+    /// `V_A -> V_honest` but `V_A` submits a receipt co-signed by its colluding buddy `V_B`,
+    /// verification immediately fails with [`PopError::UnauthorizedCounterparty`] (triggering a
+    /// **50% bond burn + jail**) without recording anything into `replay_registry`.
+    pub fn verify_beacon_bilateral_proof(
+        commitment: &PopCommitment,
+        challenge: &PopChallenge,
+        proof: &PopProof,
+        peer_receipt: Option<&BilateralDeliveryReceipt>,
+        peer_key: Option<&PeerReceiptKey>,
+        pairing_schedule: &BeaconPairingSchedule,
+        replay_registry: &mut PopReplayRegistry,
+    ) -> Result<PopVerificationReceipt, PopError> {
+        Self::verify_beacon_bilateral_proof_with_policy(
+            commitment,
+            challenge,
+            proof,
+            peer_receipt,
+            peer_key,
+            pairing_schedule,
+            replay_registry,
+            &PopAuditPolicy::default(),
+        )
+    }
+
+    /// Anti-collusion beacon-paired bilateral Proof-of-Pad verification against an explicit
+    /// [`PopAuditPolicy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_beacon_bilateral_proof_with_policy(
+        commitment: &PopCommitment,
+        challenge: &PopChallenge,
+        proof: &PopProof,
+        peer_receipt: Option<&BilateralDeliveryReceipt>,
+        peer_key: Option<&PeerReceiptKey>,
+        pairing_schedule: &BeaconPairingSchedule,
+        replay_registry: &mut PopReplayRegistry,
+        policy: &PopAuditPolicy,
+    ) -> Result<PopVerificationReceipt, PopError> {
+        validate_beacon_gamma(pairing_schedule.beacon_gamma)?;
+        if pairing_schedule.epoch != challenge.epoch {
+            return Err(PopError::ChallengeMismatch(format!(
+                "beacon pairing schedule epoch mismatch: schedule={}, challenge={}",
+                pairing_schedule.epoch, challenge.epoch
+            )));
+        }
+
+        // 1. Require a counterparty bilateral delivery receipt and verification key.
+        let receipt = peer_receipt.ok_or(PopError::MissingPeerReceipt(
+            "counterparty bilateral delivery receipt is required (solo mining rejected)",
+        ))?;
+        let _key = peer_key.ok_or(PopError::MissingPeerReceipt(
+            "counterparty verification key is required",
+        ))?;
+
+        // 2. Reject self-co-signing first.
+        if receipt.counterparty_id == receipt.provider_id
+            || receipt.counterparty_id == challenge.validator_id
+            || receipt.counterparty_id == proof.validator_id
+        {
+            return Err(PopError::SelfCoSignForbidden(challenge.validator_id));
+        }
+
+        // 3. Ensure the receipt belongs to the challenged provider.
+        if receipt.provider_id != challenge.validator_id {
+            return Err(PopError::ChallengeMismatch(format!(
+                "peer receipt provider_id mismatch: challenge={}, receipt={}",
+                challenge.validator_id, receipt.provider_id
+            )));
+        }
+
+        // 4. Enforce mandatory beacon-assigned counterparty BEFORE accepting or touching replay state!
+        pairing_schedule.verify_assignment(challenge.validator_id, receipt.counterparty_id)?;
+
+        // 5. Run complete bilateral MAC + commit-then-challenge + entropy + Beaver triple + QKD
+        //    + cross-epoch/cross-validator anti-replay verification.
+        Self::verify_bilateral_proof_with_policy(
+            commitment,
+            challenge,
+            proof,
+            peer_receipt,
+            peer_key,
+            replay_registry,
+            policy,
+        )
+    }
 }
 
 /// Per-validator outcome recorded during `PopEpochCoordinator::run_audited_epoch`.
@@ -2069,6 +2523,117 @@ pub struct BilateralPopSubmission {
 pub struct PopEpochCoordinator;
 
 impl PopEpochCoordinator {
+    /// Audit all participating validators' [`BilateralPopSubmission`]s for the current epoch
+    /// against the mandatory, unbiasable counterparty derangement derived from `beacon_gamma`
+    /// and `active_validators` over `F_(2^127 - 1)`.
+    ///
+    /// Rejects 2-node Sybil collusion rings (`UnauthorizedCounterparty`), solo mining
+    /// (`MissingPeerReceipt`), self-co-signing (`SelfCoSignForbidden`), forged MACs, tampered
+    /// commitments, bad Beaver triples, and cross-epoch/cross-validator replays with an automatic
+    /// **50% bond burn + jail**, then settles the epoch reward pool for honest validators.
+    pub fn run_beacon_bilateral_audited_epoch(
+        beacon_gamma: u128,
+        active_validators: &[ValidatorId],
+        tokenomics: &mut TokenomicsEngine,
+        replay_registry: &mut PopReplayRegistry,
+        submissions: &[BilateralPopSubmission],
+    ) -> Result<PopEpochReport, PopError> {
+        Self::run_beacon_bilateral_audited_epoch_with_policy(
+            beacon_gamma,
+            active_validators,
+            tokenomics,
+            replay_registry,
+            submissions,
+            &PopAuditPolicy::default(),
+        )
+    }
+
+    /// Beacon-paired bilateral + anti-replay epoch audit and settlement using an explicit
+    /// [`PopAuditPolicy`].
+    pub fn run_beacon_bilateral_audited_epoch_with_policy(
+        beacon_gamma: u128,
+        active_validators: &[ValidatorId],
+        tokenomics: &mut TokenomicsEngine,
+        replay_registry: &mut PopReplayRegistry,
+        submissions: &[BilateralPopSubmission],
+        policy: &PopAuditPolicy,
+    ) -> Result<PopEpochReport, PopError> {
+        let current_epoch = tokenomics.current_epoch();
+        let schedule = BeaconPairingSchedule::derive(current_epoch, active_validators, beacon_gamma)?;
+
+        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
+        let mut outcomes = Vec::with_capacity(submissions.len());
+        let mut seen_validators = BTreeSet::new();
+
+        for sub in submissions {
+            let validator_id = sub.challenge.validator_id;
+
+            let audit_result = if sub.challenge.epoch != current_epoch {
+                Err(PopError::CoordinatorRejected(format!(
+                    "stale or future challenge epoch {} != current epoch {current_epoch}",
+                    sub.challenge.epoch
+                )))
+            } else if !seen_validators.insert(validator_id) {
+                Err(PopError::CoordinatorRejected(format!(
+                    "duplicate PoP submission for validator {validator_id} in epoch {current_epoch}"
+                )))
+            } else {
+                PopAuditor::verify_beacon_bilateral_proof_with_policy(
+                    &sub.commitment,
+                    &sub.challenge,
+                    &sub.proof,
+                    sub.peer_receipt.as_ref(),
+                    sub.peer_key.as_ref(),
+                    &schedule,
+                    replay_registry,
+                    policy,
+                )
+            };
+
+            match audit_result {
+                Ok(receipt) => match tokenomics
+                    .record_contribution(receipt.validator_id, receipt.contribution)
+                {
+                    Ok(()) => {
+                        outcomes.push(PopAuditOutcome::Accepted(receipt.clone()));
+                        accepted.push(receipt);
+                    }
+                    Err(tok_err) => {
+                        let err = PopError::TokenomicsFailure(tok_err.to_string());
+                        outcomes.push(PopAuditOutcome::Rejected {
+                            validator_id: receipt.validator_id,
+                            error: err.clone(),
+                            slashing: None,
+                        });
+                        rejected.push((receipt.validator_id, err, None));
+                    }
+                },
+                Err(err) => {
+                    let slashing = err.slashing_offense().and_then(|offense| {
+                        tokenomics.slash_validator(validator_id, offense).ok()
+                    });
+                    outcomes.push(PopAuditOutcome::Rejected {
+                        validator_id,
+                        error: err.clone(),
+                        slashing: slashing.clone(),
+                    });
+                    rejected.push((validator_id, err, slashing));
+                }
+            }
+        }
+
+        let settlement = tokenomics.settle_epoch();
+
+        Ok(PopEpochReport {
+            epoch: current_epoch,
+            accepted,
+            rejected,
+            outcomes,
+            settlement,
+        })
+    }
+
     /// Audit all participating validators' [`BilateralPopSubmission`]s for the current epoch with
     /// mandatory bilateral counterparty receipts and cross-epoch/cross-validator anti-replay
     /// enforcement, credit honest validators, slash cheaters, and settle the epoch reward pool.
@@ -2941,5 +3506,487 @@ mod tests {
         // Sliding window pruning check: advancing beyond max_history_epochs (8) prunes epoch 0!
         replay.prune_expired(20);
         assert_eq!(replay.tracked_pad_fingerprints(), 0);
+    }
+
+    #[test]
+    fn test_beacon_counterparty_derangement_invariants_across_sizes_and_gammas() {
+        // 1. Invalid inputs rejected cleanly.
+        assert_eq!(
+            derive_counterparty_derangement(&[], 42).unwrap_err(),
+            PopError::InvalidParameter(
+                "at least 2 distinct validators are required for counterparty derangement"
+            )
+        );
+        assert_eq!(
+            derive_counterparty_derangement(&[7], 42).unwrap_err(),
+            PopError::InvalidParameter(
+                "at least 2 distinct validators are required for counterparty derangement"
+            )
+        );
+        assert_eq!(
+            derive_counterparty_derangement(&[7, 7], 42).unwrap_err(),
+            PopError::InvalidParameter(
+                "at least 2 distinct validators are required for counterparty derangement"
+            )
+        );
+        for bad_gamma in [0u128, PRIME_P, PRIME_P + 1, u128::MAX] {
+            assert_eq!(
+                derive_counterparty_derangement(&[1, 2, 3], bad_gamma).unwrap_err(),
+                PopError::InvalidParameter(
+                    "beacon_gamma must satisfy 0 < beacon_gamma < PRIME_P"
+                )
+            );
+        }
+
+        // 2. Verify fixed-point-free bijective single-cycle derangements for N = 2, 3, 4, 7, 16.
+        let mut gammas: Vec<u128> = vec![
+            1,
+            2,
+            0x1234_5678_9ABC_DEF0_1122_3344_5566_7788 & PRIME_P,
+            0x5A17_9C3B_7E2D_4F61_138B_9D4E_6A2F_11C5,
+            0x7FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFE, // PRIME_P - 1
+            0x0000_0000_0000_0001_DEAD_BEEF_CAFE_BABE,
+            0x4444_5555_6666_7777_8888_9999_AAAA_BBBB & PRIME_P,
+            0x2345_6789_ABCD_EF01_2345_6789_ABCD_EF01,
+        ];
+        for k in 1u128..=32 {
+            gammas.push(add_mod(mul_mod(k, 0x0001_0000_0001_0001_0001_0001_0001_0001), 97));
+        }
+
+        for n in [2usize, 3, 4, 7, 16] {
+            let validators: Vec<ValidatorId> = (100..(100 + n as u64)).collect();
+            let reversed: Vec<ValidatorId> = validators.iter().copied().rev().collect();
+            let mut distinct_schedules = BTreeSet::new();
+
+            for &gamma in &gammas {
+                let map = derive_counterparty_derangement(&validators, gamma).unwrap();
+                let map_rev = derive_counterparty_derangement(&reversed, gamma).unwrap();
+                // Order-independent determinism:
+                assert_eq!(map, map_rev);
+                assert_eq!(map.len(), n);
+
+                // Zero fixed points & exact bijection (every validator is once provider and once counterparty):
+                let mut seen_counterparties = BTreeSet::new();
+                for &v in &validators {
+                    let cp = map[&v];
+                    assert_ne!(cp, v, "fixed point detected for N={n}, gamma={gamma}, v={v}");
+                    assert!(
+                        seen_counterparties.insert(cp),
+                        "non-bijective duplicate counterparty {cp} for N={n}"
+                    );
+                    // Single N-cycle guarantee: for N >= 3, NO reciprocal 2-cycles (V_A <-> V_B)!
+                    if n >= 3 {
+                        assert_ne!(
+                            map[&cp], v,
+                            "reciprocal 2-cycle detected for N={n} ({v} <-> {cp})"
+                        );
+                    }
+                }
+                let expected_set: BTreeSet<ValidatorId> = validators.iter().copied().collect();
+                assert_eq!(seen_counterparties, expected_set);
+
+                // Verify single full cycle of length N:
+                let mut cur = validators[0];
+                let mut visited = BTreeSet::new();
+                for _ in 0..n {
+                    assert!(visited.insert(cur), "premature sub-cycle for N={n}");
+                    cur = map[&cur];
+                }
+                assert_eq!(cur, validators[0], "cycle must close after exactly N={n} hops");
+
+                let canonical_vec: Vec<(ValidatorId, ValidatorId)> =
+                    map.iter().map(|(&k, &v)| (k, v)).collect();
+                distinct_schedules.insert(canonical_vec);
+            }
+
+            // Distinct gammas must produce distinct derangement schedules for N >= 3.
+            match n {
+                2 => assert_eq!(distinct_schedules.len(), 1),
+                3 => assert_eq!(distinct_schedules.len(), 2, "N=3 has 2 distinct cyclic derangements"),
+                4 => assert_eq!(distinct_schedules.len(), 6, "N=4 has 6 distinct cyclic derangements"),
+                _ => assert!(
+                    distinct_schedules.len() >= 24,
+                    "expected diverse derangements across {} distinct gammas for N={n}, got {}",
+                    gammas.len(),
+                    distinct_schedules.len()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_beacon_derived_pop_challenge_determinism_and_fresh_cw_masks() {
+        let gamma_a = 0x3A7B_91C4_5E2D_8F16_4C3A_7B19_E2D5_6F41u128;
+        let gamma_b = 0x51C9_2E84_7A3B_6D1F_9E47_2A83_5C1B_8D63u128;
+
+        // Invalid parameters rejected.
+        assert!(PopAuditor::issue_beacon_challenge(1, 0, 0, 4).is_err());
+        assert!(PopAuditor::issue_beacon_challenge(1, 0, PRIME_P, 4).is_err());
+        assert!(PopAuditor::issue_beacon_challenge(1, 0, gamma_a, 0).is_err());
+
+        // Same (validator, epoch, gamma, slot_count) -> identical deterministic challenge_r & slots,
+        // while one-time Carter-Wegman masks remain fresh per audit!
+        let c1 = PopAuditor::issue_beacon_challenge(10, 5, gamma_a, 4).unwrap();
+        let c2 = PopAuditor::issue_beacon_challenge(10, 5, gamma_a, 4).unwrap();
+        assert_eq!(c1.challenge_r, c2.challenge_r);
+        assert!(c1.challenge_r > 0 && c1.challenge_r < PRIME_P);
+        assert_eq!(c1.pad_slot_indices, c2.pad_slot_indices);
+        assert_eq!(c1.pad_slot_indices.len(), 4);
+        assert_eq!(c1.beaver_slot_index, c2.beaver_slot_index);
+        assert_ne!(c1.sample_mask_s, c2.sample_mask_s);
+        assert_ne!(c1.batch_mask_s, c2.batch_mask_s);
+        assert_ne!(c1.slots_mask_s, c2.slots_mask_s);
+
+        PopAuditor::verify_beacon_challenge_binding(&c1, gamma_a).unwrap();
+        assert!(PopAuditor::verify_beacon_challenge_binding(&c1, gamma_b).is_err());
+
+        // Distinct validators, epochs, and gammas yield distinct challenges.
+        let c_other_val = PopAuditor::issue_beacon_challenge(11, 5, gamma_a, 4).unwrap();
+        let c_other_ep = PopAuditor::issue_beacon_challenge(10, 6, gamma_a, 4).unwrap();
+        let c_other_gamma = PopAuditor::issue_beacon_challenge(10, 5, gamma_b, 4).unwrap();
+        assert_ne!(c1.challenge_r, c_other_val.challenge_r);
+        assert_ne!(c1.pad_slot_indices, c_other_val.pad_slot_indices);
+        assert_ne!(c1.challenge_r, c_other_ep.challenge_r);
+        assert_ne!(c1.pad_slot_indices, c_other_ep.pad_slot_indices);
+        assert_ne!(c1.challenge_r, c_other_gamma.challenge_r);
+        assert_ne!(c1.beaver_slot_index, c_other_gamma.beaver_slot_index);
+    }
+
+    #[test]
+    fn test_two_node_sybil_collusion_rejected_with_unauthorized_counterparty_and_slashed_50_percent() {
+        let validators = [1u64, 2, 3, 4];
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.mint_genesis_supply(50 * VERN_PER_VRNM).unwrap();
+        for &vid in &validators {
+            engine.register_genesis_validator(vid).unwrap();
+        }
+        let mut replay = PopReplayRegistry::default();
+        let epoch = engine.current_epoch();
+
+        // Pick a canonical beacon_gamma where V1 is assigned V3 (NOT its colluding Sybil buddy V2).
+        let beacon_gamma = (1u128..10_000)
+            .find(|&g| {
+                let sched = derive_counterparty_derangement(&validators, g).unwrap();
+                sched[&1] == 3 && sched[&2] != 1
+            })
+            .expect("must find gamma with V1 -> V3 and V2 -/-> V1");
+
+        let schedule = BeaconPairingSchedule::derive(epoch, &validators, beacon_gamma).unwrap();
+        assert_eq!(schedule.expected_counterparty(1), Some(3));
+        assert_ne!(schedule.expected_counterparty(2), Some(1));
+
+        // Colluding Sybils V1 <-> V2 co-sign EACH OTHER instead of their beacon-assigned honest peers!
+        let key_sybil_1 = PeerReceiptKey::generate();
+        let (mut b1, c1, r1_colluding) =
+            PopMiner::mine_bilateral_pad_batch(1, 2, epoch, 8, 8, &key_sybil_1).unwrap();
+        let ch1 = PopAuditor::issue_beacon_challenge(1, epoch, beacon_gamma, 4).unwrap();
+        let p1 = PopMiner::answer_challenge(&mut b1, &ch1);
+
+        let key_sybil_2 = PeerReceiptKey::generate();
+        let (mut b2, c2, r2_colluding) =
+            PopMiner::mine_bilateral_pad_batch(2, 1, epoch, 8, 8, &key_sybil_2).unwrap();
+        let ch2 = PopAuditor::issue_beacon_challenge(2, epoch, beacon_gamma, 4).unwrap();
+        let p2 = PopMiner::answer_challenge(&mut b2, &ch2);
+
+        // Direct PopAuditor check rejects V1's colluding receipt with UnauthorizedCounterparty (50% slash).
+        let direct_err = PopAuditor::verify_beacon_bilateral_proof(
+            &c1,
+            &ch1,
+            &p1,
+            Some(&r1_colluding),
+            Some(&key_sybil_1),
+            &schedule,
+            &mut replay,
+        )
+        .unwrap_err();
+        assert_eq!(
+            direct_err,
+            PopError::UnauthorizedCounterparty {
+                provider_id: 1,
+                expected_counterparty: 3,
+                actual_counterparty: 2,
+            }
+        );
+        assert_eq!(
+            direct_err.slashing_offense(),
+            Some(SlashingOffense::InconsistentMpcShare)
+        );
+        assert_eq!(
+            replay.tracked_pad_fingerprints(),
+            0,
+            "rejected colluder must not pollute replay registry"
+        );
+
+        // Honest validators V3 and V4 follow their mandatory beacon-assigned counterparties!
+        let cp3 = schedule.expected_counterparty(3).unwrap();
+        let key3 = PeerReceiptKey::generate();
+        let (mut b3, c3, r3) =
+            PopMiner::mine_bilateral_pad_batch(3, cp3, epoch, 8, 8, &key3).unwrap();
+        let ch3 = PopAuditor::issue_beacon_challenge(3, epoch, beacon_gamma, 4).unwrap();
+        let p3 = PopMiner::answer_challenge(&mut b3, &ch3);
+
+        let cp4 = schedule.expected_counterparty(4).unwrap();
+        let key4 = PeerReceiptKey::generate();
+        let (mut b4, c4, r4) =
+            PopMiner::mine_bilateral_pad_batch(4, cp4, epoch, 8, 8, &key4).unwrap();
+        let ch4 = PopAuditor::issue_beacon_challenge(4, epoch, beacon_gamma, 4).unwrap();
+        let p4 = PopMiner::answer_challenge(&mut b4, &ch4);
+
+        let submissions = vec![
+            BilateralPopSubmission {
+                commitment: c1,
+                challenge: ch1,
+                proof: p1,
+                peer_receipt: Some(r1_colluding),
+                peer_key: Some(key_sybil_1),
+            },
+            BilateralPopSubmission {
+                commitment: c2,
+                challenge: ch2,
+                proof: p2,
+                peer_receipt: Some(r2_colluding),
+                peer_key: Some(key_sybil_2),
+            },
+            BilateralPopSubmission {
+                commitment: c3,
+                challenge: ch3,
+                proof: p3,
+                peer_receipt: Some(r3),
+                peer_key: Some(key3),
+            },
+            BilateralPopSubmission {
+                commitment: c4,
+                challenge: ch4,
+                proof: p4,
+                peer_receipt: Some(r4),
+                peer_key: Some(key4),
+            },
+        ];
+
+        let report = PopEpochCoordinator::run_beacon_bilateral_audited_epoch(
+            beacon_gamma,
+            &validators,
+            &mut engine,
+            &mut replay,
+            &submissions,
+        )
+        .unwrap();
+
+        // Only honest V3 and V4 are accepted; colluding Sybils V1 and V2 are rejected & slashed 50% + jailed!
+        assert_eq!(report.accepted.len(), 2);
+        assert_eq!(report.accepted[0].validator_id, 3);
+        assert_eq!(report.accepted[0].counterparty_id, Some(cp3));
+        assert_eq!(report.accepted[1].validator_id, 4);
+        assert_eq!(report.accepted[1].counterparty_id, Some(cp4));
+        assert_eq!(report.rejected.len(), 2);
+
+        let expected_v2_cp = schedule.expected_counterparty(2).unwrap();
+        for (vid, err, maybe_slash) in &report.rejected {
+            match *vid {
+                1 => assert_eq!(
+                    err,
+                    &PopError::UnauthorizedCounterparty {
+                        provider_id: 1,
+                        expected_counterparty: 3,
+                        actual_counterparty: 2,
+                    }
+                ),
+                2 => assert_eq!(
+                    err,
+                    &PopError::UnauthorizedCounterparty {
+                        provider_id: 2,
+                        expected_counterparty: expected_v2_cp,
+                        actual_counterparty: 1,
+                    }
+                ),
+                other => panic!("unexpected rejected validator {other}"),
+            }
+            let slash = maybe_slash.as_ref().expect("colluder must be slashed 50%");
+            assert_eq!(slash.offense, SlashingOffense::InconsistentMpcShare);
+            assert_eq!(slash.slashed_amount, DEFAULT_REQUIRED_BOND / 2);
+            assert_eq!(slash.remaining_bond, DEFAULT_REQUIRED_BOND / 2);
+            assert_eq!(slash.new_status, ValidatorStatus::Jailed);
+        }
+
+        assert_eq!(engine.vault(1).unwrap().status, ValidatorStatus::Jailed);
+        assert_eq!(engine.vault(1).unwrap().reward_balance, 0);
+        assert_eq!(engine.vault(2).unwrap().status, ValidatorStatus::Jailed);
+        assert_eq!(engine.vault(2).unwrap().reward_balance, 0);
+        assert!(engine.vault(3).unwrap().reward_balance > 0);
+        assert!(engine.vault(4).unwrap().reward_balance > 0);
+        assert_eq!(
+            report.settlement.total_distributed + report.settlement.dust_rolled_over,
+            INITIAL_EPOCH_REWARD
+        );
+        engine.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn test_end_to_end_autonomous_clock_beacon_pairing_challenge_and_audited_epoch() {
+        use crate::entropy_beacon::{
+            AutonomousEpochClock, BeaconConfig, EpochPipelineStage, OtpChannelKey, VernamBeacon,
+        };
+
+        let n = 4usize;
+        let active_validators: Vec<ValidatorId> = (0..n as u64).collect();
+
+        // 1. AutonomousEpochClock crosses epoch 0 -> epoch 1 boundary at block height 10.
+        let mut clock = AutonomousEpochClock::new(10).unwrap();
+        for h in 1..10 {
+            assert!(clock.on_block_finalized(h).is_none());
+        }
+        let transition = clock
+            .on_block_finalized(10)
+            .expect("epoch 1 transition must fire at block 10");
+        assert_eq!(transition.new_epoch, 1);
+        assert!(clock.needs_beacon_round());
+
+        // 2. Run a full 4-validator information-theoretic VernamBeacon round for epoch 1.
+        let bcfg = BeaconConfig::bft(n).unwrap();
+        let mut sender_keys: Vec<Vec<OtpChannelKey>> = Vec::with_capacity(n);
+        let mut receiver_keys: Vec<Vec<Option<OtpChannelKey>>> =
+            (0..n).map(|_| (0..n).map(|_| None).collect()).collect();
+        for d in 0..n {
+            let mut row = Vec::with_capacity(n);
+            for r in 0..n {
+                let (sk, rk) = OtpChannelKey::generate_pair_for_config(&bcfg);
+                row.push(sk);
+                receiver_keys[r][d] = Some(rk);
+            }
+            sender_keys.push(row);
+        }
+        let receiver_keys: Vec<Vec<OtpChannelKey>> = receiver_keys
+            .into_iter()
+            .map(|row| row.into_iter().map(Option::unwrap).collect())
+            .collect();
+
+        let mut nodes: Vec<VernamBeacon> = (0..n as u32)
+            .map(|id| VernamBeacon::new(bcfg, 1, id).unwrap())
+            .collect();
+        let mut all_envs = Vec::with_capacity(n);
+        for d in 0..n {
+            let refs: Vec<(u32, &OtpChannelKey)> =
+                (0..n).map(|r| (r as u32, &sender_keys[d][r])).collect();
+            all_envs.push(nodes[d].generate_commit_envelopes(&refs).unwrap());
+        }
+        for r in 0..n {
+            for d in 0..n {
+                nodes[r]
+                    .receive_commit_envelope(&all_envs[d][r], &receiver_keys[r][d])
+                    .unwrap();
+            }
+        }
+        let all_checks: Vec<_> = nodes.iter().map(|node| node.generate_pairwise_checks()).collect();
+        for checks in &all_checks {
+            for chk in checks {
+                assert!(nodes[chk.to_id as usize].verify_pairwise_check(chk).unwrap());
+            }
+        }
+        let all_ic_ch: Vec<_> = nodes.iter_mut().map(|node| node.generate_ic_challenges()).collect();
+        for chs in &all_ic_ch {
+            for ch in chs {
+                let resp = nodes[ch.holder_id as usize].answer_ic_challenge(ch).unwrap();
+                assert!(nodes[ch.verifier_id as usize].verify_ic_response(&resp).unwrap());
+            }
+        }
+        for node in &mut nodes {
+            assert_eq!(node.lock_commit_phase().unwrap().len(), n);
+        }
+        let reveals: Vec<_> = nodes.iter().map(|node| node.generate_reveal().unwrap()).collect();
+        let mut beacon_outputs = Vec::with_capacity(n);
+        for node in &mut nodes {
+            for rev in &reveals {
+                assert!(node.receive_reveal(rev).unwrap());
+            }
+            beacon_outputs.push(node.finalize_epoch().unwrap());
+        }
+        let beacon_out = beacon_outputs[0].clone();
+        for out in &beacon_outputs[1..] {
+            assert_eq!(out, &beacon_out);
+        }
+        assert!(beacon_out.gamma > 0 && beacon_out.gamma < PRIME_P);
+
+        // Advance autonomous clock: Beacon -> AwaitingPopAudit.
+        clock.complete_beacon_round(beacon_out.clone()).unwrap();
+        assert!(clock.needs_pop_audit());
+
+        // 3. Derive mandatory BeaconPairingSchedule from the finalized EpochBeaconOutput.
+        let schedule =
+            BeaconPairingSchedule::from_beacon_output(&beacon_out, &active_validators).unwrap();
+        assert_eq!(schedule.epoch, 1);
+        assert_eq!(schedule.len(), n);
+
+        // Advance TokenomicsEngine to epoch 1 (matching clock.current_epoch()).
+        let mut engine = TokenomicsEngine::with_defaults();
+        engine.mint_genesis_supply(50 * VERN_PER_VRNM).unwrap();
+        for &vid in &active_validators {
+            engine.register_genesis_validator(vid).unwrap();
+        }
+        let _epoch0_settle = engine.settle_epoch();
+        assert_eq!(engine.current_epoch(), 1);
+        let mut replay = PopReplayRegistry::default();
+
+        // 4. Each validator mines a bilateral pad batch with its beacon-assigned counterparty and
+        //    answers its deterministic beacon-derived PoP challenge!
+        let mut submissions = Vec::with_capacity(n);
+        for &vid in &active_validators {
+            let counterparty = schedule.expected_counterparty(vid).unwrap();
+            assert_ne!(counterparty, vid);
+
+            let key = PeerReceiptKey::generate();
+            let (mut batch, commitment, receipt) = PopMiner::mine_bilateral_pad_batch(
+                vid,
+                counterparty,
+                beacon_out.epoch,
+                8,
+                12,
+                &key,
+            )
+            .unwrap();
+            let challenge = PopAuditor::issue_beacon_challenge(
+                vid,
+                beacon_out.epoch,
+                beacon_out.gamma,
+                DEFAULT_CHALLENGE_SLOT_COUNT,
+            )
+            .unwrap();
+            PopAuditor::verify_beacon_challenge_binding(&challenge, beacon_out.gamma).unwrap();
+            let proof = PopMiner::answer_challenge(&mut batch, &challenge).with_liveness(10, 1);
+
+            submissions.push(BilateralPopSubmission {
+                commitment,
+                challenge,
+                proof,
+                peer_receipt: Some(receipt),
+                peer_key: Some(key),
+            });
+        }
+
+        // 5. Run the beacon-paired bilateral audited epoch and complete the autonomous clock pipeline!
+        let report = PopEpochCoordinator::run_beacon_bilateral_audited_epoch(
+            beacon_out.gamma,
+            &active_validators,
+            &mut engine,
+            &mut replay,
+            &submissions,
+        )
+        .unwrap();
+
+        assert_eq!(report.epoch, 1);
+        assert_eq!(report.accepted.len(), n);
+        assert!(report.rejected.is_empty());
+        for rcpt in &report.accepted {
+            assert_eq!(
+                rcpt.counterparty_id,
+                schedule.expected_counterparty(rcpt.validator_id)
+            );
+            assert!(engine.vault(rcpt.validator_id).unwrap().reward_balance > 0);
+        }
+        engine.check_invariants().unwrap();
+
+        clock.complete_pop_audit().unwrap();
+        assert!(clock.needs_pss_refresh());
+        clock.complete_pss_refresh().unwrap();
+        assert_eq!(clock.pipeline_stage(), EpochPipelineStage::Idle);
     }
 }

@@ -26,9 +26,26 @@
 
 use std::fmt;
 use std::hint::black_box;
+use std::sync::atomic::{Ordering, compiler_fence};
 use std::time::Instant;
 
-use crate::field::{PRIME_P, ct_eq_16, mul_mod, reduce, zeroize_u128};
+use crate::field::{PRIME_P, ct_eq_16, mul_mod, reduce, zeroize_slice, zeroize_u128};
+
+#[inline]
+fn zeroize_u64_slice(buf: &mut [u64]) {
+    for w in buf.iter_mut() {
+        // SAFETY: `w` is a valid mutable reference to an initialized `u64`.
+        unsafe { std::ptr::write_volatile(w, 0u64) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+#[inline]
+fn zeroize_u64(val: &mut u64) {
+    // SAFETY: `val` is a valid mutable reference to an initialized `u64`.
+    unsafe { std::ptr::write_volatile(val, 0u64) };
+    compiler_fence(Ordering::SeqCst);
+}
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
@@ -161,6 +178,8 @@ fn otp_xor_scalar_u64(data: &mut [u8], key: &[u8]) {
     }
 }
 
+/// # Safety
+/// Caller must ensure `avx512f` is supported on the current CPU and `data.len() == key.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn otp_xor_avx512(data: &mut [u8], key: &[u8]) {
@@ -171,7 +190,7 @@ unsafe fn otp_xor_avx512(data: &mut [u8], key: &[u8]) {
     let mut offset = 0usize;
 
     // 4x unrolled AVX-512 loop: 256 bytes per iteration.
-    while offset + 256 <= len {
+    while len - offset >= 256 {
         // SAFETY: `offset + 256 <= len`, pointers are valid and non-aliasing (Rust borrow rules),
         // and unaligned load/store intrinsics accept arbitrary byte alignment.
         unsafe {
@@ -193,7 +212,7 @@ unsafe fn otp_xor_avx512(data: &mut [u8], key: &[u8]) {
     }
 
     // Single 64-byte AVX-512 tail chunks.
-    while offset + 64 <= len {
+    while len - offset >= 64 {
         // SAFETY: `offset + 64 <= len`.
         unsafe {
             let d0 = _mm512_loadu_si512(d_ptr.add(offset).cast());
@@ -208,6 +227,8 @@ unsafe fn otp_xor_avx512(data: &mut [u8], key: &[u8]) {
     }
 }
 
+/// # Safety
+/// Caller must ensure `avx2` is supported on the current CPU and `data.len() == key.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn otp_xor_avx2(data: &mut [u8], key: &[u8]) {
@@ -218,7 +239,7 @@ unsafe fn otp_xor_avx2(data: &mut [u8], key: &[u8]) {
     let mut offset = 0usize;
 
     // 4x unrolled AVX2 loop: 128 bytes per iteration.
-    while offset + 128 <= len {
+    while len - offset >= 128 {
         // SAFETY: `offset + 128 <= len`.
         unsafe {
             let d0 = _mm256_loadu_si256(d_ptr.add(offset).cast());
@@ -239,7 +260,7 @@ unsafe fn otp_xor_avx2(data: &mut [u8], key: &[u8]) {
     }
 
     // Single 32-byte AVX2 tail chunks.
-    while offset + 32 <= len {
+    while len - offset >= 32 {
         // SAFETY: `offset + 32 <= len`.
         unsafe {
             let d0 = _mm256_loadu_si256(d_ptr.add(offset).cast());
@@ -388,15 +409,18 @@ fn cw_mac_bytes_core(key: &CwFastKey, data: &[u8]) -> [u8; 16] {
     }
 
     // Handle remaining 0..59 bytes in 15-byte chunks (exact injective 0x01 sentinel).
+    let mut buf = [0u8; 16];
     for chunk in chunks60.remainder().chunks(15) {
-        let mut buf = [0u8; 16];
+        buf = [0u8; 16];
         buf[..chunk.len()].copy_from_slice(chunk);
         buf[chunk.len()] = 0x01;
         let block = u128::from_le_bytes(buf);
         acc = mul_weak(add_weak(acc, block), key.r);
     }
+    zeroize_slice(&mut buf);
 
     let tag_val = reduce(add_weak(acc, key.s));
+    zeroize_u128(&mut acc);
     debug_assert!(tag_val < PRIME_P);
     tag_val.to_be_bytes()
 }
@@ -423,6 +447,7 @@ fn cw_mac_u128_stream_core(key: &CwFastKey, words: &[u128]) -> [u8; 16] {
     acc = mul_weak(add_weak(acc, words.len() as u128), key.r);
 
     let tag_val = reduce(add_weak(acc, key.s));
+    zeroize_u128(&mut acc);
     debug_assert!(tag_val < PRIME_P);
     tag_val.to_be_bytes()
 }
@@ -484,8 +509,10 @@ impl CwFastKey {
     /// Constant-time verification of a 16-byte Carter-Wegman MAC tag.
     #[inline]
     pub fn verify(&self, data: &[u8], tag: &[u8; 16]) -> bool {
-        let expected = self.mac(data);
-        ct_eq_16(&expected, tag)
+        let mut expected = self.mac(data);
+        let ok = ct_eq_16(&expected, tag);
+        zeroize_slice(&mut expected);
+        ok
     }
 
     /// 4-way pipelined Carter-Wegman MAC over a native `&[u128]` stream (e.g. binary transaction
@@ -584,7 +611,10 @@ pub const fn toeplitz_seed_words_turbo(raw_bits: usize, out_bits: usize) -> usiz
     if raw_bits == 0 || out_bits == 0 {
         return 0;
     }
-    (raw_bits + out_bits - 1).div_ceil(64)
+    match raw_bits.checked_add(out_bits - 1) {
+        Some(bits) => bits.div_ceil(64),
+        None => panic!("toeplitz bit count overflow"),
+    }
 }
 
 /// Runtime-dispatched SIMD 2-universal Toeplitz hash over GF(2) for QKD privacy amplification.
@@ -623,7 +653,9 @@ pub fn toeplitz_hash_turbo(
         raw.len()
     );
 
-    let needed_seed_bits = raw_bits + out_bits - 1;
+    let needed_seed_bits = raw_bits
+        .checked_add(out_bits - 1)
+        .expect("toeplitz bit count overflow");
     let needed_seed_words = needed_seed_bits.div_ceil(64);
     assert!(
         seed.len() >= needed_seed_words,
@@ -663,7 +695,7 @@ fn toeplitz_hash_scalar_4x(
     } else {
         (1u64 << rem_bits) - 1
     };
-    let tail_raw = if tail_mask != 0 {
+    let mut tail_raw = if tail_mask != 0 {
         raw[full_words] & tail_mask
     } else {
         0
@@ -734,6 +766,7 @@ fn toeplitz_hash_scalar_4x(
         out[i / 64] |= parity << (i % 64);
     }
 
+    zeroize_u64(&mut tail_raw);
     out
 }
 
@@ -816,7 +849,7 @@ unsafe fn toeplitz_hash_avx512(
     } else {
         (1u64 << rem_bits) - 1
     };
-    let tail_raw = if tail_mask != 0 {
+    let mut tail_raw = if tail_mask != 0 {
         raw[full_words] & tail_mask
     } else {
         0
@@ -945,6 +978,8 @@ unsafe fn toeplitz_hash_avx512(
         }
     }
 
+    zeroize_u64_slice(&mut shifted_buf);
+    zeroize_u64(&mut tail_raw);
     out
 }
 
@@ -1033,7 +1068,7 @@ unsafe fn toeplitz_hash_avx2(
     } else {
         (1u64 << rem_bits) - 1
     };
-    let tail_raw = if tail_mask != 0 {
+    let mut tail_raw = if tail_mask != 0 {
         raw[full_words] & tail_mask
     } else {
         0
@@ -1145,6 +1180,8 @@ unsafe fn toeplitz_hash_avx2(
         }
     }
 
+    zeroize_u64_slice(&mut shifted_buf);
+    zeroize_u64(&mut tail_raw);
     out
 }
 
@@ -1604,5 +1641,129 @@ mod tests {
         assert!(bench.toeplitz_mbps > 0.0);
         assert!(!bench.xor_backend.is_empty());
         assert!(!bench.toeplitz_backend.is_empty());
+    }
+
+    #[test]
+    fn test_simd_xor_cw_mac_and_toeplitz_exhaustive_0_to_260_and_unaligned() {
+        let mut rng = TestRng::new(0x51AD_F00D_CAFE_9999);
+
+        // 1. Exhaustive OTP XOR across EVERY length 0..=260 + 1025 with unaligned sub-slices.
+        let mut extra_lengths: Vec<usize> = (0..=260).collect();
+        extra_lengths.push(511);
+        extra_lengths.push(512);
+        extra_lengths.push(513);
+        extra_lengths.push(1025);
+
+        for &len in &extra_lengths {
+            let mut data_backing = vec![0u8; len + 16];
+            let mut key_backing = vec![0u8; len + 16];
+            rng.fill_bytes(&mut data_backing);
+            rng.fill_bytes(&mut key_backing);
+
+            for &(d_off, k_off) in &[(0usize, 0usize), (1, 0), (0, 1), (1, 3), (3, 7)] {
+                let mut ref_buf = data_backing[d_off..d_off + len].to_vec();
+                let key = &key_backing[k_off..k_off + len];
+                ref_otp_xor_in_place(&mut ref_buf, key);
+
+                // Test directly on unaligned in-place mutable sub-slice (not a fresh Vec!).
+                let mut work_backing = data_backing.clone();
+                let unaligned_slice = &mut work_backing[d_off..d_off + len];
+                otp_xor_turbo_in_place(unaligned_slice, key);
+                assert_eq!(
+                    unaligned_slice,
+                    ref_buf.as_slice(),
+                    "unaligned turbo XOR mismatch len={len} d_off={d_off} k_off={k_off}"
+                );
+                // Ensure guard bytes immediately before/after sub-slice were never overwritten!
+                assert_eq!(&work_backing[..d_off], &data_backing[..d_off]);
+                assert_eq!(
+                    &work_backing[d_off + len..],
+                    &data_backing[d_off + len..]
+                );
+
+                // Explicitly test every compiled backend on unaligned sub-slices too.
+                let mut sc_backing = data_backing.clone();
+                otp_xor_scalar_u64(&mut sc_backing[d_off..d_off + len], key);
+                assert_eq!(&sc_backing[d_off..d_off + len], ref_buf.as_slice());
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        let mut avx2_backing = data_backing.clone();
+                        unsafe { otp_xor_avx2(&mut avx2_backing[d_off..d_off + len], key) };
+                        assert_eq!(&avx2_backing[d_off..d_off + len], ref_buf.as_slice());
+                        assert_eq!(&avx2_backing[..d_off], &data_backing[..d_off]);
+                        assert_eq!(
+                            &avx2_backing[d_off + len..],
+                            &data_backing[d_off + len..]
+                        );
+                    }
+                    if std::arch::is_x86_feature_detected!("avx512f") {
+                        let mut avx512_backing = data_backing.clone();
+                        unsafe { otp_xor_avx512(&mut avx512_backing[d_off..d_off + len], key) };
+                        assert_eq!(&avx512_backing[d_off..d_off + len], ref_buf.as_slice());
+                        assert_eq!(&avx512_backing[..d_off], &data_backing[..d_off]);
+                        assert_eq!(
+                            &avx512_backing[d_off + len..],
+                            &data_backing[d_off + len..]
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. Exhaustive 4-way Carter-Wegman MAC across EVERY length 0..=260 + unaligned sub-slices.
+        let r = rng.next_u128();
+        let s = rng.next_u128();
+        let fast_key = CwFastKey::new(r, s);
+        for len in 0..=260usize {
+            let mut backing = vec![0u8; len + 8];
+            rng.fill_bytes(&mut backing);
+            for off in [0usize, 1, 3] {
+                let slice = &backing[off..off + len];
+                let expected = ref_carter_wegman_mac(slice, r, s);
+                let actual = cw_mac_4way(&fast_key, slice);
+                assert_eq!(
+                    actual, expected,
+                    "cw_mac_4way mismatch len={len} off={off}"
+                );
+                assert!(fast_key.verify(slice, &actual));
+            }
+        }
+
+        // 3. Dense Toeplitz differential sweep including odd bit widths and sub-sliced u64 inputs.
+        let raw_bit_cases = [1usize, 2, 7, 15, 31, 63, 64, 65, 127, 128, 129, 255, 256, 257, 513];
+        let out_bit_cases = [1usize, 2, 7, 63, 64, 65, 127, 128, 129, 257];
+        for &rb in &raw_bit_cases {
+            let rw = rb.div_ceil(64);
+            let raw_backing: Vec<u64> = (0..rw + 3).map(|_| rng.next_u64()).collect();
+            for &ob in &out_bit_cases {
+                let sw = toeplitz_seed_words_turbo(rb, ob);
+                let seed_backing: Vec<u64> = (0..sw + 3).map(|_| rng.next_u64()).collect();
+                let raw_sub = &raw_backing[1..1 + rw];
+                let seed_sub = &seed_backing[2..2 + sw];
+
+                let expected = ref_toeplitz_hash_u64(raw_sub, rb, seed_sub, ob);
+                let actual = toeplitz_hash_turbo(raw_sub, rb, seed_sub, ob);
+                assert_eq!(actual, expected, "toeplitz mismatch rb={rb} ob={ob}");
+
+                let scalar = toeplitz_hash_scalar_4x(raw_sub, rb, seed_sub, ob);
+                assert_eq!(scalar, expected);
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        let a2 = unsafe { toeplitz_hash_avx2(raw_sub, rb, seed_sub, ob) };
+                        assert_eq!(a2, expected);
+                    }
+                    if std::arch::is_x86_feature_detected!("avx512f")
+                        && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+                    {
+                        let a512 = unsafe { toeplitz_hash_avx512(raw_sub, rb, seed_sub, ob) };
+                        assert_eq!(a512, expected);
+                    }
+                }
+            }
+        }
     }
 }

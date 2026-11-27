@@ -318,7 +318,10 @@ impl TurboCwKey {
 
     /// Generate `count` independent single-use keys in a single batched OS entropy read.
     pub fn generate_batch(count: usize) -> Vec<Self> {
-        let mut elems = vec![0u128; count * 2];
+        let total_elems = count
+            .checked_mul(2)
+            .expect("TurboCwKey batch size overflow");
+        let mut elems = vec![0u128; total_elems];
         fill_random_field_elems(&mut elems);
         let mut keys = Vec::with_capacity(count);
         for pair in elems.chunks_exact(2) {
@@ -598,16 +601,16 @@ impl TurboCompactBatch {
     /// Total number of transactions represented by this compact batch.
     #[inline]
     pub fn tx_count(&self) -> usize {
-        self.short_ids.len() + self.prefilled_txs.len()
+        self.short_ids.len().saturating_add(self.prefilled_txs.len())
     }
 
     /// Exact wire byte length of this compact batch.
     #[inline]
     pub fn wire_bytes(&self) -> usize {
         TURBO_COMPACT_HEADER_SIZE
-            + 4
-            + self.short_ids.len() * 8
-            + self.prefilled_txs.len() * (4 + TURBO_TX_SIZE)
+            .saturating_add(4)
+            .saturating_add(self.short_ids.len().saturating_mul(8))
+            .saturating_add(self.prefilled_txs.len().saturating_mul(4 + TURBO_TX_SIZE))
     }
 
     /// Wire byte length of the equivalent full (non-compact) batch of 24-byte [`TurboTx`]s.
@@ -661,10 +664,22 @@ impl TurboCompactBatch {
         block_tag.copy_from_slice(&bytes[40..56]);
         let prefilled_count = u32::from_le_bytes(bytes[56..60].try_into().unwrap()) as usize;
 
-        let expected = TURBO_COMPACT_HEADER_SIZE
-            + 4
-            + short_count * 8
-            + prefilled_count * (4 + TURBO_TX_SIZE);
+        let short_bytes = short_count
+            .checked_mul(8)
+            .ok_or(TurboExpressError::InvalidEncoding(
+                "compact batch short_ids length overflow",
+            ))?;
+        let prefilled_bytes = prefilled_count
+            .checked_mul(4 + TURBO_TX_SIZE)
+            .ok_or(TurboExpressError::InvalidEncoding(
+                "compact batch prefilled length overflow",
+            ))?;
+        let expected = (TURBO_COMPACT_HEADER_SIZE + 4)
+            .checked_add(short_bytes)
+            .and_then(|v| v.checked_add(prefilled_bytes))
+            .ok_or(TurboExpressError::InvalidEncoding(
+                "compact batch total length overflow",
+            ))?;
         if bytes.len() != expected {
             return Err(TurboExpressError::InvalidEncoding(
                 "compact batch length mismatch",
@@ -890,7 +905,13 @@ pub fn reconstruct_batch(
     compact: &TurboCompactBatch,
     out: &mut Vec<TurboTx>,
 ) -> Result<(), Vec<usize>> {
-    let total = compact.tx_count();
+    let Some(total) = compact
+        .short_ids
+        .len()
+        .checked_add(compact.prefilled_txs.len())
+    else {
+        return Err(vec![usize::MAX]);
+    };
     out.clear();
     out.reserve(total);
 
@@ -934,11 +955,11 @@ pub fn reconstruct_batch(
                 missing.push(idx);
             }
         }
+        for slot in slots {
+            out.push(slot.unwrap_or(TurboTx::new(0, 0, 0, 0)));
+        }
         if !missing.is_empty() {
             return Err(missing);
-        }
-        for tx in slots.into_iter().flatten() {
-            out.push(tx);
         }
         Ok(())
     }
@@ -1046,14 +1067,23 @@ impl TurboLedger {
                 "cannot stage_batch while a previous staged batch is still uncommitted",
             ));
         }
-        if height != self.height + 1 || !ct_eq_16(prev_tag, &self.tip_tag) {
+        let expected_height = self
+            .height
+            .checked_add(1)
+            .ok_or(TurboExpressError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: height,
+            })?;
+        if height != expected_height || !ct_eq_16(prev_tag, &self.tip_tag) {
             return Err(TurboExpressError::ChainLinkMismatch {
-                expected_height: self.height + 1,
+                expected_height,
                 got_height: height,
             });
         }
 
-        let needed = txs.len() * 2;
+        let needed = txs.len().checked_mul(2).ok_or(
+            TurboExpressError::InvalidParameters("batch too large for undo log"),
+        )?;
         if self.undo_log.len() < needed {
             self.undo_log.resize(needed, (0, 0, 0));
         }
@@ -1193,7 +1223,10 @@ impl TurboLinkDeck {
         let mut out_slots = Vec::with_capacity(count);
         let mut in_slots = Vec::with_capacity(count);
         let cw_keys = TurboCwKey::generate_batch(count);
-        let mut pads = vec![0u8; count * VOTE_PAYLOAD_LEN];
+        let pad_bytes = count
+            .checked_mul(VOTE_PAYLOAD_LEN)
+            .expect("TurboLinkDeck pad buffer overflow");
+        let mut pads = vec![0u8; pad_bytes];
         fill_os_random(&mut pads);
 
         for (i, cw_a) in cw_keys.into_iter().enumerate() {
@@ -1232,12 +1265,15 @@ impl TurboLinkDeck {
         payload: &[u8; VOTE_PAYLOAD_LEN],
     ) -> Result<TurboVoteFrame, TurboExpressError> {
         let idx = self.next_send_idx;
+        let next_idx = idx
+            .checked_add(1)
+            .ok_or(TurboExpressError::OtpDeckExhausted)?;
         let slot = self
             .slots
             .get_mut(idx)
             .and_then(Option::take)
             .ok_or(TurboExpressError::OtpDeckExhausted)?;
-        self.next_send_idx += 1;
+        self.next_send_idx = next_idx;
 
         let TurboLinkSlot { otp_pad, cw_key } = slot;
         let mut ct = [0u8; VOTE_PAYLOAD_LEN];
@@ -1266,9 +1302,11 @@ impl TurboLinkDeck {
         if frame.from != expected_from || frame.to != expected_to {
             return Err(TurboExpressError::InvalidEncoding("vote endpoint mismatch"));
         }
+        let slot_idx =
+            usize::try_from(frame.slot_id).map_err(|_| TurboExpressError::OtpDeckExhausted)?;
         let slot = self
             .slots
-            .get_mut(frame.slot_id as usize)
+            .get_mut(slot_idx)
             .and_then(Option::take)
             .ok_or(TurboExpressError::OtpDeckExhausted)?;
 
@@ -1618,7 +1656,11 @@ impl PersistentValidator {
         let view = job.view;
         let prev_tag = job.prev_tag;
         let batch: &[TurboTx] = &job.batch;
-        let key_idx = ((height - 1) as usize) * VIEWS_PER_HEIGHT + (view as usize);
+        let key_idx = height
+            .checked_sub(1)
+            .and_then(|h| usize::try_from(h).ok())
+            .and_then(|h| h.checked_mul(VIEWS_PER_HEIGHT))
+            .and_then(|v| v.checked_add(view as usize));
 
         let mut local_err: Option<TurboExpressError> = None;
         let mut staged = false;
@@ -1631,7 +1673,7 @@ impl PersistentValidator {
         if is_leader {
             // Leader consumes its dedicated single-use CW sealing key and publishes `block_tag`.
             let seal_key_opt = if (view as usize) < VIEWS_PER_HEIGHT {
-                self.seal_keys.get_mut(key_idx).and_then(Option::take)
+                key_idx.and_then(|idx| self.seal_keys.get_mut(idx).and_then(Option::take))
             } else {
                 None
             };
@@ -1664,7 +1706,7 @@ impl PersistentValidator {
             // staging in parallel with the leader, then verifies `ct_eq_16` against the leader's
             // published `block_tag` BEFORE casting any Prepare vote!
             let seal_key_opt = if (view as usize) < VIEWS_PER_HEIGHT {
-                self.seal_keys.get_mut(key_idx).and_then(Option::take)
+                key_idx.and_then(|idx| self.seal_keys.get_mut(idx).and_then(Option::take))
             } else {
                 None
             };
@@ -2072,13 +2114,20 @@ impl TurboExpressCluster {
             return Err(TurboExpressError::ClusterShutdown);
         }
 
-        let height = self.height + 1;
+        let height = self
+            .height
+            .checked_add(1)
+            .ok_or(TurboExpressError::ChainLinkMismatch {
+                expected_height: u64::MAX,
+                got_height: u64::MAX,
+            })?;
         let view = self.current_view;
         if (view as usize) >= VIEWS_PER_HEIGHT {
             return Err(TurboExpressError::MissingBlockSealKey { height });
         }
 
-        let leader_id = ((height as usize) + (view as usize)) % TURBO_NUM_VALIDATORS;
+        let leader_id =
+            (((height as u128) + (view as u128)) % (TURBO_NUM_VALIDATORS as u128)) as usize;
         let prev_tag = self.tip_tag;
         let tx_count = batch.len();
 
@@ -2120,7 +2169,7 @@ impl TurboExpressCluster {
         }
 
         if committed_validators < TURBO_QUORUM {
-            self.current_view += 1;
+            self.current_view = self.current_view.saturating_add(1);
             return Err(first_root_err.or(first_any_err).unwrap_or(
                 TurboExpressError::QuorumNotReached {
                     phase: "Commit",
@@ -2663,5 +2712,91 @@ mod tests {
             ],
         };
         assert!(reconstruct_batch(&mp, &dup_compact, &mut out).is_err());
+    }
+
+    #[test]
+    fn test_turbo_compact_prefilled_miss_patching_and_adversarial_worker_conservation() {
+        // 1. Crafted overflowing compact batch counts must return InvalidEncoding without panic.
+        let mut malformed = vec![0u8; TURBO_COMPACT_HEADER_SIZE + 4];
+        malformed[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed[56..60].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            TurboCompactBatch::from_bytes(&malformed),
+            Err(TurboExpressError::InvalidEncoding(_))
+        ));
+
+        // 2. Non-empty prefilled_txs + mempool miss populates `out` for patch_missing_txs.
+        let key = TurboShortIdKey::generate();
+        let mut mp = TurboMempool::new(key.duplicate_for_round());
+        let tx0 = TurboTx::new(0, 1, 10, 1);
+        let tx1 = TurboTx::new(1, 2, 20, 1);
+        let tx2 = TurboTx::new(2, 3, 30, 1);
+        mp.insert(tx2).unwrap();
+
+        let compact = TurboCompactBatch {
+            height: 1,
+            view: 0,
+            leader_id: 0,
+            prev_tag: TURBO_GENESIS_TAG,
+            block_tag: [0u8; 16],
+            short_ids: vec![key.short_id(&tx1), key.short_id(&tx2)],
+            prefilled_txs: vec![(0, tx0)],
+        };
+        let mut out = Vec::new();
+        let missing = mp.reconstruct_batch(&compact, &mut out).unwrap_err();
+        assert_eq!(missing, vec![1]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], tx0);
+        assert_eq!(out[2], tx2);
+        mp.patch_missing_txs(&mut out, &[(1, tx1)]).unwrap();
+        assert_eq!(out, vec![tx0, tx1, tx2]);
+
+        // 3. Multi-round persistent worker-pool stress test mixing valid commits, forged seals,
+        //    overdraft rollbacks, and replay attacks -> exact coin conservation & 0 divergence!
+        let num_accounts = 64usize;
+        let initial_bal = 50_000u64;
+        let expected_total: u64 = initial_bal * num_accounts as u64;
+        let mut cluster = TurboExpressCluster::new(vec![initial_bal; num_accounts], 32);
+        let mut next_page = vec![1u64; num_accounts];
+
+        for h in 1..=12u64 {
+            // Interleave forged seal on odd heights and overdraft rollback on multiples of 3.
+            if h % 2 == 1 {
+                let forged_batch = Arc::from([TurboTx::new(0, 1, 10, next_page[0])]);
+                assert_eq!(
+                    cluster.commit_batch_with_forged_seal(forged_batch, [0xAAu8; 16]),
+                    Err(TurboExpressError::InvalidBlockSeal { height: h })
+                );
+            }
+            if h % 3 == 0 {
+                let bad_batch = Arc::from([
+                    TurboTx::new(0, 1, 5, next_page[0]),
+                    TurboTx::new(1, 2, u64::MAX, next_page[1]),
+                ]);
+                assert!(matches!(
+                    cluster.commit_batch(bad_batch),
+                    Err(TurboExpressError::InvalidTx { index: 1, .. })
+                ));
+            }
+            let mut valid = Vec::with_capacity(32);
+            for i in 0..32usize {
+                let s = (i + h as usize) % num_accounts;
+                let r = (s + 5) % num_accounts;
+                let pid = next_page[s];
+                next_page[s] += 1;
+                valid.push(TurboTx::new(s as u32, r as u32, 7, pid));
+            }
+            let cert = cluster.commit_batch(Arc::from(valid)).unwrap();
+            assert_eq!(cert.height, h);
+
+            let snaps = cluster.all_validator_snapshots();
+            for vid in 0..TURBO_NUM_VALIDATORS {
+                assert_eq!(snaps[vid].height, h);
+                assert_eq!(snaps[vid].tip_tag, cert.block_tag);
+                assert_eq!(snaps[vid].balances, snaps[0].balances);
+                assert_eq!(snaps[vid].last_pages, snaps[0].last_pages);
+                assert_eq!(snaps[vid].balances.iter().sum::<u64>(), expected_total);
+            }
+        }
     }
 }
